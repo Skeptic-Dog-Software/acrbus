@@ -858,39 +858,36 @@ const BG_WAIT_NOTE: &str = "A session's background work, such as a test run, liv
      otherwise it's stopped some minutes after the session's turn ends, and \
      what it found is lost. The bridge's timeout still ends every run.";
 
-/// Adds the background wait to an existing ACR bridge's environment, if it
-/// isn't there. Returns whether it added it.
 /// The tools the ACR bridge lets a request choose: every one the bindings
 /// `setup acr` writes use, or a request for one is refused.
 const ACR_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "Bash", "Write", "Edit"];
 
-/// Adds to an existing ACR bridge the tools of [`ACR_TOOLS`] it doesn't
-/// let a request choose. Returns the ones it added.
-fn tools_bridge(doc: &mut toml_edit::DocumentMut) -> Result<Vec<&'static str>> {
-    let options = doc
-        .get_mut("bridges")
-        .and_then(|b| b.get_mut(ACR_AGENT))
-        .and_then(|a| a.as_table_like_mut())
-        .context("there's no ACR bridge")?
-        .entry("options")
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_like_mut()
-        .context("its options aren't a table")?;
-    let tools = options
-        .entry("tools")
-        .or_insert(toml_edit::value(toml_edit::Array::new()))
-        .as_array_mut()
-        .context("its options' tools aren't a list")?;
-    let missing: Vec<&'static str> = ACR_TOOLS
+/// The tools of [`ACR_TOOLS`] an existing ACR bridge doesn't let a request
+/// choose. Setup leaves its allow-list as it is, narrowed on purpose or not:
+/// a binding that asks for one of these is refused before a review starts,
+/// saying so.
+fn tools_missing(doc: &toml_edit::DocumentMut) -> Vec<&'static str> {
+    let allowed: Vec<String> = doc
+        .get("bridges")
+        .and_then(|b| b.get(ACR_AGENT))
+        .and_then(|a| a.get("options"))
+        .and_then(|o| o.get("tools"))
+        .and_then(|t| t.as_array())
+        .map(|t| {
+            t.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    ACR_TOOLS
         .into_iter()
-        .filter(|t| !tools.iter().any(|v| v.as_str() == Some(t)))
-        .collect();
-    for t in &missing {
-        tools.push(*t);
-    }
-    Ok(missing)
+        .filter(|t| !allowed.iter().any(|a| a == t))
+        .collect()
 }
 
+/// Adds the background wait to an existing ACR bridge's environment, if it
+/// isn't there. Returns whether it added it.
 fn bg_wait_bridge(doc: &mut toml_edit::DocumentMut) -> Result<bool> {
     let bridge = doc
         .get_mut("bridges")
@@ -1305,9 +1302,15 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         if bg_wait_bridge(&mut doc)? {
             println!("Its sessions' background work now lives until it's done.");
         }
-        let added = tools_bridge(&mut doc)?;
-        if !added.is_empty() {
-            println!("Its requests may now ask for {}.", added.join(", "));
+        let missing = tools_missing(&doc);
+        if !missing.is_empty() {
+            println!(
+                "Its requests can't ask for {}: a binding that does is refused before a \
+                 review starts. Add them to [bridges.{ACR_AGENT}.options] tools in {} if you \
+                 want them, with tools_args to pass them on.",
+                missing.join(", "),
+                paths.config.display()
+            );
         }
     } else {
         let home = paths.state.join(ACR_AGENT).join("home");
@@ -1571,21 +1574,24 @@ mod tests {
     }
 
     #[test]
-    fn an_older_acr_bridge_gets_the_tools_its_bindings_use() {
-        let mut old: toml_edit::DocumentMut = "[bridges.claude-acr]\nargs = [\"-p\"]\n\
-                                               [bridges.claude-acr.options]\n\
-                                               tools = [\"Read\", \"Bash\"]\n"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            tools_bridge(&mut old).unwrap(),
-            ["Grep", "Glob", "Write", "Edit"]
+    fn setup_says_what_an_older_acr_bridge_lacks_and_changes_nothing() {
+        let text = "[bridges.claude-acr]\nargs = [\"-p\"]\n\
+                    [bridges.claude-acr.options]\ntools = [\"Read\", \"Bash\"]\n";
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert_eq!(tools_missing(&doc), ["Grep", "Glob", "Write", "Edit"]);
+        assert_eq!(doc.to_string(), text, "the allow-list is the user's");
+        // One with no options lets a request choose none of them.
+        let bare: toml_edit::DocumentMut = "[bridges.claude-acr]\n".parse().unwrap();
+        assert_eq!(tools_missing(&bare), ACR_TOOLS);
+        let fresh = acr_bridge(
+            "o",
+            Path::new("/c"),
+            Path::new("/h"),
+            Path::new("/t"),
+            Path::new("/f"),
+            "/bin",
         );
-        assert!(tools_bridge(&mut old).unwrap().is_empty());
-        let tools = old["bridges"]["claude-acr"]["options"]["tools"]
-            .as_array()
-            .unwrap();
-        assert_eq!(tools.len(), ACR_TOOLS.len());
+        assert!(tools_missing(&fresh.parse().unwrap()).is_empty());
     }
 
     #[test]

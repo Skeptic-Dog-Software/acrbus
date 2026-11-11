@@ -534,11 +534,10 @@ pub struct Binding {
 const CHANGING_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
 
 impl Binding {
-    /// Whether it names a tool that can change files. A reviewer that has
-    /// one works in a copy of its own, to run and break things in, and never
-    /// in the checkout.
-    /// Whether its tools can run or change things. Agents spell their
-    /// tools in their own case, `Bash` or `bash`.
+    /// Whether it names a tool that can run or change files, in whatever
+    /// case its agent spells it, `Bash` or `bash`. A reviewer that has one
+    /// works in a copy of its own, to run and break things in, and never in
+    /// the checkout.
     pub fn changes_files(&self) -> bool {
         self.tools.as_ref().is_some_and(|t| {
             t.iter()
@@ -970,8 +969,6 @@ impl Config {
         Ok(())
     }
 
-    /// ACR runs on one machine: every binding in use must reach an agent on
-    /// `machine`, where the code is, so its reviewers read the code itself.
     /// Each binding a role or lens names, and each one's fallback, once,
     /// with its name: every binding a review could call.
     pub fn chosen_bindings(&self) -> Vec<(&str, &Binding)> {
@@ -1007,6 +1004,8 @@ impl Config {
         check_models(&self.allowed_models, &self.chosen_bindings())
     }
 
+    /// ACR runs on one machine: every binding in use must reach an agent on
+    /// `machine`, where the code is, so its reviewers read the code itself.
     pub fn check_local(&self, machine: &str) -> Result<()> {
         for (name, binding) in self.chosen_bindings() {
             let on = binding
