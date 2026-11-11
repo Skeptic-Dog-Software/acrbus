@@ -173,6 +173,15 @@ defaults:
 or any other agent CLI works the same way. Without a `configurer`, the
 Judge's binding configures.
 
+A binding's `timeout` is its role's time budget. Give a binding a
+`fallback`, another binding, and a call on it that runs out of time is
+tried once more there, on a faster model say, rather than holding the
+review; what it used is counted against the fallback. A repository's
+review config can set `allowed_models`, patterns such as `vendor/*`: every
+binding its reviews would call, fallbacks too, must name a model one
+matches, or the config is refused. Set in `defaults`, it holds every
+repository that doesn't set its own.
+
 ## Bridges
 
 A bridge answers its agent's messages by running a headless agent CLI once
@@ -198,7 +207,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 | `session` | `"fresh"`, the default, gives every request a new session. `"per-sender"` keeps one conversation with each sender. |
 | `max_concurrent` | The most runs at once. Default 1. |
 | `timeout_secs` | How long a run can take. Default 600. |
-| `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. |
+| `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. Either way, `acrbus bridge status` shows when each running request last used CPU or changed a file, which tells a slow run from a stalled one. |
 | `env`, `secrets` | More environment, and variables read from files only you can read. |
 
 | Placeholder | Is |
