@@ -814,7 +814,10 @@ max_concurrent = 3
 CLAUDE_CONFIG_DIR = "{{SESSION_DIR}}"
 # {BG_WAIT_NOTE}
 {BG_WAIT} = "0"
-
+# {OFFLINE_NOTE}
+RUSTUP_AUTO_INSTALL = "0"
+HOMEBREW_NO_AUTO_UPDATE = "1"
+{rustup}
 [bridges.{ACR_AGENT}.secrets]
 CLAUDE_CODE_OAUTH_TOKEN = {token}
 
@@ -844,6 +847,9 @@ model = "message.model"
         home = p(home),
         token = p(token),
         tools = serde_json::to_string(&ACR_TOOLS).unwrap_or_default(),
+        rustup = rustup_home()
+            .map(|r| format!("RUSTUP_HOME = {}\n", p(&r)))
+            .unwrap_or_default(),
         confine = p(confine),
         path = q(path),
     )
@@ -857,6 +863,69 @@ const BG_WAIT: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 const BG_WAIT_NOTE: &str = "A session's background work, such as a test run, lives until it's done: \
      otherwise it's stopped some minutes after the session's turn ends, and \
      what it found is lost. The bridge's timeout still ends every run.";
+
+/// Why a review's runs download nothing on their own.
+const OFFLINE_NOTE: &str = "Nothing a review runs downloads on its own: rustup installs no \
+     toolchain and Homebrew updates nothing. A missing tool is for you to install.";
+
+/// Toolchains a review's tests and reviewers may need, found on your PATH
+/// when setup runs, so the bridge's PATH has them too.
+const TOOLCHAINS: [&str; 12] = [
+    "cargo", "go", "node", "npm", "python3", "flutter", "dart", "mvn", "gradle", "java", "swift",
+    "ruby",
+];
+
+/// The folders on your PATH that hold [`TOOLCHAINS`], in PATH's order.
+fn toolchain_dirs() -> Vec<String> {
+    let path = env::var("PATH").unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let holds = TOOLCHAINS.iter().any(|t| {
+            fs::metadata(Path::new(dir).join(t)).is_ok_and(|m| {
+                m.is_file()
+                    && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0
+            })
+        });
+        if holds && !out.iter().any(|d| d == dir) {
+            out.push(dir.to_string());
+        }
+    }
+    out
+}
+
+/// Your rustup home, if you have one: its toolchains, which hold no
+/// credentials, are the review's too, so it never installs its own.
+fn rustup_home() -> Option<PathBuf> {
+    env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))
+        .filter(|p| p.join("toolchains").is_dir())
+}
+
+/// Adds the offline settings to an existing ACR bridge's environment where
+/// they're missing. Returns whether it added any.
+fn offline_bridge(doc: &mut toml_edit::DocumentMut) -> Result<bool> {
+    let env = doc
+        .get_mut("bridges")
+        .and_then(|b| b.get_mut(ACR_AGENT))
+        .and_then(|a| a.as_table_like_mut())
+        .context("there's no ACR bridge")?
+        .entry("env")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .context("its env isn't a table")?;
+    let mut added = false;
+    for (key, value) in [
+        ("RUSTUP_AUTO_INSTALL", "0"),
+        ("HOMEBREW_NO_AUTO_UPDATE", "1"),
+    ] {
+        if !env.contains_key(key) {
+            env.insert(key, toml_edit::value(value));
+            added = true;
+        }
+    }
+    Ok(added)
+}
 
 /// The tools the ACR bridge lets a request choose: every one the bindings
 /// `setup acr` writes use, or a request for one is refused.
@@ -1302,6 +1371,9 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         if bg_wait_bridge(&mut doc)? {
             println!("Its sessions' background work now lives until it's done.");
         }
+        if offline_bridge(&mut doc)? {
+            println!("Nothing its runs do downloads a toolchain or updates Homebrew now.");
+        }
         let missing = tools_missing(&doc);
         if !missing.is_empty() {
             println!(
@@ -1316,8 +1388,10 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         let home = paths.state.join(ACR_AGENT).join("home");
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
         let claude_dir = claude.parent().map(|d| d.to_string_lossy().into_owned());
+        // Your toolchains' folders too, so reviewers can build and test.
         let path: Vec<String> = claude_dir
             .into_iter()
+            .chain(toolchain_dirs())
             .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(String::from))
             .fold(Vec::new(), |mut seen, d| {
                 if !seen.contains(&d) {
