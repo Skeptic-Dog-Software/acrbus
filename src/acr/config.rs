@@ -916,15 +916,25 @@ impl Config {
 
     /// ACR runs on one machine: every binding in use must reach an agent on
     /// `machine`, where the code is, so its reviewers read the code itself.
-    pub fn check_local(&self, machine: &str) -> Result<()> {
-        let chosen = self
+    /// Each binding a role or lens names, once, with its name.
+    pub fn chosen_bindings(&self) -> Vec<(&str, &Binding)> {
+        let mut out: Vec<(&str, &Binding)> = Vec::new();
+        let names = self
             .bindings
             .values()
             .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()));
-        for name in chosen {
-            let Some(binding) = self.allowed_bindings.get(name) else {
-                continue;
-            };
+        for name in names {
+            if let Some(b) = self.allowed_bindings.get(name)
+                && !out.iter().any(|(n, _)| *n == name.as_str())
+            {
+                out.push((name, b));
+            }
+        }
+        out
+    }
+
+    pub fn check_local(&self, machine: &str) -> Result<()> {
+        for (name, binding) in self.chosen_bindings() {
             let on = binding
                 .agent
                 .split_once('@')
