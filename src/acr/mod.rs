@@ -2807,6 +2807,113 @@ mod tests {
     }
 
     #[test]
+    fn a_reviews_end_says_what_it_waits_for_and_how_to_answer() {
+        let cfg = config::resolve(
+            &config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap(),
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        let run = |status: &str, waiting: Option<&str>, escalations: serde_json::Value| -> Run {
+            serde_json::from_value(serde_json::json!({
+                "id": "r1", "repo": "/r", "base": "main", "head": null,
+                "tier": "core", "tier_why": "the Sizer: it touches storage", "fan_out": 1,
+                "round": 1, "stage": "review", "status": status, "waiting": waiting,
+                "lenses": {}, "escalations": escalations, "disagreements": [], "usage": []
+            }))
+            .unwrap()
+        };
+        let none = serde_json::json!([]);
+        let scope = next_steps(&run("waiting", Some("scope"), none.clone()), &cfg);
+        assert!(
+            scope.contains("approve its scope, tier core") && scope.contains("resume r1 --approve"),
+            "{scope}"
+        );
+        // The fold says how to let the Orchestrator fix, only where it can't.
+        let fold = next_steps(&run("waiting", Some("fold"), none.clone()), &cfg);
+        assert!(
+            fold.contains("--fold <ids>") && !fold.contains("writes: true"),
+            "{fold}"
+        );
+        let mut reads = cfg.clone();
+        let name = reads
+            .binding_name(Role::Orchestrator, None)
+            .unwrap()
+            .to_string();
+        reads.allowed_bindings.get_mut(&name).unwrap().writes = false;
+        let fold = next_steps(&run("waiting", Some("fold"), none.clone()), &reads);
+        assert!(fold.contains("writes: true"), "{fold}");
+        let up = next_steps(
+            &run(
+                "waiting",
+                Some("escalation"),
+                serde_json::json!([{"reason": "a public API change", "seen": false}]),
+            ),
+            &cfg,
+        );
+        assert!(up.contains("escalated: a public API change"), "{up}");
+        assert!(next_steps(&run("confirmed", None, none.clone()), &cfg).contains("confirmed"));
+        let ended = next_steps(&run("stopped", None, none), &cfg);
+        assert!(ended.contains("ended with"), "{ended}");
+    }
+
+    #[test]
+    fn a_waiting_proposal_is_named_not_called_no_config() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let kept = outside_config(&paths, &repo).unwrap();
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(configure::pending(&kept).config, "version: 1\n").unwrap();
+        let asked = AcrCmd::Calibration {
+            repo: repo.clone(),
+            base: "HEAD".into(),
+            config: None,
+            accept: false,
+        };
+        // It says where the proposal is, and exits 1, rather than failing to
+        // find a config.
+        assert_eq!(super::run(&paths, asked).unwrap(), ExitCode::FAILURE);
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn the_doctor_checks_reviewers_find_the_repositorys_toolchain() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
+        let user = bridge_and_bindings(&paths, &repo);
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // The test bridge's PATH is /bin, which has no cargo.
+        let said = doctor_toolchain(&paths, &cfg, &repo.canonicalize().unwrap());
+        assert!(
+            said.iter()
+                .any(|s| matches!(s, Said::Fix(t) if t.contains("reviewers can't run `cargo`"))),
+            "{said:?}"
+        );
+        // A repository with no toolchain of its own has nothing to check.
+        let plain = repo_with(&[("a.txt", "one\n")]);
+        assert!(doctor_toolchain(&paths, &cfg, &plain.canonicalize().unwrap()).is_empty());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&plain);
+    }
+
+    #[test]
     fn the_doctor_says_what_to_fix_and_how() {
         use super::change::tests::repo_with;
         let fixes = |said: &[Said]| -> Vec<String> {

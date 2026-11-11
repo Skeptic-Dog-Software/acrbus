@@ -634,6 +634,17 @@ pub fn listed(run: &KeptRun) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_configurer_stays_offline_and_says_what_comes_first() {
+        let p = prompt("shop", None, &[]);
+        assert!(
+            p.contains("Install nothing and download nothing, toolchains included"),
+            "{p}"
+        );
+        assert!(p.contains("`## Before the first review`"), "{p}");
+        assert!(p.contains("or `Nothing.`"), "{p}");
+    }
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 

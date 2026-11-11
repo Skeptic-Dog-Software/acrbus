@@ -877,7 +877,11 @@ const TOOLCHAINS: [&str; 12] = [
 
 /// The folders on your PATH that hold [`TOOLCHAINS`], in PATH's order.
 fn toolchain_dirs() -> Vec<String> {
-    let path = env::var("PATH").unwrap_or_default();
+    toolchain_dirs_in(&env::var("PATH").unwrap_or_default())
+}
+
+/// [`toolchain_dirs`], on a PATH given.
+fn toolchain_dirs_in(path: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for dir in path.split(':').filter(|d| !d.is_empty()) {
         let holds = TOOLCHAINS.iter().any(|t| {
@@ -1495,6 +1499,50 @@ mod tests {
         );
         // The sandbox stops token sessions at startup when reads are blocked.
         assert!(v.get("sandbox").is_none());
+    }
+
+    #[test]
+    fn a_new_acr_bridge_has_your_toolchains_and_downloads_nothing() {
+        let dir = temp("toolchains");
+        let (with, without) = (dir.join("rust"), dir.join("other"));
+        fs::create_dir_all(&with).unwrap();
+        fs::create_dir_all(&without).unwrap();
+        let cargo = with.join("cargo");
+        fs::write(&cargo, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&cargo, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        fs::write(without.join("go"), "not runnable").unwrap();
+        let path = format!(
+            "{}:{}:{}",
+            without.display(),
+            with.display(),
+            with.display()
+        );
+        assert_eq!(toolchain_dirs_in(&path), [with.display().to_string()]);
+        let fresh = acr_bridge(
+            "o",
+            Path::new("/c"),
+            Path::new("/h"),
+            Path::new("/t"),
+            Path::new("/f"),
+            "/bin",
+        );
+        let doc: toml_edit::DocumentMut = fresh.parse().unwrap();
+        let env = &doc["bridges"][ACR_AGENT]["env"];
+        assert_eq!(env["RUSTUP_AUTO_INSTALL"].as_str(), Some("0"));
+        assert_eq!(env["HOMEBREW_NO_AUTO_UPDATE"].as_str(), Some("1"));
+        // An older one gets them added, once, and keeps what it had.
+        let mut old: toml_edit::DocumentMut =
+            "[bridges.claude-acr]\nargs = [\"-p\"]\n[bridges.claude-acr.env]\nA = \"b\"\n"
+                .parse()
+                .unwrap();
+        assert!(offline_bridge(&mut old).unwrap());
+        assert!(!offline_bridge(&mut old).unwrap());
+        assert_eq!(
+            old["bridges"]["claude-acr"]["env"]["RUSTUP_AUTO_INSTALL"].as_str(),
+            Some("0")
+        );
+        assert_eq!(old["bridges"]["claude-acr"]["env"]["A"].as_str(), Some("b"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

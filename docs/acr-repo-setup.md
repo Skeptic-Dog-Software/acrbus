@@ -210,7 +210,9 @@ tests:
   settle, not conclusions.
 - **`context`**: every role gets what git says about the changed files.
 - **`claims`**, **`mutation`** and **`probes`** are lenses the framework
-  adds. Probers write scenarios as tests in copies of their own and run
+  adds, and `gate` adds one called `tests`, for what it finds. With the
+  gate on, the mutation stage runs inside it, so there's no `mutation`
+  lens. Probers write scenarios as tests in copies of their own and run
   them, concurrent calls and hangs among them. What a prober writes is
   kept: after a fix, the next round's probers start with it in their
   copies and run it again, which tells whether the fix held. Mutation runs `tests.command` itself, in throwaway copies, once
@@ -241,6 +243,31 @@ Every role gets the scope statement, as the builder's claims to check.
 Each reviewer gets its own lens's part. The `brief` stage covers any lens
 the builder left out. After a fix, the steelman briefs the next round,
 since by then it holds the change's context.
+
+## 5b. What the harness does, so the config needn't
+
+- **Where commands run.** The harness runs `tests.setup`, `tests.command`
+  and `tests.coverage` itself, under `sh -c`, in copies of the repository,
+  in the environment of whoever ran the review: their PATH, HOME and
+  caches.
+- **Where reviewers run.** Reviewers, the Judge and the Orchestrator run
+  through their bridge, with its `home` and `path` from config.toml, not
+  the user's. A reviewer whose binding has Bash, Write or Edit works in a
+  copy of its own. Its file tools can't read outside that copy, though its
+  shell can. So anything a reviewer runs must find its toolchain and
+  caches there. `acrbus acr doctor` checks.
+- **`{tests}`.** It's replaced with the test files to run, each quoted, with
+  spaces between them. Left empty, the command should run the whole suite.
+- **The gate without coverage.** With no `tests.coverage`, the gate still
+  runs its mutants and its other-way runs; only the uncovered lines are
+  missing.
+- **Decided non-issues.** Accepting a proposal puts its non-findings in
+  `<name>.not-findings.md`, beside the config, and points `not_findings` at
+  it. A proposal needn't name the file.
+- **Plan's estimate.** `acrbus acr plan` counts only the text the review
+  sends and reads back. `costs.per_call` adds a measured average for each
+  role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to
+  bring the estimate nearer the real use.
 
 ## 6. Check it
 
