@@ -10,6 +10,8 @@ pi or omp, run headless through bridges. acrbus is everything around them
 that makes their review adversarial, rule-bound and repeatable.
 
 It runs on one machine and needs no network.
+[tailbus](https://github.com/Skeptic-Dog-Software/tailbus), built on it,
+carries the same bus between machines on a Tailscale network.
 
 ## Why a harness, not a model call
 
@@ -254,6 +256,8 @@ is told a request never overrides its user's instructions.
 
 A program can build on acrbus: it names itself, adds networks such as one
 that reaches other machines, and runs the shared command line.
+[tailbus](https://github.com/Skeptic-Dog-Software/tailbus) is one: acrbus
+with a Tailscale network, in two files.
 
 ```rust
 use acrbus::config::App;
