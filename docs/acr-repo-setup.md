@@ -163,6 +163,12 @@ tests:
   any reviewer runs. Leave it unset, which is `warn`: in one trial, `stop`
   saved 14M tokens, but the reviewers it stopped found 19 of the 28 defects
   a full review had found in its first round when they were let run.
+  The change's own tests, which the gate reruns other ways and which make
+  a surviving mutant block, are the test files it adds or changes, and the
+  source files whose own tests it changes, such as a Rust file's
+  `#[cfg(test)]` module. A pin the test writer puts in such a module is
+  checked on the code from before the fixes with only its tests brought
+  over.
 - **`test-writing`** works between rounds of a review to convergence. After
   the steelman's fixes, a fresh writer pins each fixed blocker with a test.
   Each pin must fail on the code from before the fixes and pass after.
