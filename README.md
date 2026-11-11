@@ -244,6 +244,12 @@ A network is an `acrbus::network::Kind`: its name for `network` in
 `config.toml`, the settings it reads there, and how to open it as an
 `acrbus::network::Network`.
 
+## History
+
+acrbus has been in development since January 2026. Its git history was
+overwritten before it was made open source, to remove sensitive
+information, so this repository's history starts at that point.
+
 ## Develop
 
 ```sh
