@@ -1,0 +1,32 @@
+[package]
+name = "acrbus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Adversarial convergence review (ACR) on a local agent bus: bridges to any headless agent, no network needed"
+repository = "https://github.com/Skeptic-Dog-Software/acrbus"
+publish = false
+
+[lib]
+name = "acrbus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "acrbus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+globset = "0.4.21"
+libc = "0.2.191"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11.1"
+tiny_http = "0.12.0"
+toml = "1.1.8"
+toml_edit = "0.25.19"
+ureq = { version = "3.5.0", default-features = false }
