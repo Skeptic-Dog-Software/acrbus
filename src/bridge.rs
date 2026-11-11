@@ -257,6 +257,16 @@ fn default_log_retention() -> u32 {
     14
 }
 
+/// Why this machine's bridge for `agent` would refuse a request with these
+/// options, by the same check a request meets: None if it would take them,
+/// or if there's no bridge for `agent` here.
+pub fn would_refuse(paths: &Paths, agent: &str, options: &RunOptions) -> Result<Option<String>> {
+    if !Config::load(&paths.config)?.bridges.contains_key(agent) {
+        return Ok(None);
+    }
+    Ok(load(paths, agent)?.plan(Some(options)).err())
+}
+
 /// Reads a bridge's settings from the config, and checks them.
 pub fn load(paths: &Paths, agent: &str) -> Result<Settings> {
     if !valid_name(agent) {

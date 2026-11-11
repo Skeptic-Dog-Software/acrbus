@@ -443,6 +443,64 @@ fn not_findings(cfg: &Config, source: &Source, repo: &Path, base: &str) -> Resul
 }
 
 /// This machine's name on the tailnet, as the bus knows it.
+/// What a call on a binding asks its bridge for, wherever it works.
+pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
+    RunOptions {
+        // The binding's tools, writing ones too: some headless agents may
+        // use only the tools they're named, and refuse a write they would
+        // otherwise have to ask about. Without a list, an Orchestrator's
+        // fixes get what its bridge gives.
+        tools: b.tools.clone(),
+        session: Some("fresh".into()),
+        timeout: b.timeout,
+        workdir: None,
+        model: b.model.clone(),
+        effort: b.effort.clone(),
+        log: None,
+        // A review runs on one machine, which the bridge checks too.
+        review: Some(true),
+    }
+}
+
+/// Each binding in a user's ACR config, with what a call on it asks its
+/// bridge for.
+#[cfg(test)]
+pub(crate) fn bindings_options(text: &str) -> Result<Vec<(String, RunOptions)>> {
+    Ok(config::parse_user(text)?
+        .allowed_bindings
+        .iter()
+        .map(|(name, b)| (name.clone(), options_for(b)))
+        .collect())
+}
+
+/// Every agent a review calls is on this machine, and its bridge takes what
+/// each binding asks for. A binding its bridge refuses would fail every
+/// call it made, found only once a review was under way.
+fn check_machine(paths: &Paths, cfg: &Config) -> Result<()> {
+    let machine = this_machine(paths)?;
+    cfg.check_local(&machine)?;
+    check_bridges(paths, &cfg.chosen_bindings())
+}
+
+/// Each binding against its bridge, if its bridge is one of this machine's.
+fn check_bridges(paths: &Paths, bindings: &[(&str, &config::Binding)]) -> Result<()> {
+    for (name, b) in bindings {
+        let Some((agent, _)) = b.agent.split_once('@') else {
+            continue;
+        };
+        if let Some(why) = crate::bridge::would_refuse(paths, agent, &options_for(b))? {
+            bail!(
+                "the {agent} bridge would refuse every call on binding {name}: {why}. Allow it \
+                 in [bridges.{agent}.options] in {}, then restart the bridge, or change the \
+                 binding in {}",
+                paths.config.display(),
+                user_config_path(paths).display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn this_machine(paths: &Paths) -> Result<String> {
     let status: crate::local::Status = crate::local::call(&paths.socket(), &Request::Status)
         .context("asking the bus which machine this is")?;
@@ -566,23 +624,13 @@ impl Caller for BridgeCaller {
             );
         }
         let options = RunOptions {
-            // The binding's tools, writing ones too: some headless agents
-            // may use only the tools they're named, and refuse a write they
-            // would otherwise have to ask about. Without
-            // a list, an Orchestrator's fixes get what its bridge gives.
-            tools: b.tools.clone(),
-            session: Some("fresh".into()),
-            timeout: b.timeout,
             // Every role works in the repository, so reviewers read the
             // code itself, read-only, and an Orchestrator fixes it there.
             workdir: Some(call.repo.display().to_string()),
-            model: b.model.clone(),
-            effort: b.effort.clone(),
             // A review keeps its own record, and leaves nothing behind,
             // unless it's a trial's, kept to see what each agent did.
             log: Some(self.keep_logs),
-            // And runs on one machine, which the bridge checks too.
-            review: Some(true),
+            ..options_for(b)
         };
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {
@@ -975,13 +1023,16 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 );
             }
             match this_machine(paths) {
-                Ok(machine) => cfg.check_local(&machine)?,
+                Ok(machine) => {
+                    cfg.check_local(&machine)?;
+                    check_bridges(paths, &cfg.chosen_bindings())?;
+                }
                 Err(e) => println!("Not checked that every agent is on this machine: {e:#}."),
             }
         }
         AcrCmd::Plan { target, json } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
-            cfg.check_local(&this_machine(paths)?)?;
+            check_machine(paths, &cfg)?;
             let change = reload(&cfg, &target.repo, &target.base, target.head.as_deref())?;
             let plan = plan::dry_run(&cfg, &change, &history(paths, &target.repo))?;
             if !json && let Source::File(file) = &source {
@@ -1015,7 +1066,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             if let Some(note) = calibrated(paths, &name, &now, uncalibrated)? {
                 eprintln!("{note}");
             }
-            cfg.check_local(&this_machine(paths)?)?;
+            check_machine(paths, &cfg)?;
             change::checked_out(&target.repo, target.head.as_deref())?;
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
@@ -1053,7 +1104,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
             let _active = keep::active_guard(paths, &run_id)?;
             let cfg: Config = stored_config(&read("config.json")?)?;
-            cfg.check_local(&this_machine(paths)?)?;
+            check_machine(paths, &cfg)?;
             // Until a fix, the review is of its head, which must be checked out.
             if run.lenses.values().all(|l| l.done.is_empty()) {
                 change::checked_out(&run.repo, run.head.as_deref())?;
@@ -1501,7 +1552,7 @@ fn pipeline_run(
     flags.human_gate = Some(HumanGate::Exception);
     let (cfg, source) = load_config(paths, target, &flags)?;
     cfg.check_bindings()?;
-    cfg.check_local(&this_machine(paths)?)?;
+    check_machine(paths, &cfg)?;
     if converge {
         let name = cfg.binding_name(Role::Orchestrator, None)?;
         if !cfg.binding(Role::Orchestrator, None)?.writes {
@@ -1762,6 +1813,8 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     let name = change::name(&repo)?;
     let user = config::load_user(&user_config_path(paths))?;
     let (binding_name, binding) = configure::binding(&user)?;
+    // An hour of the configurer's work is no time to find its bridge says no.
+    check_bridges(paths, &[(binding_name.as_str(), &binding)])?;
     let kept_at = outside_config(paths, &repo)?;
     let current = fs::read_to_string(&kept_at).ok();
     let record = calibration::load(&paths.state, &name)?;
@@ -2099,6 +2152,52 @@ mod tests {
             state: dir.join("state"),
             config: dir.join("config.toml"),
         }
+    }
+
+    #[test]
+    fn a_binding_its_bridge_would_refuse_stops_a_review_before_it_starts() {
+        let paths = paths();
+        let dir = paths.config.parent().unwrap().to_path_buf();
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let bin = dir.join("agent");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::write(
+            &paths.config,
+            format!(
+                "[bridges.agent-x]\nowner = \"o\"\ncommand = \"{}\"\nargs = [\"--model\", \"{{MODEL}}\"]\nmodel = \"m\"\n\
+                 working_directory = \"{h}\"\nhome = \"{h}\"\npath = \"/bin\"\n\
+                 [bridges.agent-x.options]\ntools = [\"Read\", \"Bash\"]\n\
+                 tools_args = [\"--tools\", \"{{TOOLS}}\"]\n\
+                 effort_args = [\"--effort\", \"{{EFFORT}}\"]\n\
+                 models = [\"m\"]\nefforts = [\"high\"]\nmax_timeout_secs = 600\n",
+                bin.display(),
+                h = home.display()
+            ),
+        )
+        .unwrap();
+        let user = config::parse_user(
+            "version: 1\nallowed_bindings:\n\
+             \x20 fits: {agent: agent-x@here, model: m, effort: high, tools: [Read, Bash], timeout: 600}\n\
+             \x20 edits: {agent: agent-x@here, model: m, effort: high, tools: [Read, Edit]}\n\
+             \x20 elsewhere: {agent: someone@here, model: m, tools: [Edit]}\n",
+        )
+        .unwrap();
+        let fits = ("fits", &user.allowed_bindings["fits"]);
+        let edits = ("edits", &user.allowed_bindings["edits"]);
+        let elsewhere = ("elsewhere", &user.allowed_bindings["elsewhere"]);
+        check_bridges(&paths, &[fits, elsewhere]).unwrap();
+        let err = format!("{:#}", check_bridges(&paths, &[fits, edits]).unwrap_err());
+        assert!(
+            err.contains("would refuse every call on binding edits"),
+            "{err}"
+        );
+        assert!(
+            err.contains("tool \"Edit\" isn't one this agent's config allows"),
+            "{err}"
+        );
+        assert!(err.contains("[bridges.agent-x.options]"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

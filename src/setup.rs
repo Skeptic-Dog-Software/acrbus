@@ -820,7 +820,7 @@ CLAUDE_CODE_OAUTH_TOKEN = {token}
 
 [bridges.{ACR_AGENT}.options]
 max_timeout_secs = 14400
-tools = ["Read", "Grep", "Glob", "Bash", "Write"]
+tools = {tools}
 tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
 models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
 efforts = ["low", "medium", "high", "xhigh", "max"]
@@ -843,6 +843,7 @@ model = "message.model"
         BG_WAIT_NOTE = BG_WAIT_NOTE,
         home = p(home),
         token = p(token),
+        tools = serde_json::to_string(&ACR_TOOLS).unwrap_or_default(),
         confine = p(confine),
         path = q(path),
     )
@@ -859,6 +860,37 @@ const BG_WAIT_NOTE: &str = "A session's background work, such as a test run, liv
 
 /// Adds the background wait to an existing ACR bridge's environment, if it
 /// isn't there. Returns whether it added it.
+/// The tools the ACR bridge lets a request choose: every one the bindings
+/// `setup acr` writes use, or a request for one is refused.
+const ACR_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "Bash", "Write", "Edit"];
+
+/// Adds to an existing ACR bridge the tools of [`ACR_TOOLS`] it doesn't
+/// let a request choose. Returns the ones it added.
+fn tools_bridge(doc: &mut toml_edit::DocumentMut) -> Result<Vec<&'static str>> {
+    let options = doc
+        .get_mut("bridges")
+        .and_then(|b| b.get_mut(ACR_AGENT))
+        .and_then(|a| a.as_table_like_mut())
+        .context("there's no ACR bridge")?
+        .entry("options")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .context("its options aren't a table")?;
+    let tools = options
+        .entry("tools")
+        .or_insert(toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .context("its options' tools aren't a list")?;
+    let missing: Vec<&'static str> = ACR_TOOLS
+        .into_iter()
+        .filter(|t| !tools.iter().any(|v| v.as_str() == Some(t)))
+        .collect();
+    for t in &missing {
+        tools.push(*t);
+    }
+    Ok(missing)
+}
+
 fn bg_wait_bridge(doc: &mut toml_edit::DocumentMut) -> Result<bool> {
     let bridge = doc
         .get_mut("bridges")
@@ -1273,6 +1305,10 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         if bg_wait_bridge(&mut doc)? {
             println!("Its sessions' background work now lives until it's done.");
         }
+        let added = tools_bridge(&mut doc)?;
+        if !added.is_empty() {
+            println!("Its requests may now ask for {}.", added.join(", "));
+        }
     } else {
         let home = paths.state.join(ACR_AGENT).join("home");
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -1509,6 +1545,47 @@ mod tests {
         crate::acr::check_user_config(&acr_bindings("box")).unwrap();
         assert!(acr_bindings("box").contains("claude-acr@box"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_acr_bridge_takes_every_binding_setup_writes_for_it() {
+        let dir = temp("acr-agree");
+        let token = dir.join("claude-token");
+        fs::write(&token, "sk-ant-test").unwrap();
+        fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let claude = dir.join("claude");
+        fs::write(&claude, "#!/bin/sh\n").unwrap();
+        let text = acr_bridge("o", &claude, &dir, &token, &dir.join("c.json"), "/bin");
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        fs::write(&paths.config, &text).unwrap();
+        let bindings = crate::acr::bindings_options(&acr_bindings("box")).unwrap();
+        assert!(!bindings.is_empty());
+        for (name, options) in &bindings {
+            let refused = bridge::would_refuse(&paths, ACR_AGENT, options).unwrap();
+            assert_eq!(refused, None, "binding {name}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_older_acr_bridge_gets_the_tools_its_bindings_use() {
+        let mut old: toml_edit::DocumentMut = "[bridges.claude-acr]\nargs = [\"-p\"]\n\
+                                               [bridges.claude-acr.options]\n\
+                                               tools = [\"Read\", \"Bash\"]\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            tools_bridge(&mut old).unwrap(),
+            ["Grep", "Glob", "Write", "Edit"]
+        );
+        assert!(tools_bridge(&mut old).unwrap().is_empty());
+        let tools = old["bridges"]["claude-acr"]["options"]["tools"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tools.len(), ACR_TOOLS.len());
     }
 
     #[test]
