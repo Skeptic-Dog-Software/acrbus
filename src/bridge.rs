@@ -2343,7 +2343,16 @@ impl Bridge {
                     Some(code) => format!("exit {code}"),
                     None => format!("killed by signal {}", status.signal().unwrap_or(0)),
                 };
-                let mut done = self.failed(format!("{} {how}: {errors}", self.agent));
+                // An agent that says why on stdout, as Claude Code does of a
+                // token it can't sign in with, is heard when its stderr is
+                // empty.
+                let said = if errors.is_empty() {
+                    let out = read_end(&stdout, 8 * STDERR_TAIL);
+                    tail(&out, STDERR_TAIL).to_string()
+                } else {
+                    errors.to_string()
+                };
+                let mut done = self.failed(format!("{} {how}: {said}", self.agent));
                 done.exit_code = status.code();
                 done
             }
@@ -3073,6 +3082,21 @@ mod tests {
         rig.wait_acked(&id);
         bridge.stop().unwrap();
         assert!(rig.log.text().contains(&format!("failed {id}: api exit 3")));
+    }
+
+    #[test]
+    fn a_failure_that_says_why_on_stdout_is_heard() {
+        let rig = Rig::new();
+        // As Claude Code says it can't sign in: on stdout, with stderr empty.
+        let script = r#"echo "Failed to authenticate. API Error: 401 OAuth access token is invalid."; exit 1"#;
+        let bridge = rig.start(rig.settings(script, ""));
+        let id = rig.ask("hello");
+        assert_eq!(
+            rig.reply_to(&id),
+            "api could not answer: api exit 1: Failed to authenticate. API Error: 401 OAuth \
+             access token is invalid."
+        );
+        bridge.stop().unwrap();
     }
 
     #[test]
