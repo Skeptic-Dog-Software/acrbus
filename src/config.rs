@@ -31,6 +31,9 @@ pub struct App {
     pub network: &'static str,
     /// The networks it knows besides `local`, which every one knows.
     pub networks: &'static [crate::network::Kind],
+    /// What its environment variables start with, first first:
+    /// `<PREFIX>_HOME`, `<PREFIX>_AGENT` and `<PREFIX>_CLIENT`.
+    pub env: &'static [&'static str],
 }
 
 /// acrbus itself: a bus on this machine alone.
@@ -40,6 +43,7 @@ pub const ACRBUS: App = App {
     about: "Adversarial convergence review (ACR) on a local agent bus",
     network: "local",
     networks: &[],
+    env: &["ACRBUS"],
 };
 
 static CURRENT: OnceLock<&'static App> = OnceLock::new();
@@ -65,13 +69,17 @@ impl fmt::Display for AppName {
 
 pub const APP_NAME: AppName = AppName;
 
-/// One of our environment variables, `ACRBUS_<name>`, or `TAILBUS_<name>`,
-/// which sessions started before acrbus set. Either is accepted, whichever
-/// program this is; an empty one counts as unset.
+/// One of the program's environment variables, `<PREFIX>_<name>`, under
+/// the first of its prefixes that's set; an empty one counts as unset.
 pub fn env_var(name: &str) -> Option<String> {
-    [format!("ACRBUS_{name}"), format!("TAILBUS_{name}")]
+    env_var_for(app(), name)
+}
+
+fn env_var_for(app: &App, name: &str) -> Option<String> {
+    app.env
         .iter()
-        .find_map(|var| env::var(var).ok().filter(|v| !v.is_empty()))
+        .find_map(|prefix| env::var(format!("{prefix}_{name}")).ok())
+        .filter(|v| !v.is_empty())
 }
 
 pub struct Paths {
@@ -81,7 +89,7 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `$ACRBUS_HOME` (or `$TAILBUS_HOME`) holds everything when set.
+    /// `$ACRBUS_HOME` holds everything when set.
     /// Otherwise state goes in `$XDG_STATE_HOME/<app>` and the config in
     /// `$XDG_CONFIG_HOME/<app>/config.toml`.
     pub fn find() -> Result<Paths> {
@@ -161,11 +169,9 @@ fn env_path(var: &str) -> Option<PathBuf> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Which network the bus is on: `local`, this machine alone, or one the
-    /// program knows besides, such as tailbus's `tailscale`. The program's
-    /// own when left out.
+    /// program knows besides. The program's own when left out.
     #[serde(default)]
     pub network: Option<String>,
     /// On a local bus, this machine's name on it. The hostname by default.
@@ -187,9 +193,6 @@ pub struct Config {
     /// Days a stale message is kept, to be seen, before it evaporates.
     #[serde(default = "default_stale")]
     pub stale_days: u32,
-    /// A network's own setting: for tailbus's `tailscale` network, the
-    /// Tailscale CLI, if not the app's or the one on `PATH`.
-    pub tailscale: Option<PathBuf>,
     /// How many times in a row a session can be handed other agents'
     /// messages, with no prompt from its user in between, before the bus
     /// stops handing it more.
@@ -228,6 +231,11 @@ pub struct Config {
     /// the bus.
     #[serde(default)]
     pub bridges: std::collections::HashMap<String, toml::Value>,
+    /// Settings a network reads, such as the path to a CLI it runs: keys
+    /// only the program's networks declare (`network::Kind::settings`).
+    /// Anything else is refused when the config is loaded.
+    #[serde(flatten)]
+    pub network_settings: std::collections::BTreeMap<String, toml::Value>,
 }
 
 fn default_max_subagents() -> u32 {
@@ -278,13 +286,83 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        toml::from_str(&text).with_context(|| format!("in {}", path.display()))
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("in {}", path.display()))?;
+        cfg.check_settings(app())
+            .with_context(|| format!("in {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Refuses a key nothing reads: every key outside the ones above must be
+    /// a setting one of `app`'s networks declares.
+    pub fn check_settings(&self, app: &App) -> Result<()> {
+        for key in self.network_settings.keys() {
+            if !app
+                .networks
+                .iter()
+                .any(|n| n.settings.contains(&key.as_str()))
+            {
+                anyhow::bail!("`{key}` isn't a setting {} knows", app.name);
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn never_opened(_: &Config) -> Result<Box<dyn crate::network::Network>> {
+        anyhow::bail!("not in this test")
+    }
+
+    /// A program with a network of its own, which reads one setting, and
+    /// two environment prefixes.
+    const WITH_VPN: App = App {
+        name: "withvpn",
+        label: "com.example.withvpn",
+        about: "A test program",
+        network: "vpn",
+        networks: &[crate::network::Kind {
+            name: "vpn",
+            open: never_opened,
+            settings: &["vpn_cli"],
+        }],
+        env: &["WITHVPN", "OLDVPN"],
+    };
+
+    #[test]
+    fn a_key_only_a_network_declares_is_a_setting_and_a_typo_is_refused() {
+        let cfg: Config = toml::from_str("vpn_cli = \"/bin/vpn\"").unwrap();
+        assert_eq!(cfg.network_settings["vpn_cli"].as_str(), Some("/bin/vpn"));
+        cfg.check_settings(&WITH_VPN).unwrap();
+        let e = cfg.check_settings(&ACRBUS).unwrap_err().to_string();
+        assert!(e.contains("`vpn_cli` isn't a setting acrbus knows"), "{e}");
+        let typo: Config = toml::from_str("retention_dayz = 3").unwrap();
+        assert!(typo.check_settings(&WITH_VPN).is_err());
+        // Settings the bus itself reads aren't network settings.
+        let known: Config = toml::from_str("retention_days = 3").unwrap();
+        assert!(known.network_settings.is_empty());
+    }
+
+    #[test]
+    fn environment_variables_go_by_the_programs_prefixes_in_order() {
+        // SAFETY: names no other test uses.
+        unsafe {
+            std::env::set_var("OLDVPN_TESTVAR", "old");
+            std::env::remove_var("WITHVPN_TESTVAR");
+        }
+        assert_eq!(env_var_for(&WITH_VPN, "TESTVAR").as_deref(), Some("old"));
+        unsafe { std::env::set_var("WITHVPN_TESTVAR", "new") };
+        assert_eq!(env_var_for(&WITH_VPN, "TESTVAR").as_deref(), Some("new"));
+        // acrbus reads only its own.
+        assert_eq!(env_var_for(&ACRBUS, "TESTVAR"), None);
+        unsafe {
+            std::env::remove_var("OLDVPN_TESTVAR");
+            std::env::remove_var("WITHVPN_TESTVAR");
+        }
+    }
 
     #[test]
     fn everything_is_optional() {
@@ -311,6 +389,8 @@ mod tests {
         let cfg: Config = toml::from_str("port = 5000\nallow = [\"a@b.com\"]").unwrap();
         assert_eq!(cfg.port, 5000);
         assert_eq!(cfg.allow, ["a@b.com"]);
-        assert!(toml::from_str::<Config>("prot = 1").is_err());
+        // A misspelled key parses, and loading the config refuses it.
+        let typo: Config = toml::from_str("prot = 1").unwrap();
+        assert!(typo.check_settings(&ACRBUS).is_err());
     }
 }

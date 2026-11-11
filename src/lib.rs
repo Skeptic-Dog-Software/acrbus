@@ -1,8 +1,8 @@
 //! acrbus: adversarial convergence review (ACR) on an agent bus. A bus on
 //! this machine carries messages between AI agents and their bridges to
 //! headless agents, and `acr` reviews changes with them. A program built on
-//! it, such as tailbus, names itself and adds networks through
-//! `config::App`, then runs `cli::main`.
+//! it names itself and adds networks through `config::App`, then runs
+//! `cli::main`.
 
 mod acr;
 mod alert;
