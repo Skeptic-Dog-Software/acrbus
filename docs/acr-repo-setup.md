@@ -5,8 +5,8 @@ so that its review is configured correctly. The pipeline reviews well only
 when its reviewers know two things the diff can't tell them. Each lens needs
 to know how to attack, and every reviewer needs to know how to work in this
 repository on this machine. The brief stage then adds where to attack in
-each change. This guide covers what you write once, per repository and
-machine.
+each change. This guide covers what's written once, per repository and
+machine: by `acrbus acr configure` (§7), which follows it, or by you.
 
 The review config lives outside the repository, at
 `~/.config/acrbus/acr/<repository name>.yaml`, so nothing in a change can
@@ -201,71 +201,47 @@ acrbus acr plan --base <ref>     # tier, lenses, bindings, cost; no model calls
 checks that each one reads the copy, is refused a file outside it, and, for
 a reviewer with a shell, works in a copy of its own.
 
-## 7. Calibrate before you trust its rulings
+## 7. Calibrate: configure it from the repository, then from your feedback
 
-The pipeline's Judge decides what blocks, from the facts it states about
-each finding and from each lens's criteria. Until those rulings have been
-checked against a careful review of this repository, nothing says they fit
-it. So `acrbus acr run` refuses a repository that isn't calibrated. It
-also refuses one whose config has changed since it was calibrated, and it
+A review is only as good as its config: which dimensions it attacks, and
+what blocks in each. So the config is drawn from the repository itself, and
+then from what you say of its reviews. `acrbus acr run` refuses a
+repository whose config was never accepted, or has changed since, and
 notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
 
-1. **Run one full ACR on a real change.** Use the in-session method, the
-   acrbus `acr` skill: clean-context reviewers, one lens each, folding
-   findings in round by round until nothing blocks. Pick a change with some
-   substance. Keep any defect you already know of out of the reviewers'
-   briefs.
-2. **Write its key from that review's own records**, at
-   `~/.config/acrbus/acr/bench/<repository>-<name>.yaml`:
-
-   ```yaml
-   repo: /absolute/path/to/the/repository
-   base: <full sha the change was made on>
-   head: <full sha of the version round 1 reviewed>
-   context: |
-     What the change is for, as the builder described it before any review.
-   dimensions: [correctness, ...]
-   findings:
-     - id: short-kebab-name
-       blocker: true            # the review's own ruling at the time
-       dimension: correctness   # a lens id in this repository's config
-       what: >
-         The defect as the review found it: where, what's wrong, the evidence.
-       found_later: false       # true if found in round 2 or later
-   ```
-
-   Every finding must be a defect in the code at `head`. A later round
-   also reviews what earlier fixes added, and those findings don't belong:
-   check each later-round finding with `git show <head>:<path>`. Every
-   dimension must be a lens id in the config, spelled the same.
-3. **Give each lens its dimension's `blocker`** (§3): the definition of a
-   blocker the full review used for that dimension, as its reviewers were
-   told it. A lens with none leaves blocking to the Judge's severity.
-4. **Run `acrbus acr calibrate <key>...` twice.** Each run is one Judge
-   call per dimension and no reviewers, and each is recorded for the
-   repository.
-5. **Read where the Judge and the key disagree.** The review's own rulings
-   aren't ground truth: on a judgment call, either side can be right. What
-   to look for:
-   - **Dropped findings**, ones the Judge rated Rejected. If one is a real
-     defect, the Judge has lost it: fix the lens's criteria, or a
-     not-findings entry that's too broad.
-   - **Missed and overrated blockers.** Where the Judge is wrong because
-     the config doesn't say what blocks in this repository, say it there:
-     in the lens's `blocker`, its criteria, or its `severity`. For example,
-     a repository whose reviews block on a comment the change makes false
-     should say so.
-   - **The key itself.** A finding about code that isn't at `head`, or a
-     blocker ruling the review's own record contradicts, is the key's
-     mistake. Fix the key.
-6. **Accept it** with `acrbus acr calibration --repo <path> --accept`,
-   once there are two runs on the current config and Judge. Change the
-   config later, and run steps 4 to 6 again on the keys you have.
+1. **Configure it.** `acrbus acr configure --repo <path>` has the
+   configurer, the strongest model your `acr.yaml` binds as `configurer`,
+   review the whole repository as it is now, in a clone of its own: what
+   it's built of, how it's tested and shipped, what it keeps and talks to,
+   and which kinds of defect its history keeps fixing. It runs the test
+   commands it proposes, to be sure they work. It proposes the config this
+   guide describes: the dimensions that matter here, each with its
+   criteria, attack, blocker and triggers, and the tiers, runbook, tests and
+   stages. The proposal waits beside the config, at
+   `<repository>.proposed.yaml`, with its reasons in `<repository>.proposed.md`.
+2. **Read it and accept it.** Change what you disagree with, then run
+   `acrbus acr calibration --repo <path> --accept`. That puts it in place,
+   keeping the config it replaces as a backup, and calibrates the
+   repository. A config you wrote yourself is accepted the same way.
+3. **Review, and say how each review did.** After a review,
+   `acrbus acr feedback <review id>` lists its findings. Mark each one
+   (`--finding <number> --verdict right|not-a-defect|not-a-blocker|should-block`,
+   with `--note` if it helps), and say what it missed
+   (`--missed <text> --lens <id>`). A finished review's findings are kept
+   90 days for this.
+4. **Recalibrate when you're ready.** `acrbus acr calibrate --repo <path>`
+   hands the configurer the config, the repository again, and the feedback
+   given since the last recalibration. It proposes a revised config:
+   criteria and blockers tightened where something wasn't a defect or
+   shouldn't block, widened, or attacked better, where a defect was missed,
+   and lenses added, merged or retired. Read it and accept it as in step 2.
+   `acrbus acr run` reminds you while feedback is waiting to be folded in.
 
 ## 8. Measure what it finds
 
-Calibration checks the Judge. Whether the reviewers find what your most
-careful review finds is a separate question:
+Calibration fits the config to the repository. Whether the reviewers find
+what your most careful review finds is a separate question, for when you
+change the harness, a lens or a model:
 
 1. Take a real change, new work nobody has reviewed. Freeze a key with its
    repository, base, head, a paragraph of what it's for, and the dimensions.

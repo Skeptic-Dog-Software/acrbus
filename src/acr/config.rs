@@ -33,9 +33,14 @@ pub enum Role {
     Orchestrator,
     Reviewer,
     Judge,
+    /// Configures a repository's review from what's in it, outside any
+    /// review: `acr configure` and `acr calibrate`. A strong model. Without
+    /// its own binding it uses the Judge's.
+    Configurer,
 }
 
 impl Role {
+    /// The roles a review needs bound. The configurer isn't one.
     pub const ALL: [Role; 4] = [Role::Sizer, Role::Orchestrator, Role::Reviewer, Role::Judge];
 
     pub fn as_str(self) -> &'static str {
@@ -44,6 +49,7 @@ impl Role {
             Role::Orchestrator => "orchestrator",
             Role::Reviewer => "reviewer",
             Role::Judge => "judge",
+            Role::Configurer => "configurer",
         }
     }
 

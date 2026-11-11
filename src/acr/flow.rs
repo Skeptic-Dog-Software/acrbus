@@ -969,7 +969,10 @@ fn attack(
                             let (found, summary) = stages::run_mutants(&runner, &mutants)?;
                             Ok((Some(usage), found, Some(summary)))
                         }
-                        _ => Ok((Some(usage), roles::read_findings(&answer.text)?, None)),
+                        _ => {
+                            let found = findings_of(caller, cfg, &answer.text, &call)?;
+                            Ok((Some(usage), found, None))
+                        }
                     }
                 })
             })
@@ -1342,6 +1345,30 @@ fn prune_copies(root: &Path) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// A reviewer's findings. One that reported in prose, not the JSON asked
+/// for, has its report put in that form by a quick call with the Sizer's
+/// binding, adding and dropping nothing: a review isn't thrown away over its
+/// format. A report that still can't be read is a failure, as before.
+fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> Result<Vec<Raw>> {
+    let unread = match roles::read_findings(text) {
+        Ok(found) => return Ok(found),
+        Err(e) => e,
+    };
+    let prompt = roles::reformat_prompt(text);
+    let answer = caller.call(&Call {
+        role: Role::Sizer,
+        binding_name: cfg.binding_name(Role::Sizer, None)?,
+        binding: cfg.binding(Role::Sizer, None)?,
+        prompt: &prompt,
+        artifact: None,
+        writes: false,
+        repo: asked.repo,
+    })?;
+    roles::read_findings(&answer.text).with_context(|| {
+        format!("{unread:#}, and putting its report in the form asked didn't work either")
+    })
 }
 
 /// Turns a Judge's ratings into a lens's findings for this round.
@@ -3340,6 +3367,38 @@ lenses:
         drive(&mut run, &s, &reviewer, &|_| Ok(c.clone())).unwrap();
         assert_eq!(run.waiting, Some(Gate::Escalation));
         assert!(failures(&run)[0].contains("alpha, round 1: "));
+    }
+
+    #[test]
+    fn a_reviewer_that_reports_in_prose_is_put_in_form_not_failed() {
+        let cfg = plain("exception", 3, 1);
+        let prose = "Every scenario passed, so I have no findings.";
+        let reformats = &Mutex::new(0);
+        let put_in_form = |answer: &'static str| {
+            Fake::new(move |role, prompt: &str| match role {
+                Role::Reviewer if prompt.contains("alpha") => Ok(prose.into()),
+                Role::Reviewer => Ok(CLEAN.into()),
+                Role::Sizer if prompt.contains("A reviewer wrote this report") => {
+                    assert!(prompt.contains(prose), "the report goes as it was");
+                    *reformats.lock().unwrap() += 1;
+                    Ok(answer.into())
+                }
+                _ => Ok(NOTHING.into()),
+            })
+        };
+        // Its report says it found nothing: the lens is confirmed.
+        let fake = put_in_form(CLEAN);
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        assert!(failures(&run).is_empty(), "{:?}", failures(&run));
+        assert_eq!(*reformats.lock().unwrap(), 1);
+        // A report that can't be put in form is still a failure.
+        let fake = put_in_form("unreadable");
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_ne!(run.status, Status::Confirmed);
+        assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
+        let said = failures(&run).join(" ");
+        assert!(said.contains("didn't work either"), "{said}");
     }
 
     #[test]

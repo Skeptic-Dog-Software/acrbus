@@ -33,11 +33,14 @@ facts into a ruling, and a fact that rests on the change's own words holds
 only when the Judge quotes them from the diff. Each lens can say what blocks
 in its dimension, and a finding blocks when the Judge shows it meets that.
 
-**It's calibrated before you trust it.** `acrbus acr calibrate` runs the
-Judge over findings a careful review already made, and shows where they
-disagree. `acrbus acr run` refuses a repository until you've read that and
-accepted it, and a change to the config or to the rules voids the
-acceptance.
+**It's configured for your repository, and learns from you.** A strong
+model reviews the whole repository, what it's built of, how it's tested and
+shipped, and which defects its history keeps fixing, and proposes the
+dimensions that matter there and what blocks in each. You read and accept
+it, and `acrbus acr run` refuses a repository until you have. Then you say
+how its reviews did, finding by finding, and what they missed, and
+recalibrating folds that back into the config, so the next review gets it
+right.
 
 **It gathers its own evidence.** With its stages on, the harness runs the
 change's tests itself before any reviewer starts: coverage of the changed
@@ -105,23 +108,32 @@ service. Each part is also its own command: `acrbus service install`,
 ## Review a change
 
 1. Allow the repository: `acrbus acr add-repo <path>`.
-2. Write its review config, at `~/.config/acrbus/acr/<repository>.yaml`: its
-   lenses, how to work in it, and how its tests run.
-   [Setting up ACR review for a repository](docs/acr-repo-setup.md) walks
-   through it, and [examples/acr](examples/acr) has configs.
-3. Calibrate it once, from one careful review of a real change, as that
-   guide's section 7 describes.
+2. Configure it: `acrbus acr configure --repo <path>`. The configurer reviews
+   the whole repository and proposes its review config, at
+   `~/.config/acrbus/acr/<repository>.proposed.yaml`, with its reasons.
+3. Read it, change what you like, and accept it:
+   `acrbus acr calibration --repo <path> --accept`.
 4. Review: `acrbus acr run --repo <path> --base <ref>`.
+5. Say how it did, `acrbus acr feedback <review id>`, and, when you're
+   ready, fold that in: `acrbus acr calibrate --repo <path>`.
+
+[Setting up ACR review for a repository](docs/acr-repo-setup.md) describes
+the config, for reading a proposal or writing one yourself, and
+[examples/acr](examples/acr) has configs.
 
 | Command | Does |
 | --- | --- |
 | `acrbus acr validate`, `acrbus acr schema` | Check a repository's config, or print its schema. |
 | `acrbus acr plan` | Show the tier, lenses, bindings and estimated cost, with no model calls. |
-| `acrbus acr calibrate <key>...`, `acrbus acr calibration --accept` | Check the Judge against a careful review's findings; accept it once you've read where they disagree. |
+| `acrbus acr configure` | Have the configurer review the whole repository and propose its review config. |
+| `acrbus acr calibration --accept` | Accept the proposed config, or your own: that calibrates the repository. |
+| `acrbus acr feedback <review id>` | List a finished review's findings, and say how each did and what it missed. |
+| `acrbus acr calibrate` | Fold your feedback into the config: the configurer proposes a revised one. |
 | `acrbus acr run` | Review a change. |
 | `acrbus acr resume <run id>` | Go on past a gate that's waiting for a person. |
 | `acrbus acr carry` | Carry work that isn't code, such as a document, into git so it can be reviewed. |
 | `acrbus acr check`, `acrbus acr trial` | Check that a trial can run, then measure a review design on a change whose defects are known. |
+| `acrbus acr judge-check <key>...` | Compare the Judge's rulings with a past review's, as a benchmark. |
 
 The method itself is in [the ACR skill](plugin/skills/acr/SKILL.md), and the
 config's schema in [schema/acr.schema.json](schema/acr.schema.json).
@@ -145,14 +157,21 @@ allowed_bindings:
     model: claude-opus-5-5
     effort: medium
     tools: [Read, Grep, Glob, Bash, Write]
+  configurer:      # reviews a whole repository to configure its review
+    agent: claude-acr@laptop
+    model: claude-opus-5-5
+    effort: max
+    tools: [Read, Grep, Glob, Bash, Write]
 defaults:
   bindings:
     reviewer: reviewer-runs
     judge: judge
+    configurer: configurer
 ```
 
 `acrbus setup acr` writes one for headless Claude Code. A bridge to pi, omp
-or any other agent CLI works the same way.
+or any other agent CLI works the same way. Without a `configurer`, the
+Judge's binding configures.
 
 ## Bridges
 

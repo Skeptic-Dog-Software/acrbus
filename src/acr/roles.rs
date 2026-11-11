@@ -256,6 +256,24 @@ pub fn reviewer_prompt(
     )
 }
 
+/// For a reviewer that reported in prose where it should have answered in
+/// JSON: put its report in the form asked, adding nothing and dropping
+/// nothing. A report that can't be is still unreadable.
+pub fn reformat_prompt(report: &str) -> String {
+    format!(
+        "A reviewer wrote this report on a change in prose, where its answer should have been \
+         JSON. Put it in that form. Each defect it reports is a finding: its title, the \
+         evidence it gives as the detail, and the file and line if it names them. Add nothing \
+         it doesn't say, and leave out nothing it reports as wrong. If it reports nothing \
+         wrong, answer with an empty list. If the report is cut off, or isn't a reviewer's \
+         report, answer only: unreadable.\n\n\
+         The report:\n<<<\n{}\n>>>\n\n\
+         Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
+         \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}.",
+        report.trim()
+    )
+}
+
 pub fn read_findings(text: &str) -> Result<Vec<Raw>> {
     Ok(json_in::<Reviewed>(text)?.findings)
 }

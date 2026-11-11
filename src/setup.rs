@@ -823,7 +823,7 @@ max_timeout_secs = 14400
 tools = ["Read", "Grep", "Glob", "Bash", "Write"]
 tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
 models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
-efforts = ["low", "medium", "high"]
+efforts = ["low", "medium", "high", "xhigh", "max"]
 effort_args = ["--effort", "{{EFFORT}}"]
 workdirs = []
 
@@ -934,12 +934,20 @@ allowed_bindings:
     tools: [Read, Grep, Glob, Bash, Write]
     timeout: 14400
     subscription: true
+  opus-configure:  # the configurer: reviews a whole repository to configure its review
+    agent: {agent}
+    model: claude-opus-5-5
+    effort: max
+    tools: [Read, Grep, Glob, Bash, Write]
+    timeout: 14400
+    subscription: true
 defaults:
   bindings:
     sizer: haiku-low
     reviewer: sonnet-high
     orchestrator: opus-medium
     judge: opus-judge
+    configurer: opus-configure
 "#
     )
 }
@@ -968,6 +976,59 @@ fn read_hidden(prompt: &str) -> Result<String> {
     println!();
     read?;
     Ok(line.trim().to_string())
+}
+
+/// Signs in with the token, by one tiny call, from a folder of its own.
+fn check_token(claude: &Path, token: &Path) -> Result<()> {
+    let secret = fs::read_to_string(token)
+        .with_context(|| format!("reading {}", token.display()))?
+        .trim()
+        .to_string();
+    let home = env::temp_dir().join(format!("acr-token-check-{}", crate::util::new_id()));
+    fs::create_dir_all(&home)?;
+    let mut child = Command::new(claude)
+        .args([
+            "-p",
+            "--model",
+            "claude-haiku-5-5",
+            "--output-format",
+            "text",
+            "--strict-mcp-config",
+        ])
+        .current_dir(&home)
+        .env("CLAUDE_CONFIG_DIR", &home)
+        .env("CLAUDE_CODE_OAUTH_TOKEN", &secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {}", claude.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(b"Reply with the single word: ok");
+    }
+    let out = child.wait_with_output()?;
+    let _ = fs::remove_dir_all(&home);
+    let said = format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let said = said.trim();
+    if !out.status.success() || said.contains("Failed to authenticate") || said.is_empty() {
+        let shown: String = said.chars().take(300).collect();
+        bail!(
+            "the token in {} doesn't sign in: {}. Remove it and run `{APP_NAME} setup acr` \
+             again to make a new one",
+            token.display(),
+            if shown.is_empty() {
+                "no answer"
+            } else {
+                &shown
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Makes the long-lived token headless Claude Code signs in with, by
@@ -1168,11 +1229,21 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         .context("the config has no folder")?
         .to_path_buf();
     let token = dir.join("claude-token");
-    if token.exists() {
-        println!("Using the token in {}.", token.display());
-    } else {
+    let made = !token.exists();
+    if made {
         make_token(&claude, &token)?;
+    } else {
+        println!("Using the token in {}.", token.display());
     }
+    // A token that can't sign in is found now, not by the first review. One
+    // this run made goes, so running setup again asks for a new one.
+    if let Err(e) = check_token(&claude, &token) {
+        if made {
+            let _ = fs::remove_file(&token);
+        }
+        return Err(e);
+    }
+    println!("The token signs in.");
     let confine = dir.join("acr").join(CONFINE_FILE);
     let settings = confine_settings();
     match fs::read_to_string(&confine) {
@@ -1437,6 +1508,34 @@ mod tests {
         assert!(settings.usage.is_some());
         crate::acr::check_user_config(&acr_bindings("box")).unwrap();
         assert!(acr_bindings("box").contains("claude-acr@box"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_token_is_checked_by_signing_in_with_it() {
+        let dir = temp("token");
+        let token = dir.join("claude-token");
+        fs::write(&token, "a-token").unwrap();
+        let fake = |script: &str| {
+            let claude = dir.join("claude");
+            fs::write(&claude, format!("#!/bin/sh\ncat >/dev/null\n{script}\n")).unwrap();
+            fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            claude
+        };
+        // It signs in: and the token reaches it only in its environment.
+        let ok = fake(r#"[ "$CLAUDE_CODE_OAUTH_TOKEN" = a-token ] && echo ok"#);
+        check_token(&ok, &token).unwrap();
+        // Claude Code says it can't sign in on stdout, and exits 1.
+        let refused = fake(
+            r#"echo "Failed to authenticate. API Error: 401 OAuth access token is invalid."; exit 1"#,
+        );
+        let e = check_token(&refused, &token).unwrap_err().to_string();
+        assert!(
+            e.contains("doesn't sign in: Failed to authenticate") && e.contains("setup acr"),
+            "{e}"
+        );
+        assert!(!e.contains("a-token"), "never the token itself: {e}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -1,9 +1,9 @@
-//! Whether a repository's review config is calibrated. Its keys come from
-//! one full ACR of a real change, and `acr calibrate` has the pipeline's
-//! Judge rule on their findings. A person then reads where the two
-//! disagreed and accepts it, with `acr calibration --accept`. A full review's
-//! rulings aren't ground truth, so the bar isn't strict agreement: it's that
-//! a person has read the disagreements, twice on the same config and Judge.
+//! Whether a repository's review config is calibrated: configured for what's
+//! in the repository, and accepted by a person. `acr configure` proposes a
+//! config from a review of the whole repository, and `acr calibrate` revises
+//! it from what the person has said of its reviews (`acr feedback`). Either
+//! way, a person reads the proposal and accepts it, with `acr calibration
+//! --accept`, which also accepts a config they wrote themselves.
 //!
 //! `acr run` refuses a repository that was never calibrated, or whose config
 //! has changed since, and warns when only the Judge has: a new Judge prompt
@@ -13,16 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::APP_NAME;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-/// Runs kept for each repository.
-const KEPT: usize = 20;
-
-/// Runs on the same config and Judge before a calibration can be accepted:
-/// one result could be the Judge's luck.
-pub const RUNS_NEEDED: usize = 2;
 
 /// What a calibration was made against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +27,8 @@ pub struct Fingerprint {
     pub judge: String,
 }
 
-/// One `acr calibrate` of a repository's keys.
+/// One comparison of the Judge with a past review's keys, which records
+/// from before calibration was configuring still hold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationRun {
     pub at: i64,
@@ -53,7 +47,9 @@ pub struct CalibrationRun {
 pub struct Accepted {
     pub at: i64,
     pub fingerprint: Fingerprint,
-    /// The runs it was accepted on.
+    /// How many key comparisons it was accepted on, for an acceptance from
+    /// before; none now.
+    #[serde(default)]
     pub runs: usize,
 }
 
@@ -63,13 +59,10 @@ pub struct Record {
     pub runs: Vec<CalibrationRun>,
     #[serde(default)]
     pub accepted: Option<Accepted>,
-}
-
-impl Record {
-    /// The runs made against `now`, latest last.
-    pub fn runs_on(&self, now: &Fingerprint) -> Vec<&CalibrationRun> {
-        self.runs.iter().filter(|r| &r.fingerprint == now).collect()
-    }
+    /// The latest feedback a recalibration folded in: feedback after it is
+    /// still to fold in.
+    #[serde(default)]
+    pub feedback_folded_at: Option<i64>,
 }
 
 /// Where a repository stands for `acr run`.
@@ -144,39 +137,38 @@ fn save(state: &Path, repo: &str, record: &Record) -> Result<()> {
     Ok(())
 }
 
-/// Records a run, keeping the latest few.
-pub fn add_run(state: &Path, repo: &str, run: CalibrationRun) -> Result<Record> {
+/// Accepts the repository's config as it is now, against `now`. `folded`
+/// is the latest feedback it folds in, if it came from a recalibration.
+pub fn accept(
+    state: &Path,
+    repo: &str,
+    now: &Fingerprint,
+    at: i64,
+    folded: Option<i64>,
+) -> Result<Accepted> {
     let mut record = load(state, repo)?;
-    record.runs.push(run);
-    let over = record.runs.len().saturating_sub(KEPT);
-    record.runs.drain(..over);
-    save(state, repo, &record)?;
-    Ok(record)
-}
-
-/// Accepts the calibration made against `now`, once it has run enough.
-pub fn accept(state: &Path, repo: &str, now: &Fingerprint, at: i64) -> Result<Accepted> {
-    let mut record = load(state, repo)?;
-    let runs = record.runs_on(now).len();
-    if runs < RUNS_NEEDED {
-        bail!(
-            "{repo} has {runs} calibration run(s) on its current config and Judge; it needs \
-             {RUNS_NEEDED}: run `{APP_NAME} acr calibrate` on its keys again first"
-        );
-    }
     let accepted = Accepted {
         at,
         fingerprint: now.clone(),
-        runs,
+        runs: 0,
     };
     record.accepted = Some(accepted.clone());
+    if let Some(folded) = folded {
+        record.feedback_folded_at = Some(folded.max(record.feedback_folded_at.unwrap_or(0)));
+    }
     save(state, repo, &record)?;
     Ok(accepted)
 }
 
 /// Where a repository's calibration stands, and its runs on the current
 /// config and Judge.
-pub fn report(name: &str, record: &Record, now: &Fingerprint) -> String {
+pub fn report(
+    name: &str,
+    record: &Record,
+    now: &Fingerprint,
+    unfolded: usize,
+    pending: Option<&Path>,
+) -> String {
     let stands = match standing(record, now) {
         Standing::Calibrated => "calibrated".to_string(),
         Standing::JudgeChanged => "calibrated, but on an earlier Judge: recalibrate soon".into(),
@@ -184,19 +176,23 @@ pub fn report(name: &str, record: &Record, now: &Fingerprint) -> String {
         Standing::Never => "not calibrated".into(),
     };
     let mut out = format!("{name}: {stands}.");
-    let runs = record.runs_on(now);
-    if runs.is_empty() {
-        out.push_str("\nNo calibration runs on its current config and Judge.");
-    }
-    for r in runs {
+    if let Some(a) = &record.accepted {
         out.push_str(&format!(
-            "\n- {}: blockers agreed {}, missed {}, overrated {}; dropped {} ({})",
-            crate::util::rfc3339(r.at),
-            r.agreed,
-            r.missed,
-            r.overrated,
-            r.dropped,
-            r.keys.join(", ")
+            "\nIts config was last accepted {}.",
+            crate::util::rfc3339(a.at)
+        ));
+    }
+    if let Some(path) = pending {
+        out.push_str(&format!(
+            "\nA proposed config is waiting for you to read: {}. Accept it with \
+             `{APP_NAME} acr calibration --accept`.",
+            path.display()
+        ));
+    }
+    if unfolded > 0 {
+        out.push_str(&format!(
+            "\n{unfolded} piece(s) of feedback on its reviews aren't in its config yet: \
+             `{APP_NAME} acr calibrate` folds them in."
         ));
     }
     out
@@ -213,46 +209,39 @@ mod tests {
         }
     }
 
-    fn run(f: &Fingerprint) -> CalibrationRun {
-        CalibrationRun {
-            at: 1,
-            keys: vec!["k".into()],
-            fingerprint: f.clone(),
-            agreed: 1,
-            missed: 0,
-            overrated: 0,
-            dropped: 0,
-        }
-    }
-
     #[test]
-    fn a_calibration_is_accepted_after_two_runs_and_voided_by_a_new_config() {
+    fn accepting_a_config_calibrates_it_until_the_config_changes() {
         let state = std::env::temp_dir().join(format!("tb-cal-{}", crate::util::new_id()));
         let now = fp("c1", "j1");
-        assert_eq!(standing(&load(&state, "r").unwrap(), &now), Standing::Never);
-        add_run(&state, "r", run(&now)).unwrap();
-        // One run isn't enough, nor is one on another config.
-        add_run(&state, "r", run(&fp("c0", "j1"))).unwrap();
-        let err = accept(&state, "r", &now, 2).unwrap_err().to_string();
-        assert!(err.contains("needs 2"), "{err}");
-        add_run(&state, "r", run(&now)).unwrap();
-        accept(&state, "r", &now, 3).unwrap();
+        let record = load(&state, "r").unwrap();
+        assert_eq!(standing(&record, &now), Standing::Never);
+        assert!(report("r", &record, &now, 0, None).contains("not calibrated"));
+        // Accepting it is the calibration: no runs needed.
+        accept(&state, "r", &now, 3, None).unwrap();
         let record = load(&state, "r").unwrap();
         assert_eq!(standing(&record, &now), Standing::Calibrated);
+        assert_eq!(record.feedback_folded_at, None);
         // A changed config refuses; a changed Judge only warns.
         assert_eq!(standing(&record, &fp("c2", "j1")), Standing::ConfigChanged);
         assert_eq!(standing(&record, &fp("c1", "j2")), Standing::JudgeChanged);
-        fs::remove_dir_all(&state).unwrap();
-    }
-
-    #[test]
-    fn only_the_latest_runs_are_kept() {
-        let state = std::env::temp_dir().join(format!("tb-cal-{}", crate::util::new_id()));
-        let now = fp("c", "j");
-        for _ in 0..KEPT + 5 {
-            add_run(&state, "r", run(&now)).unwrap();
-        }
-        assert_eq!(load(&state, "r").unwrap().runs.len(), KEPT);
+        // A recalibration's acceptance records the feedback it folded in,
+        // never moving it back.
+        accept(&state, "r", &now, 5, Some(40)).unwrap();
+        accept(&state, "r", &now, 6, Some(30)).unwrap();
+        assert_eq!(load(&state, "r").unwrap().feedback_folded_at, Some(40));
+        let shown = report(
+            "r",
+            &load(&state, "r").unwrap(),
+            &now,
+            2,
+            Some(Path::new("/c/r.proposed.yaml")),
+        );
+        assert!(
+            shown.contains("r: calibrated.")
+                && shown.contains("/c/r.proposed.yaml")
+                && shown.contains("2 piece(s) of feedback"),
+            "{shown}"
+        );
         fs::remove_dir_all(&state).unwrap();
     }
 
