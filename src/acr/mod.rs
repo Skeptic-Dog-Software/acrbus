@@ -396,7 +396,20 @@ fn repo_layer(
     }
     let base =
         base.with_context(|| format!("give a config file, or --base to read {REPO_CONFIG} from"))?;
-    Ok((change::repo_config(repo, base)?, Source::Base))
+    match change::at_base(repo, base, REPO_CONFIG)? {
+        Some(text) => Ok((text, Source::Base)),
+        // Neither place has one: the repository hasn't been configured,
+        // which is what to say, not that a change can't bring its own.
+        None => bail!(
+            "{} has no review config yet: there's none at {}, and no {REPO_CONFIG} on {base}. \
+             Have the configurer propose one with `{APP_NAME} acr configure --repo {}`, then \
+             read it and accept it with `{APP_NAME} acr calibration --repo {} --accept`",
+            change::name(repo)?,
+            outside_config(paths, repo)?.display(),
+            repo.display(),
+            repo.display(),
+        ),
+    }
 }
 
 /// Where a repository's config is kept outside it.
@@ -2086,6 +2099,21 @@ mod tests {
             state: dir.join("state"),
             config: dir.join("config.toml"),
         }
+    }
+
+    #[test]
+    fn an_unconfigured_repository_is_told_how_to_get_a_config() {
+        use super::change::tests::repo_with;
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let paths = paths();
+        let err = format!(
+            "{:#}",
+            repo_layer(&paths, &repo, Some("main"), None).unwrap_err()
+        );
+        assert!(err.contains("has no review config yet"), "{err}");
+        assert!(err.contains("acr configure --repo"), "{err}");
+        assert!(err.contains(&outside_config(&paths, &repo).unwrap().display().to_string()));
+        let _ = fs::remove_dir_all(&repo);
     }
 
     fn target(repo: &Path, config: Option<PathBuf>) -> Target {
