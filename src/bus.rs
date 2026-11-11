@@ -355,7 +355,7 @@ impl Bus {
     pub fn allowed(&self, who: &Whois) -> Result<bool> {
         let me = self.me()?;
         let same_owner =
-            !me.owner.is_empty() && who.owner == me.owner && who.owner != "tagged-devices";
+            !me.owner.is_empty() && who.owner == me.owner && who.owner != crate::ask::TAGGED;
         Ok(same_owner
             || self.cfg.allow.iter().any(|a| {
                 a.eq_ignore_ascii_case(&who.owner) || a.eq_ignore_ascii_case(&who.machine)
@@ -2469,6 +2469,11 @@ pub(crate) mod tests {
     /// A bus on machine `here` with no Tailscale, no dialogs, and `api`
     /// subscribed.
     pub fn bus() -> Arc<Bus> {
+        bus_owned_by("o")
+    }
+
+    /// The same, with `owner` as this machine's owner.
+    pub fn bus_owned_by(owner: &str) -> Arc<Bus> {
         let mut cfg: Config = toml::from_str("alerts = false").unwrap();
         cfg.handoff_limit = 3;
         let bus = Bus::start(
@@ -2479,7 +2484,7 @@ pub(crate) mod tests {
         );
         *bus.me.write().unwrap() = Some(Me {
             machine: "here".into(),
-            owner: "o".into(),
+            owner: owner.into(),
             ipv4: None,
         });
         bus.db().add_agent("api", 1).unwrap();
