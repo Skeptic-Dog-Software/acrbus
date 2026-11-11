@@ -172,14 +172,16 @@ pub fn read_sized(text: &str) -> Result<Sized> {
     json_in(text)
 }
 
+/// The lenses are required, so a stray object doesn't pass for "none
+/// apply"; the escalations are required where there were some to check,
+/// which the reader of the answer sees to.
 #[derive(Debug, Default, Deserialize)]
 pub struct Selected {
     /// Lenses whose descriptions apply.
-    #[serde(default)]
     pub lenses: Vec<String>,
-    /// `always_escalate` items that apply.
+    /// `always_escalate` items that apply, if it said.
     #[serde(default)]
-    pub escalate: Vec<String>,
+    pub escalate: Option<Vec<String>>,
 }
 
 pub fn orchestrator_prompt(lenses: &[(&str, &str)], escalate: &[String]) -> String {
@@ -200,6 +202,28 @@ pub fn orchestrator_prompt(lenses: &[(&str, &str)], escalate: &[String]) -> Stri
 
 pub fn read_selected(text: &str) -> Result<Selected> {
     json_in(text)
+}
+
+/// Puts an Orchestrator's answer on which lenses and escalations apply into
+/// the form asked, from the ones it was asked about.
+pub fn reformat_selected_prompt(answer: &str, lenses: &[&str], escalate: &[String]) -> String {
+    let list = |items: Vec<String>| match items.is_empty() {
+        true => "none".to_string(),
+        false => items.join("; "),
+    };
+    format!(
+        "An Orchestrator said which lenses apply to a change and which things about it must \
+         go to a person, where its answer should have been JSON. Put it in that form: the \
+         lenses it says apply, by id, from these: {}; and the things it says apply, word for \
+         word, from these: {}. Add nothing it doesn't say, and when it's unclear about one, \
+         include it. If it says none apply, give empty lists. If the answer is cut off, or \
+         doesn't say, answer only: unreadable.\n\n\
+         The answer:\n<<<\n{}\n>>>\n\n\
+         Answer with only JSON: {{\"lenses\": [\"<id>\"], \"escalate\": [\"<item, word for word>\"]}}.",
+        list(lenses.iter().map(|l| l.to_string()).collect()),
+        list(escalate.to_vec()),
+        answer.trim()
+    )
 }
 
 /// One thing a reviewer found.
