@@ -1620,7 +1620,12 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 eprintln!("{note}");
             }
             check_machine(paths, &cfg, &target.repo, false)?;
-            change::checked_out(&target.repo, target.head.as_deref())?;
+            change::checked_out(
+                &target.repo,
+                &target.base,
+                target.head.as_deref(),
+                cfg.review_scope,
+            )?;
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
             let id = new_id();
@@ -1668,7 +1673,12 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 // Until a fix, the review is of its head, which must be
                 // checked out.
                 if run.lenses.values().all(|l| l.done.is_empty()) {
-                    change::checked_out(&run.repo, run.head.as_deref())?;
+                    change::checked_out(
+                        &run.repo,
+                        &run.base,
+                        run.head.as_deref(),
+                        cfg.review_scope,
+                    )?;
                 }
                 check_machine(paths, &cfg, &run.repo, true)?;
             }
@@ -2138,7 +2148,12 @@ fn pipeline_run(
             );
         }
     }
-    change::checked_out(&target.repo, target.head.as_deref())?;
+    change::checked_out(
+        &target.repo,
+        &target.base,
+        target.head.as_deref(),
+        cfg.review_scope,
+    )?;
     allow_copies(paths, &cfg)?;
     let id = new_id();
     let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
