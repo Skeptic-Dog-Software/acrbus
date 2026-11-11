@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
-use super::config::{Generated, REPO_CONFIG, ReviewScope};
+use super::config::{Generated, ReviewScope};
 use super::generated::CONVENTIONS;
 
 #[derive(Debug, Clone, Default)]
@@ -143,12 +143,6 @@ pub fn at_base(repo: &Path, base: &str, path: &str) -> Result<Option<String>> {
     )
     .with_context(|| format!("there's no {base} to read the config from"))?;
     Ok(git(repo, &["show", &format!("{base}:{path}")]).ok())
-}
-
-/// The repository's config, from its base.
-pub fn repo_config(repo: &Path, base: &str) -> Result<String> {
-    at_base(repo, base, REPO_CONFIG)?
-        .with_context(|| format!("{base} has no {REPO_CONFIG}; a change can't bring its own"))
 }
 
 /// The repository's name: its top directory's.
@@ -503,6 +497,8 @@ pub mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::acr::config::REPO_CONFIG;
+
     use super::*;
     use crate::util::new_id;
 
@@ -790,15 +786,15 @@ pub mod tests {
         let repo = repo_with(&[(REPO_CONFIG, "base config"), ("a.txt", "one\n")]);
         branch(&repo, "work");
         commit(&repo, &[(REPO_CONFIG, "head config")], "switch it off");
-        assert_eq!(repo_config(&repo, "main").unwrap(), "base config");
-        assert_eq!(repo_config(&repo, "work").unwrap(), "head config");
+        let config = |repo: &Path, base: &str| at_base(repo, base, REPO_CONFIG);
+        assert_eq!(config(&repo, "main").unwrap().unwrap(), "base config");
+        assert_eq!(config(&repo, "work").unwrap().unwrap(), "head config");
         // A config that only the change has doesn't count.
         let bare = repo_with(&[("a.txt", "one\n")]);
         branch(&bare, "work");
         commit(&bare, &[(REPO_CONFIG, "brought along")], "bring my own");
-        let err = format!("{:#}", repo_config(&bare, "main").unwrap_err());
-        assert!(err.contains("can't bring its own"), "{err}");
-        assert!(repo_config(&repo, "no-such-ref").is_err());
+        assert_eq!(config(&bare, "main").unwrap(), None);
+        assert!(config(&repo, "no-such-ref").is_err());
     }
 
     #[test]
