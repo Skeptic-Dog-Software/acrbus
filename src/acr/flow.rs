@@ -1304,10 +1304,20 @@ fn write_tests(
             let files = [t.file.clone()];
             if let Some(before) = before {
                 let to = before.join(&t.file);
+                let from = run.repo.join(&t.file);
+                // A pin in the file it tests goes in as its tests alone:
+                // copied whole, the file would bring the fix with it.
+                let inline = fs::read_to_string(&from)
+                    .ok()
+                    .zip(fs::read_to_string(&to).ok())
+                    .and_then(|(after, old)| stages::with_tests_of(&t.file, &old, &after));
                 let copied = to
                     .parent()
                     .map_or(Ok(()), fs::create_dir_all)
-                    .and_then(|_| fs::copy(run.repo.join(&t.file), &to).map(|_| ()));
+                    .and_then(|_| match &inline {
+                        Some(text) => fs::write(&to, text),
+                        None => fs::copy(&from, &to).map(|_| ()),
+                    });
                 if copied.is_ok() {
                     let log = before.with_extension("before.log");
                     pin.fails_before = stages::tests_pass(before, command, &files, limit, &log)
@@ -2911,6 +2921,58 @@ lenses:
             probers[1]
                 .3
                 .contains("Earlier rounds' probes are in your copy already, in `probe_test.sh`")
+        );
+    }
+
+    #[test]
+    fn a_pin_in_the_file_it_tests_is_checked_without_the_fix() {
+        use super::super::change::tests::repo_with;
+        // The pin passes only on the fixed code, so it must fail before.
+        let top = "stages: [test-writing]\ntests: {command: \"grep -q 'let x = 2' {tests}\"}";
+        let cfg = config("exception", 20, 1, "", top);
+        let code = |x: u32, tests: &str| {
+            format!("let x = {x};\n\n#[cfg(test)]\nmod tests {{\n{tests}}}\n")
+        };
+        let repo = repo_with(&[("a.src", "let x = 1;\n"), ("a.rs", &code(1, ""))]);
+        let root = std::env::temp_dir().join(format!("tb-acr-inline-pin-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.converge = true;
+        s.copies = Some(root.clone());
+        let fixed = Mutex::new(false);
+        let checkout = repo.clone();
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    fs::write(checkout.join("a.src"), "let x = 2;\n").unwrap();
+                    fs::write(checkout.join("a.rs"), code(2, "")).unwrap();
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "x is two now"}"#.to_string()
+                }
+                Role::Orchestrator if prompt.contains("You write tests for a change") => {
+                    fs::write(checkout.join("a.rs"), code(2, "    // pins x being two\n")).unwrap();
+                    r#"{"tests": [{"file": "a.rs", "pins": ["alpha-r1-1"]}], "done": "pinned"}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let c = change(&["a.src", "a.rs"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let pin = run.steelmans[0].pins[0].clone();
+        assert_eq!(pin.file, "a.rs");
+        assert_eq!(pin.fails_before, Some(true), "checked on the old code");
+        assert_eq!(pin.passes_after, Some(true));
+        assert!(
+            !run.escalations
+                .iter()
+                .any(|e| e.reason.contains("pins nothing"))
         );
     }
 

@@ -352,6 +352,48 @@ fn is_test_path(path: &str) -> bool {
     p.contains("test") || p.contains("spec")
 }
 
+/// Where a source file's own tests start, in a language that keeps them in
+/// the file they test: in Rust, the top-level `#[cfg(test)]` module, by
+/// convention the file's last item, so its tests run from there to the
+/// end. The line, from 1. None for a test file, or one with no tests in it.
+fn inline_tests_from(path: &str, text: &str) -> Option<u64> {
+    if is_test_path(path) || !path.ends_with(".rs") {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().find_map(|(i, line)| {
+        let module = lines[i + 1..]
+            .iter()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+            .is_some_and(|l| l.split_whitespace().any(|w| w == "mod"));
+        (line.trim_end() == "#[cfg(test)]" && module).then_some(i as u64 + 1)
+    })
+}
+
+/// A file as it was before a fix, with the tests it has after: for a pin
+/// that sits in the file it tests, which copying whole would bring the fix
+/// with it. None where the file keeps no tests of its own.
+pub fn with_tests_of(path: &str, before: &str, after: &str) -> Option<String> {
+    let at = |text: &str, line: u64| -> usize {
+        text.split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum()
+    };
+    let from = inline_tests_from(path, after)?;
+    let code = match inline_tests_from(path, before) {
+        Some(line) => &before[..at(before, line)],
+        None => before,
+    };
+    let code = if code.is_empty() || code.ends_with('\n') {
+        code.to_string()
+    } else {
+        format!("{code}\n")
+    };
+    Some(code + &after[at(after, from)..])
+}
+
 /// Text cut to `max` bytes, at a character's edge.
 pub fn clip_text(text: &str, max: usize) -> String {
     clip(text, max)
@@ -779,7 +821,7 @@ pub fn mutants_prompt(scope: &str, count: u32, guide: &str) -> String {
          lookup by the wrong id or key; a condition flipped or dropped; a call or a write left \
          out; a boundary moved by one; a value not cleared or not reset; an error swallowed; an \
          order swapped. Fewer only if the change has fewer places a break could go, and never \
-         pad the list with a break that changes nothing. Each must still compile. Name the test files that should catch each: the change's own tests, and the \
+         pad the list with a break that changes nothing. Each must still compile. Name the test files that should catch each, or, for tests kept in the file they test, that file: the change's own tests, and the \
          existing tests of the code it touches.\n\n\
          For each: the file; `find`, text copied exactly from that file, long enough to occur \
          only once in it; `replace`, what it becomes; and `why`, the behaviour a test should \
@@ -1140,10 +1182,20 @@ pub struct GateRuns<'a> {
 }
 
 /// The test files a diff adds or changes.
-pub fn changed_tests(diff: &str) -> Vec<String> {
+pub fn changed_tests(repo: &Path, diff: &str) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    for (f, _, _) in added_lines(diff) {
-        if is_test_path(&f) && !is_doc(&f) && !files.contains(&f) {
+    // Where each file's own tests start, as the change leaves it.
+    let mut inline: std::collections::BTreeMap<String, Option<u64>> = Default::default();
+    for (f, n, _) in added_lines(diff) {
+        if files.contains(&f) || is_doc(&f) {
+            continue;
+        }
+        let from = inline.entry(f.clone()).or_insert_with(|| {
+            fs::read_to_string(repo.join(&f))
+                .ok()
+                .and_then(|text| inline_tests_from(&f, &text))
+        });
+        if is_test_path(&f) || from.is_some_and(|from| n >= from) {
             files.push(f);
         }
     }
@@ -1159,7 +1211,7 @@ fn vary(g: &GateRuns) -> Result<(Vec<Raw>, String)> {
         .file_name()
         .map_or_else(|| "repo".into(), |n| n.to_owned());
     let copy = r.dir.join("checks").join(&name);
-    let tests: Vec<String> = changed_tests(g.diff)
+    let tests: Vec<String> = changed_tests(r.repo, g.diff)
         .into_iter()
         .filter(|t| r.repo.join(t).is_file())
         .collect();
@@ -1326,7 +1378,7 @@ fn in_the_change(repo: &Path, m: &Mutant, diff: &str) -> bool {
     let first = text[..at].matches('\n').count() as u64 + 1;
     let last = first + m.find.matches('\n').count() as u64;
     let touched = (first..=last).any(|n| lines.contains_key(&n));
-    let own = changed_tests(diff);
+    let own = changed_tests(repo, diff);
     touched && m.tests.iter().any(|t| own.contains(t))
 }
 
@@ -1444,6 +1496,65 @@ pub fn mutation_dir(copies: &Path, lens: &str, n: u32) -> PathBuf {
 mod tests {
     use super::*;
     use crate::acr::change::tests::{commit, repo_with};
+
+    const INLINE: &str = "fn x() -> u32 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn one() {\n        assert_eq!(x(), 1);\n    }\n}\n";
+
+    #[test]
+    fn a_rust_files_own_tests_count_as_the_changes_tests() {
+        assert_eq!(inline_tests_from("src/a.rs", INLINE), Some(5));
+        // Not a test module: a test-only import, an indented one, another
+        // language, or a file that's all tests anyway.
+        assert_eq!(
+            inline_tests_from("src/a.rs", "#[cfg(test)]\nuse std::fs;\n"),
+            None
+        );
+        assert_eq!(
+            inline_tests_from(
+                "src/a.rs",
+                "mod m {\n    #[cfg(test)]\n    mod tests {}\n}\n"
+            ),
+            None
+        );
+        assert_eq!(inline_tests_from("src/a.go", INLINE), None);
+        assert_eq!(inline_tests_from("tests/a.rs", INLINE), None);
+        let repo = repo_with(&[("src/a.rs", INLINE), ("src/b.rs", "fn b() {}\n")]);
+        let diff = |file: &str, line: u32| {
+            format!(
+                "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -{line},0 +{line},1 @@\n+        let y = 2;\n"
+            )
+        };
+        // A line in its tests makes it one of the change's tests; a line in
+        // its code doesn't.
+        assert_eq!(changed_tests(&repo, &diff("src/a.rs", 11)), ["src/a.rs"]);
+        assert!(changed_tests(&repo, &diff("src/a.rs", 2)).is_empty());
+        assert!(changed_tests(&repo, &diff("src/b.rs", 1)).is_empty());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn an_inline_pin_goes_onto_the_old_code_without_the_fix() {
+        let before = INLINE;
+        let after = INLINE
+            .replace("    1\n", "    2\n")
+            .replace("assert_eq!(x(), 1)", "assert_eq!(x(), 2)");
+        let pinned = with_tests_of("src/a.rs", before, &after).unwrap();
+        assert!(pinned.contains("    1\n"), "the old code: {pinned}");
+        assert!(
+            pinned.contains("assert_eq!(x(), 2)"),
+            "the new tests: {pinned}"
+        );
+        assert!(!pinned.contains("assert_eq!(x(), 1)"));
+        // Old code with no tests yet gets them after it.
+        let bare = "fn x() -> u32 {\n    1\n}";
+        let pinned = with_tests_of("src/a.rs", bare, &after).unwrap();
+        assert!(
+            pinned.starts_with("fn x() -> u32 {\n    1\n}\n#[cfg(test)]"),
+            "{pinned}"
+        );
+        // A file that keeps no tests of its own is copied whole, as before.
+        assert_eq!(with_tests_of("tests/a.rs", before, &after), None);
+        assert_eq!(with_tests_of("src/a.rs", before, "fn x() {}\n"), None);
+    }
 
     #[test]
     fn a_probers_work_goes_into_the_next_rounds_copy_and_waits_if_it_no_longer_applies() {
