@@ -901,9 +901,9 @@ fn acr_bindings(machine: &str) -> String {
     format!(
         r#"# ACR's bindings, set up by `{APP_NAME} setup acr`: Anthropic models through
 # {agent}, headless Claude Code on your subscription, so they count in
-# tokens. ACR runs on one machine: every role works in the repository, and
-# reviewers read it in place, read-only. Each timeout is 4 hours, a cap no
-# review should ever reach.
+# tokens. ACR runs on one machine. Reviewers each work in a copy of the
+# repository of their own, where they run and break things, and nothing they
+# do reaches it. Each timeout is 4 hours, a cap no review should ever reach.
 version: 1
 allowed_bindings:
   haiku-low:       # the Sizer: one quick call to pick the tier
@@ -913,11 +913,11 @@ allowed_bindings:
     tools: [Read, Grep, Glob]
     timeout: 14400
     subscription: true
-  sonnet-high:     # reviewers: most of the calls, and they attack
+  sonnet-high:     # reviewers: most of the calls; they attack, and run probes
     agent: {agent}
     model: claude-sonnet-5-5
     effort: high
-    tools: [Read, Grep, Glob]
+    tools: [Read, Grep, Glob, Bash, Write, Edit]
     timeout: 14400
     subscription: true
   opus-medium:     # the Orchestrator: few calls; without writes, fixes escalate
