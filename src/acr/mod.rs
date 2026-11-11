@@ -54,7 +54,7 @@ pub struct Target {
     #[arg(long)]
     base: String,
     /// The repository's config, kept outside it. Left out, it's
-    /// `~/.config/acrbus/acr/<repository>.yaml` if that's there, or else the
+    /// `<repository>.yaml` in the `acr` folder beside your config.toml if that's there, or else the
     /// repository's own `.acr/config.yaml`, from `--base`.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -292,7 +292,7 @@ pub enum AcrCmd {
     /// a carrier repository, and prints how to review it.
     Carry {
         /// The carrier's name. Its review config is
-        /// `~/.config/acrbus/acr/<name>.yaml`.
+        /// `<name>.yaml` in the `acr` folder beside your config.toml.
         #[arg(long)]
         name: String,
         /// The version before the work, as a file or folder of text. Left

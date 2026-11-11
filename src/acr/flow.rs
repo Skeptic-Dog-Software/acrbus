@@ -690,10 +690,10 @@ fn choose_lenses(
     if !described.is_empty() || !escalating.is_empty() {
         let prompt = roles::orchestrator_prompt(&described, escalating);
         let answer = ask(run, s, caller, Role::Orchestrator, &prompt, Some(artifact))
-            .and_then(|text| roles::read_selected(&text));
+            .and_then(|text| selected_of(run, s, caller, &text, &described, escalating));
         match answer {
             Ok(selected) => {
-                for item in selected.escalate {
+                for item in selected.escalate.unwrap_or_default() {
                     if cfg.always_escalate.contains(&item) {
                         escalate(run, format!("always_escalate: {item}"));
                     }
@@ -1466,6 +1466,39 @@ fn prune_copies(root: &Path) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Which lenses and escalations an Orchestrator's answer picks. One written
+/// in prose is put in form by one more call; only an answer that's still
+/// unreadable goes to a person, as no check of the change's descriptions.
+fn selected_of(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    text: &str,
+    described: &[(&str, &str)],
+    escalating: &[String],
+) -> Result<roles::Selected> {
+    // An answer that leaves out the escalations it was asked about would
+    // pass for "none apply", which goes to no person.
+    let read = |text: &str| {
+        let selected = roles::read_selected(text)?;
+        if !escalating.is_empty() && selected.escalate.is_none() {
+            bail!("the answer doesn't say which things must go to a person");
+        }
+        Ok(selected)
+    };
+    let unread = match read(text) {
+        Ok(selected) => return Ok(selected),
+        Err(e) => e,
+    };
+    let ids: Vec<&str> = described.iter().map(|(id, _)| *id).collect();
+    let prompt = roles::reformat_selected_prompt(text, &ids, escalating);
+    ask(run, s, caller, Role::Sizer, &prompt, None)
+        .and_then(|text| read(&text))
+        .with_context(|| {
+            format!("{unread:#}, and putting its answer in the form asked didn't work either")
+        })
 }
 
 /// The briefs in a briefer's answer. One written in prose is put in form
@@ -3365,6 +3398,57 @@ lenses:
             !counted.is_empty() && counted.iter().all(|b| *b == other),
             "{counted:?}"
         );
+    }
+
+    #[test]
+    fn an_orchestrator_that_picks_lenses_in_prose_is_put_in_form() {
+        let extra = r#"  - {id: gamma, criteria: g, triggers: {description: "touches storage"}}"#;
+        let top = "always_escalate: [\"a change to storage\"]";
+        for (form, picked) in [
+            (
+                r#"{"lenses": ["gamma"], "escalate": ["a change to storage"]}"#,
+                true,
+            ),
+            // A form that leaves a list out passes for nothing, so it's none.
+            (r#"{"lenses": ["gamma"]}"#, false),
+            ("unreadable", false),
+        ] {
+            let cfg = config("exception", 1, 1, extra, top);
+            let fake = Fake::new(|role, prompt: &str| {
+                Ok(match role {
+                    Role::Orchestrator if prompt.contains("say which of these apply") => {
+                        // A stray object first, then prose: neither is the answer.
+                        "Note {\"x\": 1}. gamma applies: it's a change to storage.".to_string()
+                    }
+                    Role::Sizer if prompt.contains("An Orchestrator said which lenses") => {
+                        assert!(prompt.contains("from these: gamma;"), "{prompt}");
+                        assert!(prompt.contains("a change to storage"), "{prompt}");
+                        form.to_string()
+                    }
+                    Role::Reviewer => CLEAN.to_string(),
+                    _ => NOTHING.to_string(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            let reasons: Vec<&str> = run.escalations.iter().map(|e| e.reason.as_str()).collect();
+            if picked {
+                assert!(run.lenses.contains_key("gamma"), "{form}");
+                assert!(
+                    reasons.contains(&"always_escalate: a change to storage"),
+                    "{reasons:?}"
+                );
+                assert!(
+                    !reasons.iter().any(|r| r.contains("couldn't check")),
+                    "{reasons:?}"
+                );
+            } else {
+                let unread = reasons.iter().any(|r| {
+                    r.contains("couldn't check this change's descriptions")
+                        && r.contains("didn't work either")
+                });
+                assert!(unread, "{form}: {reasons:?}");
+            }
+        }
     }
 
     #[test]
