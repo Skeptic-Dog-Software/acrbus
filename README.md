@@ -107,6 +107,9 @@ service. Each part is also its own command: `acrbus service install`,
 
 ## Review a change
 
+[The quickstart](docs/quickstart.md) walks through it, for you or your
+agent, step by step, with what to check at each. In short:
+
 1. Allow the repository: `acrbus acr add-repo <path>`.
 2. Configure it: `acrbus acr configure --repo <path>`. The configurer reviews
    the whole repository and proposes its review config, at
@@ -123,6 +126,7 @@ the config, for reading a proposal or writing one yourself, and
 
 | Command | Does |
 | --- | --- |
+| `acrbus acr doctor` | Check this machine and a repository are ready for review, and say what to fix. |
 | `acrbus acr validate`, `acrbus acr schema` | Check a repository's config, or print its schema. |
 | `acrbus acr plan` | Show the tier, lenses, bindings and estimated cost, with no model calls. |
 | `acrbus acr configure` | Have the configurer review the whole repository and propose its review config. |
@@ -209,6 +213,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 | `timeout_secs` | How long a run can take. Default 600. |
 | `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. Either way, `acrbus bridge status` shows when each running request last used CPU or changed a file, which tells a slow run from a stalled one. |
 | `env`, `secrets` | More environment, and variables read from files only you can read. |
+| `attachments` | `"path"`, the default, tells the agent where each attachment is. `"inline"` puts each one's text in its message, for an agent that can read only its working directory, since attachments are kept outside it. |
 
 | Placeholder | Is |
 | --- | --- |

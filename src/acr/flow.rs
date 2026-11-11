@@ -1160,9 +1160,12 @@ fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> (Option<PathBuf>, Op
 /// What the test gate found this round, for the reviewers who follow it:
 /// what it ran, and each gap with how it was rated.
 fn gate_report(round: &Round) -> String {
-    let mut out = String::from(
-        "# What the test gate found this round\n\nIt ran the change's tests with coverage, \
-         against mutants of its code, and other ways: don't repeat those runs.\n",
+    // Said only of what it ran: with no coverage command, it measured none.
+    let coverage = round.notes.iter().any(|n| n.contains("coverage:"));
+    let mut out = format!(
+        "# What the test gate found this round\n\nIt ran the change's tests{}, against mutants \
+         of its code, and other ways: don't repeat those runs.\n",
+        if coverage { " with coverage" } else { "" }
     );
     for note in &round.notes {
         out.push_str(&format!("- {note}\n"));
@@ -3211,6 +3214,16 @@ lenses:
                 "{mode:?}"
             );
             assert_eq!(run.lenses["alpha"].rounds.len(), 1, "{mode:?}");
+            // With no coverage command, the reviewers aren't told it ran one.
+            let told: Vec<_> = calls
+                .iter()
+                .filter(|c| c.0 == Role::Reviewer && c.3.contains("What the test gate found"))
+                .collect();
+            assert!(!told.is_empty(), "{mode:?}");
+            assert!(
+                told.iter().all(|c| !c.3.contains("tests with coverage")),
+                "{mode:?}"
+            );
         }
     }
 

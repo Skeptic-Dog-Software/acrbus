@@ -1227,11 +1227,28 @@ fn run_tests(
     limit: Duration,
     log: &Path,
 ) -> Result<(Ran, String)> {
+    run_tests_in(dir, command, tests, limit, log, None)
+}
+
+/// [`run_tests`], with only `env` in its environment, if given: to run the
+/// tests as an agent's runs would.
+fn run_tests_in(
+    dir: &Path,
+    command: &str,
+    tests: &[String],
+    limit: Duration,
+    log: &Path,
+    env: Option<&[(String, String)]>,
+) -> Result<(Ran, String)> {
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
     let file = fs::File::create(log)?;
-    let mut child = Command::new("sh")
+    let mut sh = Command::new("sh");
+    if let Some(env) = env {
+        sh.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    let mut child = sh
         .arg("-c")
         .arg(command_line(command, tests))
         .current_dir(dir)
@@ -1612,11 +1629,25 @@ pub fn tests_pass(
     limit: Duration,
     log: &Path,
 ) -> Result<Option<bool>> {
-    Ok(match run_tests(dir, command, tests, limit, log)?.0 {
-        Ran::Passed => Some(true),
-        Ran::Failed => Some(false),
-        Ran::TimedOut => None,
-    })
+    tests_pass_in(dir, command, tests, limit, log, None)
+}
+
+/// [`tests_pass`], with only `env` in the environment, if given.
+pub fn tests_pass_in(
+    dir: &Path,
+    command: &str,
+    tests: &[String],
+    limit: Duration,
+    log: &Path,
+    env: Option<&[(String, String)]>,
+) -> Result<Option<bool>> {
+    Ok(
+        match run_tests_in(dir, command, tests, limit, log, env)?.0 {
+            Ran::Passed => Some(true),
+            Ran::Failed => Some(false),
+            Ran::TimedOut => None,
+        },
+    )
 }
 
 /// The test writer's brief: pins for the blockers just fixed, and tests

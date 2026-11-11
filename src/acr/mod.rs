@@ -142,6 +142,18 @@ pub enum AcrCmd {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Whether this machine, and a repository, are ready for review: each
+    /// check says it's fine, or what's wrong and the command that fixes it.
+    /// It runs the review config's test commands in a copy, as a review
+    /// does, and as its reviewers would, and signs in with ACR's token: one
+    /// small model call.
+    Doctor {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Leave out running the tests, which can take a while.
+        #[arg(long)]
+        no_tests: bool,
+    },
     /// Print the published schema.
     Schema,
     /// How the pipeline's Judge rates what each key's own review found, set
@@ -547,6 +559,308 @@ fn check_bridges(
         bail!("the {agent} bridge would refuse every call on binding {name}: {why}. {fix}");
     }
     Ok(())
+}
+
+/// What `acr doctor` says of one check.
+#[derive(Debug, PartialEq)]
+enum Said {
+    Ok(String),
+    Note(String),
+    Fix(String),
+}
+
+/// `acr doctor`: prints each check, and returns whether nothing needs a fix.
+fn doctor(paths: &Paths, repo: &Path, with_tests: bool) -> Result<bool> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("finding {}", repo.display()))?;
+    println!("{APP_NAME} acr doctor: {}", repo.display());
+    let mut fixes = 0;
+    for said in diagnose(paths, &repo, with_tests) {
+        match said {
+            Said::Ok(text) => println!("  ok    {text}"),
+            Said::Note(text) => println!("  note  {text}"),
+            Said::Fix(text) => {
+                fixes += 1;
+                println!("  fix   {text}");
+            }
+        }
+    }
+    match fixes {
+        0 => println!(
+            "Ready: `{APP_NAME} acr plan --repo {} --base <ref>` shows a review before it runs.",
+            repo.display()
+        ),
+        n => println!("{n} to fix. Run `{APP_NAME} acr doctor` again after."),
+    }
+    Ok(fixes == 0)
+}
+
+/// Each of `acr doctor`'s checks, in order, stopping where the rest can't
+/// be checked.
+fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
+    let mut out = Vec::new();
+    let shown = repo.display();
+    // The bus, and the machine it says this is.
+    let machine = match this_machine(paths) {
+        Ok(m) => {
+            out.push(Said::Ok(format!("the bus answers, on {m}")));
+            Some(m)
+        }
+        Err(e) => {
+            out.push(Said::Fix(format!(
+                "the bus doesn't answer ({e:#}): start it with `{APP_NAME} service install`"
+            )));
+            None
+        }
+    };
+    // The user's bindings.
+    let user_path = user_config_path(paths);
+    if !user_path.exists() {
+        out.push(Said::Fix(format!(
+            "there's no {}, which names the models a review uses: `{APP_NAME} setup acr` writes \
+             one, with its bridge and token",
+            user_path.display()
+        )));
+        return out;
+    }
+    let user = match config::load_user(&user_path) {
+        Ok(u) => u,
+        Err(e) => {
+            out.push(Said::Fix(format!("{e:#}")));
+            return out;
+        }
+    };
+    // The repository is one the reviewers' bridge may work in.
+    let reviewers = user
+        .defaults
+        .as_ref()
+        .and_then(|d| d.bindings.get(&Role::Reviewer))
+        .and_then(|name| user.allowed_bindings.get(name))
+        .and_then(|b| b.agent.split_once('@').map(|(a, _)| a.to_string()));
+    if let Some(agent) = &reviewers
+        && let Ok(settings) = crate::bridge::load(paths, agent)
+    {
+        let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let allowed = std::iter::once(&settings.working_directory)
+            .chain(&settings.options.workdirs)
+            .any(|dir| repo.starts_with(real(dir)));
+        out.push(match allowed {
+            true => Said::Ok(format!("the {agent} bridge may work in it")),
+            false => Said::Fix(format!(
+                "the {agent} bridge may not work in it: `{APP_NAME} acr add-repo {shown}`"
+            )),
+        });
+    }
+    // The repository's review config.
+    let (text, source) = match repo_layer(paths, repo, Some("HEAD"), None) {
+        Ok(found) => found,
+        Err(e) => {
+            out.push(Said::Fix(format!("{e:#}")));
+            return out;
+        }
+    };
+    let cfg = match config::parse_repo(&text)
+        .and_then(|p| config::resolve(&user, p, &Flags::default()))
+        .and_then(|c| c.check_bindings().map(|_| c))
+    {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            out.push(Said::Fix(format!(
+                "its review config doesn't resolve: {e:#}"
+            )));
+            return out;
+        }
+    };
+    let from = match &source {
+        Source::File(f) => f.display().to_string(),
+        Source::Base => format!("{REPO_CONFIG} on HEAD"),
+    };
+    out.push(Said::Ok(format!(
+        "its review config, {from}: {} tiers, {} lenses",
+        cfg.tiers.len(),
+        cfg.lenses.len()
+    )));
+    if cfg.probes_off {
+        out.push(Said::Note(config::PROBES_OFF.to_string()));
+    }
+    // Every binding against its bridge, working here.
+    if let Some(machine) = &machine {
+        match check_on(paths, &cfg, machine, repo, false) {
+            Ok(()) => out.push(Said::Ok(format!(
+                "every binding is on {machine}, and its bridge takes what it asks for, here"
+            ))),
+            Err(e) => {
+                let e = format!("{e:#}");
+                let add = if e.contains("working directory") {
+                    format!(
+                        " If the bridge doesn't allow this repository: `{APP_NAME} acr add-repo {shown}`."
+                    )
+                } else {
+                    String::new()
+                };
+                out.push(Said::Fix(format!("{e}.{add}")));
+            }
+        }
+    }
+    // Calibration.
+    let decided = not_findings(&cfg, &source, repo, "HEAD").unwrap_or_default();
+    match (change::name(repo), fingerprint(&cfg, &text, &decided)) {
+        (Ok(name), Ok(now)) => {
+            let record = calibration::load(&paths.state, &name).unwrap_or_default();
+            match calibration::standing(&record, &now) {
+                calibration::Standing::Calibrated => out.push(Said::Ok(format!("{name} is calibrated"))),
+                calibration::Standing::JudgeChanged => out.push(Said::Note(format!(
+                    "{name} is calibrated, but on an earlier Judge: `{APP_NAME} acr calibration \
+                     --repo {shown} --accept` when you've read its config again"
+                ))),
+                calibration::Standing::ConfigChanged | calibration::Standing::Never => {
+                    out.push(Said::Fix(format!(
+                        "{name} isn't calibrated: read its config, then `{APP_NAME} acr calibration \
+                         --repo {shown} --accept`"
+                    )))
+                }
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => out.push(Said::Fix(format!("{e:#}"))),
+    }
+    // ACR's own Claude Code bridge: its token signs in.
+    let mut agents: Vec<&str> = cfg
+        .chosen_bindings()
+        .iter()
+        .filter_map(|(_, b)| b.agent.split_once('@').map(|(a, _)| a))
+        .collect();
+    agents.dedup();
+    for agent in agents {
+        if agent != crate::setup::ACR_AGENT {
+            continue;
+        }
+        let Ok(settings) = crate::bridge::load(paths, agent) else {
+            continue;
+        };
+        if let Some(token) = settings.secrets.get("CLAUDE_CODE_OAUTH_TOKEN") {
+            match crate::setup::check_token(&settings.command, token) {
+                Ok(()) => out.push(Said::Ok(format!("the {agent} bridge's token signs in"))),
+                Err(e) => out.push(Said::Fix(format!(
+                    "the {agent} bridge's token doesn't sign in ({e:#}): `rm {}` and \
+                     `{APP_NAME} setup acr` for a new one",
+                    token.display()
+                ))),
+            }
+        }
+    }
+    if with_tests {
+        out.extend(doctor_tests(paths, &cfg, repo));
+    }
+    out
+}
+
+/// The review config's test commands, run in a copy of the repository as a
+/// review runs them, and as its reviewers would, with their bridge's HOME
+/// and PATH: tests that pass for you can fail for them.
+fn doctor_tests(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
+    let mut out = Vec::new();
+    let tests = &cfg.tests;
+    let Some(command) = tests.command.clone().or_else(|| stages::test_command(repo)) else {
+        out.push(Said::Note(
+            "no test command, and none could be found: set tests.command in the review config, \
+             or reviews can't run the tests"
+                .into(),
+        ));
+        return out;
+    };
+    let root = copies_root(paths).join(format!("doctor-{}", crate::util::new_id()));
+    let copy = root.join(repo.file_name().unwrap_or_default());
+    let limit = std::time::Duration::from_secs(tests.timeout.unwrap_or(900));
+    if let Err(e) = change::copy_of(repo, &copy) {
+        out.push(Said::Fix(format!(
+            "couldn't copy the repository to run its tests: {e:#}"
+        )));
+        return out;
+    }
+    let ran = |what: &str, cmd: &str, env: Option<&[(String, String)]>| {
+        let log = root.join(format!("{what}.log"));
+        let result = stages::tests_pass_in(&copy, cmd, &[], limit, &log, env);
+        (result, log)
+    };
+    let mut steps: Vec<(&str, String)> = Vec::new();
+    if let Some(setup) = &tests.setup {
+        steps.push(("setup", setup.clone()));
+    }
+    steps.push(("command", command.clone()));
+    if let Some(coverage) = &tests.coverage {
+        steps.push(("coverage", coverage.clone()));
+    }
+    let mut all = true;
+    for (what, cmd) in &steps {
+        let (result, log) = ran(what, cmd, None);
+        match result {
+            Ok(Some(true)) => out.push(Said::Ok(format!(
+                "tests.{what} runs in a copy, as a review runs it"
+            ))),
+            Ok(Some(false)) => {
+                all = false;
+                out.push(Said::Fix(format!(
+                    "tests.{what} fails in a copy of the repository, as a review runs it: see {}",
+                    log.display()
+                )));
+            }
+            Ok(None) => {
+                all = false;
+                out.push(Said::Fix(format!(
+                    "tests.{what} ran past its {} s limit: raise tests.timeout, or make it faster \
+                     ({})",
+                    limit.as_secs(),
+                    log.display()
+                )));
+            }
+            Err(e) => {
+                all = false;
+                out.push(Said::Fix(format!("tests.{what} couldn't run: {e:#}")));
+            }
+        }
+        if !all {
+            break;
+        }
+    }
+    // As reviewers run it: only those that can run things do.
+    let reviewer = cfg.binding(Role::Reviewer, None).ok();
+    let agent = reviewer
+        .filter(|b| b.changes_files())
+        .and_then(|b| b.agent.split_once('@').map(|(a, _)| a.to_string()));
+    if all
+        && let Some(agent) = agent
+        && let Ok(settings) = crate::bridge::load(paths, &agent)
+    {
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".into(), settings.home.display().to_string()),
+            ("PATH".into(), settings.path.clone()),
+            ("TMPDIR".into(), std::env::temp_dir().display().to_string()),
+        ];
+        for key in ["USER", "LOGNAME", "LANG", "SHELL"] {
+            if let Ok(v) = std::env::var(key) {
+                env.push((key.into(), v));
+            }
+        }
+        env.extend(settings.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let (result, log) = ran("as-reviewers", &command, Some(&env));
+        match result {
+            Ok(Some(true)) => out.push(Said::Ok(format!(
+                "the tests run as the {agent} bridge's reviewers would, with its HOME and PATH"
+            ))),
+            _ => out.push(Said::Fix(format!(
+                "the tests pass for you but not as the {agent} bridge's reviewers would run them, \
+                 with HOME {} and PATH {}: what they need, a toolchain or a filled cache, isn't \
+                 there. Fill it in that HOME, or have the runbook and tests.command set it \
+                 ({})",
+                settings.home.display(),
+                settings.path,
+                log.display()
+            ))),
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+    out
 }
 
 /// This machine's name on the tailnet, as the bus knows it.
@@ -1051,6 +1365,11 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
     keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
+        AcrCmd::Doctor { repo, no_tests } => {
+            if !doctor(paths, &repo, !no_tests)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
         AcrCmd::AddRepo { path, bridge } => crate::setup::acr_repo(paths, &path, true, &bridge)?,
         AcrCmd::RemoveRepo { path, bridge } => {
             crate::setup::acr_repo(paths, &path, false, &bridge)?
@@ -2290,6 +2609,77 @@ mod tests {
              defaults:\n  bindings: {sizer: fits, reviewer: fits, orchestrator: fits, judge: fits}\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_doctor_says_what_to_fix_and_how() {
+        use super::change::tests::repo_with;
+        let fixes = |said: &[Said]| -> Vec<String> {
+            said.iter()
+                .filter_map(|s| match s {
+                    Said::Fix(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let repo = repo.canonicalize().unwrap();
+        // Nothing set up: no bus, and no bindings, and it stops there.
+        let paths = paths();
+        let said = diagnose(&paths, &repo, false);
+        let f = fixes(&said);
+        assert!(f[0].contains("service install"), "{f:?}");
+        assert!(f[1].contains("setup acr"), "{f:?}");
+        assert_eq!(f.len(), 2, "{said:?}");
+        // Bindings, and a bridge that may work here, but no review config.
+        let user = bridge_and_bindings(&paths, &repo);
+        let yaml = "version: 1\nallowed_bindings:\n\
+            \x20 fits: {agent: agent-x@here, model: m, effort: high, tools: [Read, Bash], timeout: 600}\n\
+            defaults:\n  bindings: {sizer: fits, reviewer: fits, orchestrator: fits, judge: fits}\n";
+        fs::write(user_config_path(&paths), yaml).unwrap();
+        assert!(user.allowed_bindings.contains_key("fits"));
+        let said = diagnose(&paths, &repo, false);
+        assert!(
+            said.contains(&Said::Ok("the agent-x bridge may work in it".into())),
+            "{said:?}"
+        );
+        let f = fixes(&said);
+        assert!(
+            f.iter().any(|t| t.contains("acr configure --repo")),
+            "{f:?}"
+        );
+        // A repository it may not work in is told to add it.
+        let elsewhere = repo_with(&[("b.txt", "two\n")]);
+        let f = fixes(&diagnose(&paths, &elsewhere.canonicalize().unwrap(), false));
+        assert!(f.iter().any(|t| t.contains("acr add-repo")), "{f:?}");
+        // A config, not yet accepted, whose tests pass as you run them but
+        // not with the reviewers' bridge's PATH, /bin, which has no git.
+        let kept = outside_config(&paths, &repo).unwrap();
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(
+            &kept,
+            "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+             lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n\
+             stages: []\ntests: {command: 'command -v git', timeout: 60}\n",
+        )
+        .unwrap();
+        let said = diagnose(&paths, &repo, true);
+        let f = fixes(&said);
+        assert!(f.iter().any(|t| t.contains("isn't calibrated")), "{f:?}");
+        assert!(
+            said.contains(&Said::Ok(
+                "tests.command runs in a copy, as a review runs it".into()
+            )),
+            "{said:?}"
+        );
+        assert!(
+            f.iter()
+                .any(|t| t.contains("pass for you but not as the agent-x bridge's reviewers")),
+            "{f:?}"
+        );
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
