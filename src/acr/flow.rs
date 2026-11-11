@@ -823,7 +823,7 @@ fn attack(
                 &prompt,
                 Some(&artifacts.diff),
             )
-            .and_then(|text| stages::read_briefs(&text))
+            .and_then(|text| briefs_of(run, s, caller, &text, &unbriefed))
             {
                 Ok(briefs) => briefs,
                 Err(e) => {
@@ -1394,6 +1394,27 @@ fn prune_copies(root: &Path) {
 /// for, has its report put in that form by a quick call with the Sizer's
 /// binding, adding and dropping nothing: a review isn't thrown away over its
 /// format. A report that still can't be read is a failure, as before.
+/// The briefs in a briefer's answer. One written in prose is put in form
+/// by one more call; only an answer that's still unreadable is no brief.
+fn briefs_of(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    text: &str,
+    lenses: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let unread = match stages::read_briefs(text) {
+        Ok(briefs) => return Ok(briefs),
+        Err(e) => e,
+    };
+    let prompt = stages::reformat_briefs_prompt(text, lenses);
+    ask(run, s, caller, Role::Sizer, &prompt, None)
+        .and_then(|text| stages::read_briefs(&text))
+        .with_context(|| {
+            format!("{unread:#}, and putting its briefs in the form asked didn't work either")
+        })
+}
+
 fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> Result<Vec<Raw>> {
     let unread = match roles::read_findings(text) {
         Ok(found) => return Ok(found),
@@ -3177,6 +3198,58 @@ lenses:
         );
         drop(calls);
         assert_eq!(fake.count(Role::Orchestrator), 1, "the brief, once a round");
+    }
+
+    #[test]
+    fn briefs_written_in_prose_are_put_in_form_not_lost() {
+        let top = "stages: [brief]";
+        for (form, briefed) in [
+            (
+                r#"{"briefs": {"alpha": "Break the lookup in a.src."}}"#,
+                true,
+            ),
+            ("unreadable", false),
+        ] {
+            let cfg = config("exception", 1, 1, "", top);
+            let fake = Fake::new(|role, prompt: &str| {
+                Ok(match role {
+                    Role::Orchestrator if prompt.contains("You brief the reviewers") => {
+                        "alpha: break the lookup in a.src.".to_string()
+                    }
+                    Role::Sizer if prompt.contains("A briefer wrote briefs") => {
+                        assert!(prompt.contains("Lenses: alpha, beta."), "{prompt}");
+                        assert!(prompt.contains("alpha: break the lookup in a.src."));
+                        form.to_string()
+                    }
+                    Role::Reviewer => CLEAN.to_string(),
+                    _ => NOTHING.to_string(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            let failed = failures(&run);
+            let calls = fake.calls.lock().unwrap();
+            let alpha = calls
+                .iter()
+                .find(|c| c.0 == Role::Reviewer && c.3.contains("reviewer for alpha."))
+                .unwrap();
+            assert_eq!(alpha.3.contains("Break the lookup in a.src."), briefed);
+            // Only a briefer still unreadable after that is a failure.
+            assert_eq!(failed.is_empty(), briefed, "{failed:?}");
+            if !briefed {
+                assert!(failed[0].contains("didn't work either"), "{failed:?}");
+            }
+            drop(calls);
+            // The extra call is counted with the rest.
+            let counted = run.usage.iter().filter(|u| u.role == Role::Sizer).count();
+            assert_eq!(counted, fake.count(Role::Sizer));
+            assert!(
+                fake.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.3.contains("A briefer wrote"))
+            );
+        }
     }
 
     #[test]

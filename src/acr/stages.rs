@@ -132,6 +132,22 @@ struct Briefs {
     briefs: std::collections::BTreeMap<String, String>,
 }
 
+/// Puts a briefer's answer that isn't in the form asked into it: briefs
+/// written in prose are briefs all the same.
+pub fn reformat_briefs_prompt(answer: &str, lenses: &[String]) -> String {
+    format!(
+        "A briefer wrote briefs for the reviewers of a change, one per lens, where its answer \
+         should have been JSON. Put them in that form: for each of these lenses that it \
+         briefs, its brief, as it wrote it. Lenses: {}. Add nothing it doesn't say, and leave \
+         out a lens it doesn't brief. If it briefs none of them, or the answer is cut off, \
+         answer only: unreadable.\n\n\
+         The answer:\n<<<\n{}\n>>>\n\n\
+         Answer with only JSON: {{\"briefs\": {{\"<lens id>\": \"<the brief>\"}}}}.",
+        lenses.join(", "),
+        answer.trim()
+    )
+}
+
 pub fn read_briefs(text: &str) -> Result<std::collections::BTreeMap<String, String>> {
     Ok(super::roles::json_in::<Briefs>(text)?.briefs)
 }
