@@ -83,7 +83,19 @@ lenses:
   - determinism across time zones, orders and repeat runs;
   - network denied, with a positive control;
   - claims checked against the code, line numbers included;
-  - a generated-code regeneration compared with what's committed.
+  - a generated-code regeneration compared with what's committed;
+  - for concurrency, or work deferred past a lock or a return, an
+    interleaving table first: for each changed method and each piece of
+    shared or deferred state, every other method, thread or goroutine that
+    can run at the same moment, and whose context, cancellation and error
+    the deferred work uses. A finding names its interleaving.
+
+  A reviewer who only reads traces each path on its own, and calls code
+  safe that two paths break together: a shutdown that returns while
+  another call is still writing, or cleanup that runs under another
+  caller's context and is cancelled with it. Reviewers who write and run
+  tests catch those that readers miss. Where a repository has
+  concurrency, give its lens this attack, and turn on `probes`.
 - **`blocker`** says what blocks in this lens: its dimension's definition
   of a blocker, set at calibration (§7) from the dimensions the
   repository's full review used. Reviewers get it, and a finding the Judge
@@ -161,7 +173,10 @@ tests:
   settle, not conclusions.
 - **`context`**: every role gets what git says about the changed files.
 - **`claims`**, **`mutation`** and **`probes`** are lenses the framework
-  adds. Mutation runs `tests.command` itself, in throwaway copies, once
+  adds. Probers write scenarios as tests in copies of their own and run
+  them, concurrent calls and hangs among them. What a prober writes is
+  kept: after a fix, the next round's probers start with it in their
+  copies and run it again, which tells whether the fix held. Mutation runs `tests.command` itself, in throwaway copies, once
   clean and then once per mutant, so the command must work in a fresh copy
   with no one at the keyboard. `{tests}` stands for the test files a mutant
   names. Put cheap setup in front of it, such as the offline dependency

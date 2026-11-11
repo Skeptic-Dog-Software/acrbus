@@ -691,7 +691,13 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         // It's told to wait on a long run, not keep checking on one; a
         // reviewer that runs nothing isn't.
         assert!(running.contains(WAIT) && !brief.contains(WAIT));
-        let probes = super::super::stages::probes_prompt("the whole change", "", None, "");
+        let probes = super::super::stages::probes_prompt(
+            "the whole change",
+            "",
+            None,
+            "",
+            &super::super::stages::Carried::Nothing,
+        );
         let claims = super::super::stages::claims_prompt(&[], "the whole change", "", true, "");
         assert!(probes.contains(WAIT) && claims.contains(WAIT));
     }
