@@ -984,6 +984,8 @@ struct Quiet {
     shake: Duration,
     checked: Instant,
     since: Instant,
+    /// When activity was last seen, in Unix milliseconds, for status.
+    active_ms: i64,
     seen: Activity,
     shaking: Option<(Instant, Vec<Process>)>,
 }
@@ -1001,14 +1003,15 @@ impl Quiet {
             shake,
             checked: Instant::now(),
             since: Instant::now(),
+            active_ms: now_ms(),
             seen: Activity::of(pid, dirs),
             shaking: None,
         }
     }
 
     /// What the shake found, once the run is abandoned.
+    /// Activity is watched whether or not quiet ends a run, for status.
     fn check(&mut self, pid: i32, dirs: &[&Path]) -> Option<String> {
-        let idle = self.idle?;
         if self.checked.elapsed() < self.every {
             return None;
         }
@@ -1017,9 +1020,11 @@ impl Quiet {
         if now != self.seen {
             self.seen = now;
             self.since = Instant::now();
+            self.active_ms = now_ms();
             self.shaking = None;
             return None;
         }
+        let idle = self.idle?;
         match &self.shaking {
             None if self.since.elapsed() >= idle => {
                 let tree = tree_of(pid, &process_table());
@@ -1223,6 +1228,10 @@ struct Running {
     sender: String,
     since: i64,
     attempt: u32,
+    /// When its process tree last used CPU or changed a file, in Unix
+    /// milliseconds: what tells a slow run from a stalled one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2306,6 +2315,7 @@ impl Bridge {
                     sender: msg.from.clone(),
                     since: now_ms(),
                     attempt: journal.attempts,
+                    active: None,
                 },
             );
         });
@@ -2546,6 +2556,7 @@ impl Bridge {
         let deadline = Instant::now() + Duration::from_secs(plan.timeout);
         let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
         let mut quiet = Quiet::new(self.cfg.idle_secs, pid, dirs);
+        let mut shown = 0;
         let cut_short = loop {
             if exited(pid) {
                 break None;
@@ -2559,6 +2570,14 @@ impl Bridge {
             if let Some(shaken) = quiet.check(pid, dirs) {
                 self.log(format!("{}: abandoned, so ended: {shaken}", msg.id));
                 break Some(End::Quiet(shaken));
+            }
+            if quiet.active_ms != shown {
+                shown = quiet.active_ms;
+                self.report(|r| {
+                    if let Some(run) = r.running.get_mut(&msg.id) {
+                        run.active = Some(shown);
+                    }
+                });
             }
             let stop_at = self.lock_state().stop_at;
             if stop_at.is_some_and(|at| at.elapsed() >= grace) {
@@ -2654,8 +2673,12 @@ fn describe(paths: &Paths, agent: &str, bus: Option<&Status>) -> String {
         ));
         if r.alive() {
             for (id, run) in &r.running {
+                let active = run
+                    .active
+                    .map(|at| format!(", last active {}", ago(at, now)))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "  Running {id} from {}, started {}, try {}\n",
+                    "  Running {id} from {}, started {}{active}, try {}\n",
                     run.sender,
                     ago(run.since, now),
                     run.attempt
@@ -3187,6 +3210,32 @@ mod tests {
         let id = rig.ask("hello");
         assert_eq!(rig.reply_to(&id), "done");
         bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_runs_activity_is_watched_even_when_quiet_ends_nothing() {
+        let dir = std::env::temp_dir().join(format!("tb-quiet-{}", crate::util::new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut quiet = Quiet::new(0, pid, &[&dir]);
+        let first = quiet.active_ms;
+        let due = |q: &mut Quiet| q.checked = Instant::now() - Duration::from_secs(3600);
+        thread::sleep(Duration::from_millis(20));
+        due(&mut quiet);
+        assert_eq!(quiet.check(pid, &[&dir]), None);
+        assert_eq!(quiet.active_ms, first, "nothing happened");
+        fs::write(dir.join("step"), "1").unwrap();
+        due(&mut quiet);
+        assert_eq!(
+            quiet.check(pid, &[&dir]),
+            None,
+            "with no idle limit, never ended"
+        );
+        assert!(quiet.active_ms > first, "a file it changed is activity");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4863,7 +4912,7 @@ mod tests {
         assert!(describe(&paths, "broken", None).contains("Config problem"));
         let dir = state_dir(&paths, "api");
         fs::create_dir_all(&dir).unwrap();
-        let report = Report {
+        let mut report = Report {
             pid: process::id(),
             started_at: now_ms(),
             answered: 3,
@@ -4874,9 +4923,25 @@ mod tests {
             }),
             ..Report::default()
         };
+        report.running.insert(
+            "R1".into(),
+            Running {
+                sender: "acr@here".into(),
+                since: now_ms() - 600_000,
+                attempt: 1,
+                active: Some(now_ms() - 120_000),
+            },
+        );
         write_json(&dir.join("status.json"), &report).unwrap();
         let said = describe(&paths, "api", None);
         assert!(said.contains("running as process"), "{said}");
+        // How long since a run last did anything tells slow from stalled.
+        let running = said.lines().find(|l| l.contains("Running R1")).unwrap();
+        assert!(running.contains(", last active "), "{running}");
+        assert!(
+            running.contains(&ago(now_ms() - 120_000, now_ms())),
+            "{running}"
+        );
         assert!(said.contains("Answered 3"), "{said}");
         assert!(said.contains("it broke"), "{said}");
         assert!(said.contains("the daemon isn't answering"), "{said}");

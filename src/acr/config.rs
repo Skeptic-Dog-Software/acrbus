@@ -276,6 +276,11 @@ pub struct Policy {
     /// things gets it, and the brief stage too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runbook: Option<String>,
+    /// The models a review of this repository may use, as patterns such as
+    /// `example/*`: every binding a review would call, fallbacks too, must name
+    /// a model one matches. Left out, any model the user's bindings name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 /// What a careful reviewer does by habit, made part of every round.
@@ -477,6 +482,7 @@ impl Policy {
         self.stages = later.stages.or(self.stages);
         self.tests = later.tests.or(self.tests);
         self.runbook = later.runbook.or(self.runbook);
+        self.allowed_models = later.allowed_models.or(self.allowed_models);
         self
     }
 }
@@ -517,6 +523,11 @@ pub struct Binding {
     /// never in dollars, whatever a price or the agent says.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subscription: bool,
+    /// Another binding, to try a call on once when this one runs out of
+    /// time: its `timeout` is the role's budget, and past it the role goes
+    /// on elsewhere, on a faster model say, rather than waiting on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 /// The tools that can change files: a shell, and the writing ones.
@@ -589,6 +600,9 @@ pub struct Config {
     pub tests: Tests,
     #[serde(default)]
     pub runbook: Option<String>,
+    /// The models a review may use, as patterns: none means any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
@@ -609,6 +623,39 @@ fn framework_defaults() -> Policy {
 pub const PROBES_OFF: &str = "Probes are off: they're on by default, but they run scenarios, and \
      the reviewers' binding has no Bash, Write or Edit. Give it those, since each reviewer works \
      in a copy of its own, or list `stages` in the repository's config to choose for yourself.";
+
+/// Each binding names a model `allowed` allows, as patterns: none allowed
+/// means any.
+pub fn check_models(allowed: &[String], bindings: &[(&str, &Binding)]) -> Result<()> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let mut set = globset::GlobSetBuilder::new();
+    for pattern in allowed {
+        set.add(
+            globset::GlobBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .with_context(|| format!("allowed_models: bad pattern {pattern:?}"))?,
+        );
+    }
+    let set = set.build()?;
+    let list = allowed.join(", ");
+    for (name, b) in bindings {
+        match &b.model {
+            Some(model) if set.is_match(model) => {}
+            Some(model) => bail!(
+                "binding {name} uses {model}, which this review's allowed_models ({list}) \
+                 doesn't allow: bind its role to another, or allow it"
+            ),
+            None => bail!(
+                "binding {name} names no model, so it can't be held to this review's \
+                 allowed_models ({list}): give it its `model`"
+            ),
+        }
+    }
+    Ok(())
+}
 
 /// Where a role's binding can be set.
 fn no_binding(role: Role) -> String {
@@ -676,8 +723,10 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         probes_off: false,
         tests: merged.tests.unwrap_or_default(),
         runbook: merged.runbook,
+        allowed_models: merged.allowed_models.unwrap_or_default(),
     };
     config.check()?;
+    config.check_models()?;
     with_stage_lenses(with_universal_lenses(default_probes(config, chosen)))
 }
 
@@ -882,8 +931,15 @@ impl Config {
             .values()
             .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()));
         for name in chosen {
-            if !self.allowed_bindings.contains_key(name) {
+            let Some(b) = self.allowed_bindings.get(name) else {
                 bail!("binding {name} isn't in your allowed_bindings");
+            };
+            match &b.fallback {
+                Some(f) if f == name => bail!("binding {name} is its own fallback"),
+                Some(f) if !self.allowed_bindings.contains_key(f) => {
+                    bail!("binding {name}'s fallback, {f}, isn't in your allowed_bindings")
+                }
+                _ => {}
             }
         }
         for role in Role::ALL.into_iter().filter(|r| r.read_only()) {
@@ -916,7 +972,8 @@ impl Config {
 
     /// ACR runs on one machine: every binding in use must reach an agent on
     /// `machine`, where the code is, so its reviewers read the code itself.
-    /// Each binding a role or lens names, once, with its name.
+    /// Each binding a role or lens names, and each one's fallback, once,
+    /// with its name: every binding a review could call.
     pub fn chosen_bindings(&self) -> Vec<(&str, &Binding)> {
         let mut out: Vec<(&str, &Binding)> = Vec::new();
         let names = self
@@ -930,7 +987,24 @@ impl Config {
                 out.push((name, b));
             }
         }
+        let fallbacks: Vec<&String> = out
+            .iter()
+            .filter_map(|(_, b)| b.fallback.as_ref())
+            .collect();
+        for name in fallbacks {
+            if let Some(b) = self.allowed_bindings.get(name)
+                && !out.iter().any(|(n, _)| *n == name.as_str())
+            {
+                out.push((name, b));
+            }
+        }
         out
+    }
+
+    /// Every binding a review could call names a model `allowed_models`
+    /// allows: the repository's, or the user's for every repository.
+    fn check_models(&self) -> Result<()> {
+        check_models(&self.allowed_models, &self.chosen_bindings())
     }
 
     pub fn check_local(&self, machine: &str) -> Result<()> {
@@ -1195,6 +1269,57 @@ mod tests {
 
     const SMALL: &str = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
                          lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+
+    const MODELS_USER: &str = "version: 1\nallowed_bindings:\n\
+        \x20 open: {agent: a@m, model: vendor-a/big, tools: [read]}\n\
+        \x20 local: {agent: a@m, model: vendor-b/fast, tools: [read], fallback: lean}\n\
+        \x20 lean: {agent: a@m, model: vendor-b/lean, tools: [read]}\n\
+        \x20 bare: {agent: a@m, tools: [read]}\n\
+        defaults:\n  bindings: {sizer: local, reviewer: local, orchestrator: local, judge: local}\n";
+
+    #[test]
+    fn a_review_uses_only_the_models_its_repository_allows() {
+        let user = parse_user(MODELS_USER).unwrap();
+        let with = |extra: &str| {
+            let repo = parse_repo(&format!("{SMALL}{extra}")).unwrap();
+            resolve(&user, repo, &Flags::default())
+        };
+        let refused = |extra: &str| format!("{:#}", with(extra).unwrap_err());
+        // Every binding, fallbacks too, within what's allowed, in any case.
+        with("allowed_models: ['vendor-b/*']\n").unwrap();
+        with("allowed_models: ['VENDOR-B/*']\n").unwrap();
+        // A fallback outside it is refused like any other binding.
+        let err = refused("allowed_models: ['vendor-b/fast']\n");
+        assert!(err.contains("binding lean uses vendor-b/lean"), "{err}");
+        // So is a role bound outside it, or to a binding with no model.
+        let err = refused("allowed_models: ['vendor-b/*']\nbindings: {judge: open}\n");
+        assert!(err.contains("binding open uses vendor-a/big"), "{err}");
+        let err = refused("allowed_models: ['vendor-b/*']\nbindings: {judge: bare}\n");
+        assert!(err.contains("binding bare names no model"), "{err}");
+        // Set by the user, it holds every repository that doesn't set its own.
+        let mut held = user.clone();
+        held.defaults.as_mut().unwrap().allowed_models = Some(vec!["vendor-a/*".into()]);
+        let err = resolve(&held, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("binding local uses vendor-b/fast"));
+        let own = parse_repo(&format!("{SMALL}allowed_models: ['vendor-b/*']\n")).unwrap();
+        resolve(&held, own, &Flags::default()).unwrap();
+        // Left out everywhere, any model goes.
+        with("bindings: {judge: open}\n").unwrap();
+    }
+
+    #[test]
+    fn a_fallback_is_a_binding_and_not_itself() {
+        let check = |text: &str| {
+            let user = parse_user(text).unwrap();
+            resolve(&user, parse_repo(SMALL).unwrap(), &Flags::default())
+                .and_then(|cfg| cfg.check_bindings())
+        };
+        check(MODELS_USER).unwrap();
+        let err = check(&MODELS_USER.replace("fallback: lean", "fallback: gone")).unwrap_err();
+        assert!(format!("{err:#}").contains("fallback, gone, isn't in your allowed_bindings"));
+        let err = check(&MODELS_USER.replace("fallback: lean", "fallback: local")).unwrap_err();
+        assert!(format!("{err:#}").contains("binding local is its own fallback"));
+    }
 
     #[test]
     fn probes_are_on_by_default_wherever_reviewers_can_run_things() {
@@ -1488,6 +1613,7 @@ mod tests {
             stages: Some(Vec::new()),
             tests: Some(Tests::default()),
             runbook: Some(String::new()),
+            allowed_models: Some(Vec::new()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();

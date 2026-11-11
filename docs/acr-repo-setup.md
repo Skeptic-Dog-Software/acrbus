@@ -40,6 +40,23 @@ defaults:
     reviewer: reviewer-runs
 ```
 
+A binding's `timeout` is its role's budget. A slow model can think for
+minutes between steps and still look busy, so give a binding a `fallback`,
+another binding on a faster model, and a call that runs out of time is
+tried once there instead of failing the role.
+
+If a repository's reviews may use only some models, say so in its config,
+with patterns:
+
+```yaml
+allowed_models: ["vendor-b/*"]
+```
+
+Every binding its reviews would call, the configurer and fallbacks too,
+must name a model one matches, or the config is refused before anything
+runs. Set in your acr.yaml's `defaults`, it holds every repository on the
+machine that doesn't set its own.
+
 ## 2. Learn the repository first
 
 Before writing the config, find out the following, from the repository's

@@ -43,6 +43,68 @@ pub struct Answer {
     pub run_id: String,
     /// What the call used, if its agent said.
     pub usage: Option<RunUsage>,
+    /// The binding that answered, when it wasn't the one called: its
+    /// fallback, after the call ran out of time.
+    pub via: Option<String>,
+}
+
+/// A call that ran out of its binding's time, which is its role's budget.
+#[derive(Debug)]
+pub struct OverTime(pub String);
+
+impl std::fmt::Display for OverTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OverTime {}
+
+/// A caller that tries a call once more, on its binding's `fallback`, when
+/// it runs out of time, rather than leave the role failed for being slow.
+pub struct WithFallbacks<'a> {
+    pub inner: &'a dyn Caller,
+    pub bindings: &'a BTreeMap<String, Binding>,
+}
+
+impl Caller for WithFallbacks<'_> {
+    fn call(&self, call: &Call) -> Result<Answer> {
+        let first = match self.inner.call(call) {
+            Err(e) if e.downcast_ref::<OverTime>().is_some() => e,
+            done => return done,
+        };
+        let Some((name, binding)) = call
+            .binding
+            .fallback
+            .as_ref()
+            .and_then(|f| self.bindings.get_key_value(f))
+        else {
+            return Err(first);
+        };
+        let again = Call {
+            binding_name: name,
+            binding,
+            ..*call
+        };
+        let mut answer = self
+            .inner
+            .call(&again)
+            .with_context(|| format!("{first:#}; then on its fallback, {name}"))?;
+        answer.via = Some(name.clone());
+        Ok(answer)
+    }
+
+    fn fingerprint(&self, repo: &Path) -> Option<String> {
+        self.inner.fingerprint(repo)
+    }
+
+    fn snapshot(&self, repo: &Path) -> Option<String> {
+        self.inner.snapshot(repo)
+    }
+
+    fn delta(&self, repo: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
+        self.inner.delta(repo, from, to)
+    }
 }
 
 /// How a role reaches its model.
@@ -365,6 +427,18 @@ pub struct Decision {
 /// text it took and gave and by the config. Either is priced by the config,
 /// falling back to what the agent said.
 fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usage {
+    // Counted against the binding that answered: a fallback's model, price
+    // and subscription, not those of the one that ran out of time.
+    let answered = answer
+        .via
+        .as_deref()
+        .and_then(|n| cfg.allowed_bindings.get_key_value(n))
+        .map(|(n, b)| Call {
+            binding_name: n,
+            binding: b,
+            ..*call
+        });
+    let call = answered.as_ref().unwrap_or(call);
     let mut usage = Usage {
         role: call.role,
         binding: call.binding_name.to_string(),
@@ -675,6 +749,11 @@ pub fn start(
     change: &Change,
     caller: &dyn Caller,
 ) -> Result<Run> {
+    let fallbacks = WithFallbacks {
+        inner: caller,
+        bindings: &s.cfg.allowed_bindings,
+    };
+    let caller: &dyn Caller = &fallbacks;
     let mut run = Run {
         id: id.to_string(),
         // Whole, so that history finds it from anywhere.
@@ -2078,6 +2157,11 @@ pub fn drive(
     caller: &dyn Caller,
     reload: &dyn Fn(bool) -> Result<Change>,
 ) -> Result<()> {
+    let fallbacks = WithFallbacks {
+        inner: caller,
+        bindings: &s.cfg.allowed_bindings,
+    };
+    let caller: &dyn Caller = &fallbacks;
     run.status = Status::Running;
     run.waiting = None;
     loop {
@@ -2389,6 +2473,8 @@ lenses:
         probe_file: Option<&'static str>,
         /// Whether each prober's copy held that file when it started.
         probed: Mutex<Vec<bool>>,
+        /// A binding whose every call runs out of time.
+        slow: Option<String>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -2406,6 +2492,7 @@ lenses:
                 fixes: None,
                 probe_file: None,
                 probed: Mutex::new(Vec::new()),
+                slow: None,
             }
         }
 
@@ -2439,6 +2526,10 @@ lenses:
                     .unwrap()
                     .push(call.repo.join("warmed").is_file());
             }
+            if self.slow.as_deref() == Some(call.binding_name) {
+                let late = format!("{} timeout: it ran out of time", call.binding_name);
+                return Err(OverTime(late).into());
+            }
             if let Some(file) = self.probe_file.filter(|_| {
                 call.role == Role::Reviewer && call.prompt.contains("You probe a change")
             }) {
@@ -2455,6 +2546,7 @@ lenses:
                 text,
                 run_id: new_id(),
                 usage: self.usage.clone(),
+                via: None,
             })
         }
 
@@ -3204,6 +3296,53 @@ lenses:
         );
         drop(calls);
         assert_eq!(fake.count(Role::Orchestrator), 1, "the brief, once a round");
+    }
+
+    #[test]
+    fn a_role_out_of_time_goes_on_once_on_its_fallback() {
+        let mut cfg = plain("exception", 1, 1);
+        let reviewer = cfg.bindings[&Role::Reviewer].clone();
+        let other = cfg.bindings[&Role::Judge].clone();
+        assert_ne!(reviewer, other);
+        let answers = |role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        };
+        // Without a fallback, a slow reviewer is a failure, never a pass.
+        let mut fake = Fake::new(answers);
+        fake.slow = Some(reviewer.clone());
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_ne!(run.status, Status::Confirmed);
+        let failed = failures(&run);
+        assert!(
+            failed.iter().any(|f| f.contains("ran out of time")),
+            "{failed:?}"
+        );
+        // With one, the role goes on there, and is counted there.
+        cfg.allowed_bindings.get_mut(&reviewer).unwrap().fallback = Some(other.clone());
+        let mut fake = Fake::new(answers);
+        fake.slow = Some(reviewer.clone());
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
+        let calls = fake.calls.lock().unwrap();
+        let reviewers: Vec<&str> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Reviewer)
+            .map(|c| c.1.as_str())
+            .collect();
+        assert!(reviewers.contains(&reviewer.as_str()) && reviewers.contains(&other.as_str()));
+        let counted: Vec<&str> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Reviewer)
+            .map(|u| u.binding.as_str())
+            .collect();
+        assert!(
+            !counted.is_empty() && counted.iter().all(|b| *b == other),
+            "{counted:?}"
+        );
     }
 
     #[test]

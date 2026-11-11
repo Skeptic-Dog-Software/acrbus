@@ -678,6 +678,7 @@ mod tests {
                 text,
                 run_id: "r".into(),
                 usage: None,
+                via: None,
             })
         }
     }

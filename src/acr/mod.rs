@@ -678,6 +678,9 @@ impl Caller for BridgeCaller {
                 let msg = &item.msg;
                 let result = msg.result();
                 let status = result.map_or(RunStatus::Ok, |r| r.status);
+                if status == RunStatus::Timeout {
+                    return Err(flow::OverTime(format!("{} timeout: {}", b.agent, msg.body)).into());
+                }
                 if status != RunStatus::Ok {
                     bail!("{} {}: {}", b.agent, status.as_str(), msg.body);
                 }
@@ -696,11 +699,14 @@ impl Caller for BridgeCaller {
                     text,
                     run_id: sent.id,
                     usage: result.and_then(|r| r.usage.clone()),
+                    via: None,
                 })
             }
             Awaited::Undelivered { why } => bail!("{}: {why}", b.agent),
             Awaited::Unanswered => bail!("{} marked it handled without answering", b.agent),
-            Awaited::TimedOut => bail!("{} didn't answer in {wait} seconds", b.agent),
+            Awaited::TimedOut => {
+                Err(flow::OverTime(format!("{} didn't answer in {wait} seconds", b.agent)).into())
+            }
         }
     }
 }
@@ -1818,10 +1824,32 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     let name = change::name(&repo)?;
     let user = config::load_user(&user_config_path(paths))?;
     let (binding_name, binding) = configure::binding(&user)?;
-    // An hour of the configurer's work is no time to find its bridge says no.
-    check_bridges(paths, &[(binding_name.as_str(), &binding)])?;
     let kept_at = outside_config(paths, &repo)?;
     let current = fs::read_to_string(&kept_at).ok();
+    // The configurer, and its fallback, are held to the models this
+    // repository's review may use: its config's, or the user's for every
+    // repository.
+    let mut configuring = vec![(binding_name.as_str(), &binding)];
+    if let Some((name, b)) = binding
+        .fallback
+        .as_ref()
+        .and_then(|f| user.allowed_bindings.get_key_value(f))
+    {
+        configuring.push((name.as_str(), b));
+    }
+    let allowed = current
+        .as_deref()
+        .and_then(|text| config::parse_repo(text).ok())
+        .and_then(|p| p.allowed_models)
+        .or_else(|| {
+            user.defaults
+                .as_ref()
+                .and_then(|d| d.allowed_models.clone())
+        })
+        .unwrap_or_default();
+    config::check_models(&allowed, &configuring)?;
+    // An hour of the configurer's work is no time to find its bridge says no.
+    check_bridges(paths, &configuring)?;
     let record = calibration::load(&paths.state, &name)?;
     let feedback = if recalibrate {
         if current.is_none() {
@@ -1868,7 +1896,11 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
         .unwrap_or(&binding.agent)
         .to_string();
     crate::setup::acr_dir(paths, &copies_root(paths), &bridge)?;
-    let caller = BridgeCaller::new(paths)?;
+    let bridged = BridgeCaller::new(paths)?;
+    let caller = flow::WithFallbacks {
+        inner: &bridged,
+        bindings: &user.allowed_bindings,
+    };
     let brief = configure::prompt(&name, current.as_deref().filter(|_| recalibrate), &feedback);
     eprintln!(
         "{APP_NAME}: {binding_name} is reviewing {name} to {}. It reads the whole \
