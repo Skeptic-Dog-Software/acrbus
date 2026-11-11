@@ -590,9 +590,11 @@ impl Server {
 
 /// How this session is billed, as `claude auth status` reports it, run in
 /// the session's own environment so it sees the same credentials.
-/// `ACRBUS_TEST_AUTH_METHOD` stands in for it in tests, which keeps them
-/// off any client's API key.
+/// `ACRBUS_TEST_AUTH_METHOD` stands in for it in tests only, which keeps them
+/// off any client's API key: in a release build, a variable anyone could set
+/// would decide whose key a session is billed to.
 fn billing() -> Option<Billing> {
+    #[cfg(test)]
     if let Ok(method) = std::env::var("ACRBUS_TEST_AUTH_METHOD") {
         return Some(Billing { method, plan: None });
     }
