@@ -187,6 +187,23 @@ fn attr(value: &str) -> String {
 
 /// One message in a `<acrbus-message>` tag whose body can't close it early.
 pub fn tagged(item: &Item) -> String {
+    tagged_as(item, false)
+}
+
+/// The most of an attachment put in a message as text, in bytes.
+const INLINE_MAX: u64 = 8 << 20;
+
+/// An attachment's text, to put in the message: None if it isn't text, or
+/// is too large, so it goes by its path.
+fn inline_text(path: &str) -> Option<String> {
+    let size = std::fs::metadata(path).ok()?.len();
+    (size <= INLINE_MAX).then(|| std::fs::read_to_string(path).ok())?
+}
+
+/// [`tagged`], with attachments `inline`: each one's text in the message
+/// itself, for an agent that can't read a file outside its working
+/// directory, where attachments are kept.
+pub fn tagged_as(item: &Item, inline: bool) -> String {
     let m = &item.msg;
     let mut attrs = format!(
         "id=\"{}\" kind=\"{}\" from=\"{}\" to=\"{}\"",
@@ -266,10 +283,26 @@ pub fn tagged(item: &Item) -> String {
         let _ = writeln!(out, "<{tag}-stderr>\n{}\n</{tag}-stderr>", close(tail));
     }
     for a in m.attachments() {
+        let text = a.path.as_deref().filter(|_| inline).and_then(inline_text);
+        if let Some(text) = text {
+            let _ = writeln!(
+                out,
+                "<{tag}-attachment name=\"{}\" size=\"{}\">\n{}\n</{tag}-attachment>",
+                attr(&a.name),
+                a.size,
+                close(text.trim_end())
+            );
+            continue;
+        }
         let path = a.path.as_deref().unwrap_or("not on this machine");
+        let not_inline = if inline {
+            " inline=\"no: it isn't text, or it's too large\""
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "<{tag}-attachment name=\"{}\" size=\"{}\" path=\"{}\"/>",
+            "<{tag}-attachment name=\"{}\" size=\"{}\" path=\"{}\"{not_inline}/>",
             attr(&a.name),
             a.size,
             attr(path)

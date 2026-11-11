@@ -133,6 +133,12 @@ pub struct Settings {
     pub secrets: BTreeMap<String, PathBuf>,
     /// The model `{MODEL}` means when a request doesn't name one.
     pub model: Option<String>,
+    /// How a run sees the message's attachments: `path`, the default, says
+    /// where each is on this machine; `inline` puts each one's text in the
+    /// message itself, for an agent that can't read outside its working
+    /// directory, as attachments are kept outside it.
+    #[serde(default)]
+    pub attachments: AttachmentsMode,
     /// The most stderr a result carries, in bytes.
     #[serde(default = "default_stderr_tail")]
     pub stderr_tail_bytes: usize,
@@ -145,6 +151,18 @@ pub struct Settings {
     /// Where the agent records what its model calls used, for results that
     /// carry real usage.
     pub usage: Option<UsageFrom>,
+}
+
+/// How a run sees its message's attachments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttachmentsMode {
+    /// By path, where each is on this machine.
+    #[default]
+    Path,
+    /// Its text in the message itself; one that isn't text, or is too
+    /// large, still by path.
+    Inline,
 }
 
 /// The most a request's options can ask for. This is the authority: a
@@ -2466,7 +2484,11 @@ impl Bridge {
         let message_file = run_dir.join("message");
         let attachments = run_dir.join("attachments");
         let (run_text, session_text) = (run_dir.to_string_lossy(), session_dir.to_string_lossy());
-        let (file_text, tagged) = (message_file.to_string_lossy(), format::tagged(item));
+        let inline = self.cfg.attachments == AttachmentsMode::Inline;
+        let (file_text, tagged) = (
+            message_file.to_string_lossy(),
+            format::tagged_as(item, inline),
+        );
         let attachments_text = attachments.to_string_lossy();
         let tools = plan.tools.as_ref().map(|t| t.join(","));
         let vars = [
@@ -4523,6 +4545,42 @@ mod tests {
         // Its copy was its own, so the store still matches its hash.
         let kept = fs::read(rig.bus.attachments.path(&sha)).unwrap();
         assert_eq!(kept, b"the attached words\n");
+    }
+
+    #[test]
+    fn an_agent_kept_to_its_workdir_gets_attachments_inline() {
+        let rig = Rig::new();
+        let mut cfg = rig.settings("cat", "attachments = \"inline\"");
+        cfg.message = default_message();
+        assert_eq!(cfg.attachments, AttachmentsMode::Inline);
+        let bridge = rig.start(cfg);
+        let text = rig
+            .bus
+            .attachments
+            .add("change.diff", &mut &b"+the change itself\n"[..], 19)
+            .unwrap();
+        let binary = rig
+            .bus
+            .attachments
+            .add("blob.bin", &mut &[0xff, 0xfe, 0x00][..], 3)
+            .unwrap();
+        let id = rig.ask_with(Some(Box::new(Extras {
+            attachments: vec![text, binary],
+            ..Extras::default()
+        })));
+        let reply = rig.reply_to(&id);
+        bridge.stop().unwrap();
+        // The text is in the message, with no path to read it from.
+        assert!(
+            reply.contains("name=\"change.diff\" size=\"19\">\n+the change itself\n"),
+            "{reply}"
+        );
+        assert!(!reply.contains("/attachments/change.diff\""), "{reply}");
+        // What isn't text still goes by its path, saying why.
+        assert!(
+            reply.contains("/attachments/blob.bin\" inline=\"no:"),
+            "{reply}"
+        );
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # Setting up ACR review for a repository
 
+To set one up, start with the [quickstart](quickstart.md): the configurer
+writes the config for you, and `acrbus acr doctor` checks what it needs.
+This guide is the reference behind it, for reading a proposal, changing
+one, or writing one by hand.
+
 How to set up a repository you don't know yet, on a machine that may be new,
 so that its review is configured correctly. The pipeline reviews well only
 when its reviewers know two things the diff can't tell them. Each lens needs
@@ -146,7 +151,9 @@ runbook: |
   Never touch <the backend, stores, the network>: no fetch, pull or push.
   Stop only processes you started, by PID: never kill by pattern.
   Read-only sources: dependencies under <path>, the SDK under <path>, and
-  sibling repositories under <path>. Read them with grep and cat.
+  sibling repositories under <path>: tests.setup copies them into
+  target/acr/ in each copy, since reviewers' file tools can't read outside
+  their copy. Read them there.
   Before <a command that needs the network>, stop.
 ```
 

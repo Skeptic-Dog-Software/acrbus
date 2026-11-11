@@ -1008,7 +1008,7 @@ fn read_hidden(prompt: &str) -> Result<String> {
 }
 
 /// Signs in with the token, by one tiny call, from a folder of its own.
-fn check_token(claude: &Path, token: &Path) -> Result<()> {
+pub(crate) fn check_token(claude: &Path, token: &Path) -> Result<()> {
     let secret = fs::read_to_string(token)
         .with_context(|| format!("reading {}", token.display()))?
         .trim()
