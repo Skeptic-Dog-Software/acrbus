@@ -9,7 +9,8 @@ blocks. The reviewers are the agents you already use, such as Claude Code,
 pi or omp, run headless through bridges. acrbus is everything around them
 that makes their review adversarial, rule-bound and repeatable.
 
-It runs on one machine and needs no network.
+It runs on one machine. acrbus itself needs no network: the bus is a local
+socket, and the models are reached only through the agents you bridge.
 [tailbus](https://github.com/Skeptic-Dog-Software/tailbus), built on it,
 carries the same bus between machines on a Tailscale network.
 

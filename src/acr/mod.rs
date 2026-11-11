@@ -749,8 +749,130 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
             }
         }
     }
+    out.extend(doctor_toolchain(paths, &cfg, repo));
     if with_tests {
         out.extend(doctor_tests(paths, &cfg, repo));
+    }
+    out
+}
+
+/// The reviewers' bridge, if they run things: only then do their own
+/// commands need a toolchain.
+fn reviewers_bridge(paths: &Paths, cfg: &Config) -> Option<(String, crate::bridge::Settings)> {
+    let b = cfg
+        .binding(Role::Reviewer, None)
+        .ok()
+        .filter(|b| b.changes_files())?;
+    let agent = b.agent.split_once('@')?.0.to_string();
+    let settings = crate::bridge::load(paths, &agent).ok()?;
+    Some((agent, settings))
+}
+
+/// The environment a bridge's runs get, as near as a check can make it:
+/// its HOME, PATH and env, and the few variables it passes on.
+fn bridge_env(settings: &crate::bridge::Settings) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("HOME".into(), settings.home.display().to_string()),
+        ("PATH".into(), settings.path.clone()),
+        ("TMPDIR".into(), std::env::temp_dir().display().to_string()),
+    ];
+    for key in ["USER", "LOGNAME", "LANG", "SHELL"] {
+        if let Ok(v) = std::env::var(key) {
+            env.push((key.into(), v));
+        }
+    }
+    env.extend(
+        settings
+            .env
+            .iter()
+            .filter(|(_, v)| !v.contains('{'))
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    env
+}
+
+/// Whether `command` succeeds in `dir` with only `env`.
+fn runs_with(dir: &Path, command: &str, env: &[(String, String)]) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The toolchain a repository's own files call for, and how to see that it
+/// runs: what reviewers who run things will reach for.
+const TOOLCHAIN_OF: [(&str, &str, &str); 8] = [
+    ("Cargo.toml", "cargo", "cargo --version"),
+    ("go.mod", "go", "go version"),
+    ("package.json", "node", "node --version"),
+    ("pubspec.yaml", "flutter", "command -v flutter"),
+    ("pyproject.toml", "python3", "python3 --version"),
+    ("requirements.txt", "python3", "python3 --version"),
+    ("pom.xml", "mvn", "command -v mvn"),
+    ("build.gradle", "gradle", "command -v gradle"),
+];
+
+/// Whether reviewers who run things find the repository's toolchain, as
+/// their bridge runs them: tests that pass for you can't run for them
+/// without it.
+fn doctor_toolchain(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
+    let mut out = Vec::new();
+    let Some((agent, settings)) = reviewers_bridge(paths, cfg) else {
+        return out;
+    };
+    let env = bridge_env(&settings);
+    for (marker, tool, probe) in TOOLCHAIN_OF {
+        if !repo.join(marker).is_file()
+            || out.iter().any(
+                |s| matches!(s, Said::Ok(t) | Said::Fix(t) if t.contains(&format!("`{tool}`"))),
+            )
+        {
+            continue;
+        }
+        if runs_with(repo, probe, &env) {
+            out.push(Said::Ok(format!(
+                "reviewers find `{tool}` as the {agent} bridge runs them"
+            )));
+            continue;
+        }
+        let found = runs_with(repo, &format!("command -v {tool}"), &env);
+        let yours = Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty());
+        out.push(Said::Fix(match (found, yours) {
+            (true, _) if tool == "cargo" => format!(
+                "reviewers find `cargo` but no Rust toolchain as the {agent} bridge runs them: \
+                 set `RUSTUP_HOME` to your rustup home in [bridges.{agent}.env] in {}, or \
+                 install a toolchain in its HOME, {}",
+                paths.config.display(),
+                settings.home.display()
+            ),
+            (_, Some(at)) => format!(
+                "reviewers can't run `{tool}` as the {agent} bridge runs them: add {} to \
+                 `path` in [bridges.{agent}] in {}, then restart the bridge",
+                Path::new(&at)
+                    .parent()
+                    .map_or(at.clone(), |d| d.display().to_string()),
+                paths.config.display()
+            ),
+            (_, None) => format!(
+                "reviewers can't run `{tool}`, which this repository's {marker} calls for, and \
+                 neither can you: install it, and put its folder in `path` in \
+                 [bridges.{agent}] in {}",
+                paths.config.display()
+            ),
+        }));
     }
     out
 }
@@ -824,25 +946,20 @@ fn doctor_tests(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
         }
     }
     // As reviewers run it: only those that can run things do.
-    let reviewer = cfg.binding(Role::Reviewer, None).ok();
-    let agent = reviewer
-        .filter(|b| b.changes_files())
-        .and_then(|b| b.agent.split_once('@').map(|(a, _)| a.to_string()));
-    if all
-        && let Some(agent) = agent
-        && let Ok(settings) = crate::bridge::load(paths, &agent)
-    {
-        let mut env: Vec<(String, String)> = vec![
-            ("HOME".into(), settings.home.display().to_string()),
-            ("PATH".into(), settings.path.clone()),
-            ("TMPDIR".into(), std::env::temp_dir().display().to_string()),
-        ];
-        for key in ["USER", "LOGNAME", "LANG", "SHELL"] {
-            if let Ok(v) = std::env::var(key) {
-                env.push((key.into(), v));
-            }
+    if all && let Some((agent, settings)) = reviewers_bridge(paths, cfg) {
+        let env = bridge_env(&settings);
+        // A Rust repository's crates, in the cache their runs use.
+        if repo.join("Cargo.toml").is_file()
+            && runs_with(&copy, "cargo --version", &env)
+            && !runs_with(&copy, "cargo fetch --offline --locked", &env)
+        {
+            out.push(Said::Fix(format!(
+                "the {agent} bridge's crate cache lacks this repository's crates, so reviewers \
+                 can't build it offline: from the repository, once, with the network, `HOME={} \
+                 cargo fetch --locked`",
+                settings.home.display()
+            )));
         }
-        env.extend(settings.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         let (result, log) = ran("as-reviewers", &command, Some(&env));
         match result {
             Ok(Some(true)) => out.push(Said::Ok(format!(
@@ -1135,21 +1252,86 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     if let Some(pr) = pr {
         post(run, cfg, pr)?;
     }
+    eprintln!("{APP_NAME}: {}", next_steps(run, cfg));
     Ok(match run.status {
         Status::Confirmed => ExitCode::SUCCESS,
-        Status::Waiting => {
-            let code = match run.waiting {
-                Some(flow::Gate::Escalation) => ESCALATED,
-                _ => WAITING,
-            };
-            eprintln!(
-                "{APP_NAME}: waiting for you: {APP_NAME} acr resume {}",
-                run.id
-            );
-            ExitCode::from(code)
-        }
+        Status::Waiting => ExitCode::from(match run.waiting {
+            Some(flow::Gate::Escalation) => ESCALATED,
+            _ => WAITING,
+        }),
         Status::Running | Status::Stopped => ExitCode::FAILURE,
     })
+}
+
+/// What a review's end means, and what to do next, in a sentence or two.
+fn next_steps(run: &Run, cfg: &Config) -> String {
+    let id = &run.id;
+    let blockers: Vec<String> = run
+        .lenses
+        .values()
+        .filter(|l| !l.blockers().is_empty())
+        .map(|l| format!("{} ({})", l.id, l.blockers().len()))
+        .collect();
+    let open: Vec<&str> = run
+        .lenses
+        .values()
+        .filter(|l| l.outcome == flow::Outcome::Open)
+        .map(|l| l.id.as_str())
+        .collect();
+    let writes = cfg
+        .binding(Role::Orchestrator, None)
+        .is_ok_and(|b| b.writes);
+    match (run.status, run.waiting) {
+        (Status::Confirmed, _) => {
+            format!("confirmed: every lens agrees. Its findings: `{APP_NAME} acr feedback {id}`.")
+        }
+        (Status::Waiting, Some(flow::Gate::Scope)) => format!(
+            "waiting for you to approve its scope, tier {} ({}), before any reviewer runs: \
+             `{APP_NAME} acr resume {id} --approve`, or `--stop`.",
+            run.tier, run.tier_why
+        ),
+        (Status::Waiting, Some(flow::Gate::Fold)) => format!(
+            "waiting for you to choose which blockers get fixed: {}. `{APP_NAME} acr resume \
+             {id} --fold <ids>`{}, `--waive <ids>`, or `--stop`. `{APP_NAME} acr feedback {id}` \
+             lists them with their IDs.",
+            blockers.join(", "),
+            if writes {
+                ""
+            } else {
+                " (the Orchestrator's binding can't write, so give it `writes: true` in acr.yaml for that)"
+            }
+        ),
+        (Status::Waiting, Some(flow::Gate::Final)) => format!(
+            "waiting for you to approve the result: `{APP_NAME} acr resume {id} --approve`, or `--stop`."
+        ),
+        (Status::Waiting, _) => {
+            let unseen: Vec<&str> = run
+                .escalations
+                .iter()
+                .filter(|e| !e.seen)
+                .map(|e| e.reason.as_str())
+                .collect();
+            format!(
+                "waiting for you, escalated: {}. Read it, then `{APP_NAME} acr resume {id} \
+                 --approve` to go on, or `--stop`.",
+                unseen.join("; ")
+            )
+        }
+        (_, _) if blockers.is_empty() => format!(
+            "ended with {} still open: `{APP_NAME} acr feedback {id}` lists what each found.",
+            open.join(", ")
+        ),
+        (_, _) => format!(
+            "ended with blockers left: {}. Fix them and review again{}; `{APP_NAME} acr \
+             feedback {id}` lists them.",
+            blockers.join(", "),
+            if writes {
+                ""
+            } else {
+                ", or give the Orchestrator's binding `writes: true` in acr.yaml so a review can fix them itself"
+            }
+        ),
+    }
 }
 
 /// Where reviewers that can change files get their copies of the checkout.
@@ -1438,7 +1620,12 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 eprintln!("{note}");
             }
             check_machine(paths, &cfg, &target.repo, false)?;
-            change::checked_out(&target.repo, target.head.as_deref())?;
+            change::checked_out(
+                &target.repo,
+                &target.base,
+                target.head.as_deref(),
+                cfg.review_scope,
+            )?;
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
             let id = new_id();
@@ -1486,7 +1673,12 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 // Until a fix, the review is of its head, which must be
                 // checked out.
                 if run.lenses.values().all(|l| l.done.is_empty()) {
-                    change::checked_out(&run.repo, run.head.as_deref())?;
+                    change::checked_out(
+                        &run.repo,
+                        &run.base,
+                        run.head.as_deref(),
+                        cfg.review_scope,
+                    )?;
                 }
                 check_machine(paths, &cfg, &run.repo, true)?;
             }
@@ -1565,6 +1757,19 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 pr: None,
                 brief: None,
             };
+            // A proposal waiting where no config is yet: say so, not "none".
+            let waiting = configure::pending(&kept_at);
+            if !accept && !kept_at.exists() && waiting.config.exists() {
+                println!(
+                    "{name} has no accepted review config yet, but a proposal waits at {}, \
+                     with its reasons in {}. Read them, then accept it: `{APP_NAME} acr \
+                     calibration --repo {} --accept`.",
+                    waiting.config.display(),
+                    waiting.why.display(),
+                    repo.display()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
             let (text, _) = repo_layer(paths, &repo, Some(&base), config.as_deref())?;
             let decided = not_findings(&cfg, &source, &repo, &base)?;
@@ -1943,7 +2148,12 @@ fn pipeline_run(
             );
         }
     }
-    change::checked_out(&target.repo, target.head.as_deref())?;
+    change::checked_out(
+        &target.repo,
+        &target.base,
+        target.head.as_deref(),
+        cfg.review_scope,
+    )?;
     allow_copies(paths, &cfg)?;
     let id = new_id();
     let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
@@ -2609,6 +2819,113 @@ mod tests {
              defaults:\n  bindings: {sizer: fits, reviewer: fits, orchestrator: fits, judge: fits}\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_reviews_end_says_what_it_waits_for_and_how_to_answer() {
+        let cfg = config::resolve(
+            &config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap(),
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        let run = |status: &str, waiting: Option<&str>, escalations: serde_json::Value| -> Run {
+            serde_json::from_value(serde_json::json!({
+                "id": "r1", "repo": "/r", "base": "main", "head": null,
+                "tier": "core", "tier_why": "the Sizer: it touches storage", "fan_out": 1,
+                "round": 1, "stage": "review", "status": status, "waiting": waiting,
+                "lenses": {}, "escalations": escalations, "disagreements": [], "usage": []
+            }))
+            .unwrap()
+        };
+        let none = serde_json::json!([]);
+        let scope = next_steps(&run("waiting", Some("scope"), none.clone()), &cfg);
+        assert!(
+            scope.contains("approve its scope, tier core") && scope.contains("resume r1 --approve"),
+            "{scope}"
+        );
+        // The fold says how to let the Orchestrator fix, only where it can't.
+        let fold = next_steps(&run("waiting", Some("fold"), none.clone()), &cfg);
+        assert!(
+            fold.contains("--fold <ids>") && !fold.contains("writes: true"),
+            "{fold}"
+        );
+        let mut reads = cfg.clone();
+        let name = reads
+            .binding_name(Role::Orchestrator, None)
+            .unwrap()
+            .to_string();
+        reads.allowed_bindings.get_mut(&name).unwrap().writes = false;
+        let fold = next_steps(&run("waiting", Some("fold"), none.clone()), &reads);
+        assert!(fold.contains("writes: true"), "{fold}");
+        let up = next_steps(
+            &run(
+                "waiting",
+                Some("escalation"),
+                serde_json::json!([{"reason": "a public API change", "seen": false}]),
+            ),
+            &cfg,
+        );
+        assert!(up.contains("escalated: a public API change"), "{up}");
+        assert!(next_steps(&run("confirmed", None, none.clone()), &cfg).contains("confirmed"));
+        let ended = next_steps(&run("stopped", None, none), &cfg);
+        assert!(ended.contains("ended with"), "{ended}");
+    }
+
+    #[test]
+    fn a_waiting_proposal_is_named_not_called_no_config() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let kept = outside_config(&paths, &repo).unwrap();
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(configure::pending(&kept).config, "version: 1\n").unwrap();
+        let asked = AcrCmd::Calibration {
+            repo: repo.clone(),
+            base: "HEAD".into(),
+            config: None,
+            accept: false,
+        };
+        // It says where the proposal is, and exits 1, rather than failing to
+        // find a config.
+        assert_eq!(super::run(&paths, asked).unwrap(), ExitCode::FAILURE);
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn the_doctor_checks_reviewers_find_the_repositorys_toolchain() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
+        let user = bridge_and_bindings(&paths, &repo);
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // The test bridge's PATH is /bin, which has no cargo.
+        let said = doctor_toolchain(&paths, &cfg, &repo.canonicalize().unwrap());
+        assert!(
+            said.iter()
+                .any(|s| matches!(s, Said::Fix(t) if t.contains("reviewers can't run `cargo`"))),
+            "{said:?}"
+        );
+        // A repository with no toolchain of its own has nothing to check.
+        let plain = repo_with(&[("a.txt", "one\n")]);
+        assert!(doctor_toolchain(&paths, &cfg, &plain.canonicalize().unwrap()).is_empty());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&plain);
     }
 
     #[test]

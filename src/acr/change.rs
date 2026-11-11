@@ -289,30 +289,66 @@ pub fn tree_diff(repo: &Path, from: &str, to: &str) -> Result<(Vec<String>, Stri
     Ok((files.lines().map(str::to_string).collect(), diff))
 }
 
-/// Reviewers read the checkout itself, so a commit under review must be the
-/// one checked out, with nothing changed on top. Without `head`, the review
-/// is of the working tree, which is the checkout already.
-pub fn checked_out(repo: &Path, head: Option<&str>) -> Result<()> {
-    let Some(head) = head else {
+/// Reviewers read the checkout itself, so the commit a review is of must be
+/// the one checked out, with nothing changed on top. That's `head`, or with
+/// `bottom-of-stack`, the first commit after the base on the way to it.
+/// Without `head`, the review is of the working tree, which is the checkout
+/// already.
+pub fn checked_out(repo: &Path, base: &str, head: Option<&str>, scope: ReviewScope) -> Result<()> {
+    let Some(given) = head else {
         return Ok(());
     };
-    let want = git(repo, &["rev-parse", &format!("{head}^{{commit}}")])?;
-    let have = git(repo, &["rev-parse", "HEAD"])?;
-    if want.trim() != have.trim() {
+    let reviewed = reviewed_head(repo, base, head, scope)?.unwrap_or_else(|| given.to_string());
+    let commit = |r: &str| -> Result<String> {
+        Ok(git(repo, &["rev-parse", &format!("{r}^{{commit}}")])?
+            .trim()
+            .to_string())
+    };
+    let short = |s: &str| s[..12.min(s.len())].to_string();
+    let want = commit(&reviewed)?;
+    let have = git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    if want != have {
+        if want != commit(given)? {
+            bail!(
+                "review_scope is bottom-of-stack, so the review is of {}, the first commit \
+                 after {base} on the way to {given}, and reviewers read the checkout, which is \
+                 {}. Check {} out, or pass --review-scope whole-pr to review all of \
+                 {base}..{given}.",
+                short(&want),
+                short(&have),
+                short(&want)
+            );
+        }
         bail!(
-            "reviewers read the checkout, so {head} has to be what's checked out, and it's \
-             {}. Check {head} out, or leave --head out to review the working tree.",
-            &have.trim()[..12.min(have.trim().len())]
+            "reviewers read the checkout, so {given} has to be what's checked out, and it's \
+             {}. Check {given} out, or leave --head out to review the working tree.",
+            short(&have)
         );
     }
     let changed = git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
     if !changed.trim().is_empty() {
         bail!(
-            "reviewers read the checkout, which has changes on top of {head}. Commit or \
+            "reviewers read the checkout, which has changes on top of {given}. Commit or \
              stash them, or leave --head out to review the working tree."
         );
     }
     Ok(())
+}
+
+/// The commit a review is of: `head`, or with `bottom-of-stack`, the first
+/// commit after the base on the way to it. None for the working tree.
+pub fn reviewed_head(
+    repo: &Path,
+    base: &str,
+    head: Option<&str>,
+    scope: ReviewScope,
+) -> Result<Option<String>> {
+    Ok(match (scope, head) {
+        (ReviewScope::BottomOfStack, Some(head)) => {
+            bottom_of_stack(repo, base, head)?.or(Some(head.to_string()))
+        }
+        (_, head) => head.map(str::to_string),
+    })
 }
 
 /// The commit a stack's review stops at: the first after the base.
@@ -330,12 +366,7 @@ pub fn load(
     scope: ReviewScope,
     generated: &Generated,
 ) -> Result<Change> {
-    let head = match (scope, head) {
-        (ReviewScope::BottomOfStack, Some(head)) => {
-            bottom_of_stack(repo, base, head)?.or(Some(head.to_string()))
-        }
-        (_, head) => head.map(str::to_string),
-    };
+    let head = reviewed_head(repo, base, head, scope)?;
     let range = match &head {
         Some(head) => format!("{base}...{head}"),
         None => base.to_string(),
@@ -761,13 +792,62 @@ pub mod tests {
         branch(&dir, "change");
         commit(&dir, &[("a.txt", "two\n")], "two");
         // The working tree is always fine: it's the checkout.
-        assert!(checked_out(&dir, None).is_ok());
-        assert!(checked_out(&dir, Some("change")).is_ok());
-        let err = format!("{:#}", checked_out(&dir, Some("main")).unwrap_err());
+        let whole = |head| checked_out(&dir, "main", head, ReviewScope::WholePr);
+        assert!(whole(None).is_ok());
+        assert!(whole(Some("change")).is_ok());
+        let err = format!("{:#}", whole(Some("main")).unwrap_err());
         assert!(err.contains("checked out"), "{err}");
         fs::write(dir.join("a.txt"), "three\n").unwrap();
-        let err = format!("{:#}", checked_out(&dir, Some("change")).unwrap_err());
+        let err = format!("{:#}", whole(Some("change")).unwrap_err());
         assert!(err.contains("changes on top"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stacks_review_is_of_its_bottom_commit_which_must_be_checked_out() {
+        // Reviewers were handed the bottom commit's diff while they read the
+        // top of the stack, so they argued with lines that weren't there.
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        branch(&dir, "change");
+        commit(&dir, &[("a.txt", "two\n")], "bottom");
+        let bottom = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        commit(&dir, &[("a.txt", "three\n")], "top");
+        let stack = |head| checked_out(&dir, "main", Some(head), ReviewScope::BottomOfStack);
+        let err = format!("{:#}", stack("change").unwrap_err());
+        assert!(
+            err.contains("bottom-of-stack") && err.contains(&bottom.trim()[..12]),
+            "{err}"
+        );
+        assert!(err.contains("--review-scope whole-pr"), "{err}");
+        let at = |r: &str| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["checkout", "-q", r])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        at(bottom.trim());
+        assert!(stack("change").is_ok());
+        // The diff it's handed is the one checked out.
+        let change = load(
+            &dir,
+            "main",
+            Some("change"),
+            ReviewScope::BottomOfStack,
+            &Generated::default(),
+        )
+        .unwrap();
+        let lines: Vec<&str> = change.changed_lines().collect();
+        assert!(
+            lines.contains(&"+two") && !lines.contains(&"+three"),
+            "{lines:?}"
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n");
+        // A stack of one is its own bottom.
+        at("change");
+        assert!(checked_out(&dir, "change~1", Some("change"), ReviewScope::BottomOfStack).is_ok());
         fs::remove_dir_all(&dir).unwrap();
     }
 

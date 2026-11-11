@@ -76,7 +76,10 @@ pub fn prompt(name: &str, current: Option<&str>, feedback: &[Feedback]) -> Strin
         "You configure adversarial convergence review (ACR) for the repository {name}. Your \
          working directory is a clone of it of your own, as it is now: read all of it you \
          need, run what you need to there, and look at its history with git. Nothing you do \
-         in it reaches the repository. Never copy a secret's value into what you write.\n\n\
+         in it reaches the repository. Never copy a secret's value into what you write. Install \
+         nothing and download nothing, toolchains included: if a command would fetch or \
+         install, such as rustup installing a toolchain, don't run it, and put it in Before \
+         the first review for the machine's user instead.\n\n\
          ACR reviews each change to this repository with fresh reviewers, one dimension (a \
          lens) each, and a Judge who rules what blocks. The config you write decides what \
          they look for and what stops a change. Make it right for this repository as it is, \
@@ -136,7 +139,10 @@ pub fn prompt(name: &str, current: Option<&str>, feedback: &[Feedback]) -> Strin
          give them in one ```not-findings block, a line each, `- <what> — <why>`. Then \
          `## Why`: for each lens, why it matters here and why its blocker is drawn where it \
          is; what you ran to check the test commands, and what it showed; and what you're \
-         unsure of.",
+         unsure of. Last, `## Before the first review`: each thing the machine's user must do \
+         before a review can run as the config expects, such as filling the reviewers' \
+         package cache or installing a tool, with the exact command; or `Nothing.` if \
+         there's nothing.",
         GUIDE.trim(),
         config::SCHEMA.trim(),
         EXAMPLE.trim()
@@ -628,6 +634,17 @@ pub fn listed(run: &KeptRun) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_configurer_stays_offline_and_says_what_comes_first() {
+        let p = prompt("shop", None, &[]);
+        assert!(
+            p.contains("Install nothing and download nothing, toolchains included"),
+            "{p}"
+        );
+        assert!(p.contains("`## Before the first review`"), "{p}");
+        assert!(p.contains("or `Nothing.`"), "{p}");
+    }
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
