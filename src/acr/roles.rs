@@ -1,17 +1,17 @@
 //! What each role is asked, and what it must answer. Answers are JSON, and
 //! one that can't be read is a failure, never an empty result.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::config::{Lens, Severity, Tier};
 
-/// The JSON in an answer, which a model may have wrapped in other words,
-/// braces among them: the first whole object in it that reads as `T`. If
-/// none does, the error is the first object's.
-pub(super) fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
+/// The objects in an answer that read as `T`, each once, and the first
+/// error from one that didn't.
+fn fits<T: DeserializeOwned>(text: &str) -> (Vec<serde_json::Value>, Option<serde_json::Error>) {
     let mut first_error = None;
+    let mut answers: Vec<serde_json::Value> = Vec::new();
     let mut from = 0;
     while let Some(start) = text[from..].find('{').map(|i| from + i) {
         let mut objects =
@@ -19,8 +19,9 @@ pub(super) fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
         match objects.next() {
             Some(Ok(value)) => {
                 from = start + objects.byte_offset();
-                match serde_json::from_value(value) {
-                    Ok(answer) => return Ok(answer),
+                match serde_json::from_value::<T>(value.clone()) {
+                    Ok(_) if !answers.contains(&value) => answers.push(value),
+                    Ok(_) => {}
                     Err(e) => {
                         first_error.get_or_insert(e);
                     }
@@ -29,9 +30,39 @@ pub(super) fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
             _ => from = start + 1,
         }
     }
+    (answers, first_error)
+}
+
+fn none_fit(first_error: Option<serde_json::Error>) -> anyhow::Error {
     match first_error {
-        Some(e) => Err(anyhow::Error::new(e).context("reading the answer's JSON")),
-        None => bail!("the answer has no JSON"),
+        Some(e) => anyhow::Error::new(e).context("reading the answer's JSON"),
+        None => anyhow!("the answer has no JSON"),
+    }
+}
+
+/// The JSON in an answer, which a model may have wrapped in other words,
+/// braces among them: the first whole object in it that reads as `T`. If
+/// none does, the error is the first object's.
+pub(super) fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
+    let (mut answers, first_error) = fits::<T>(text);
+    match answers.is_empty() {
+        false => Ok(serde_json::from_value(answers.remove(0))?),
+        true => Err(none_fit(first_error)),
+    }
+}
+
+/// The one answer in a report of findings. Two lists that say different
+/// things, such as an example before the real one, are an error, not a
+/// guess: an empty example taken for the answer would pass a change that
+/// was found wanting.
+fn one_json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
+    let (mut answers, first_error) = fits::<T>(text);
+    match answers.len() {
+        0 => Err(none_fit(first_error)),
+        1 => Ok(serde_json::from_value(answers.remove(0))?),
+        n => bail!(
+            "the answer has {n} different lists of findings in it, so which it means is unclear"
+        ),
     }
 }
 
@@ -261,12 +292,13 @@ pub fn reviewer_prompt(
 /// nothing. A report that can't be is still unreadable.
 pub fn reformat_prompt(report: &str) -> String {
     format!(
-        "A reviewer wrote this report on a change in prose, where its answer should have been \
-         JSON. Put it in that form. Each defect it reports is a finding: its title, the \
+        "A reviewer wrote this report on a change, where its answer should have been one JSON \
+         object. Put it in that form. Each defect it reports is a finding: its title, the \
          evidence it gives as the detail, and the file and line if it names them. Add nothing \
          it doesn't say, and leave out nothing it reports as wrong. If it reports nothing \
-         wrong, answer with an empty list. If the report is cut off, or isn't a reviewer's \
-         report, answer only: unreadable.\n\n\
+         wrong, answer with an empty list. If it holds more than one list, such as an \
+         example before its own, give what it reports, not the example. If the report is cut \
+         off, or isn't a reviewer's report, answer only: unreadable.\n\n\
          The report:\n<<<\n{}\n>>>\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}.",
@@ -275,7 +307,7 @@ pub fn reformat_prompt(report: &str) -> String {
 }
 
 pub fn read_findings(text: &str) -> Result<Vec<Raw>> {
-    Ok(json_in::<Reviewed>(text)?.findings)
+    Ok(one_json_in::<Reviewed>(text)?.findings)
 }
 
 /// A judged finding, merged across a lens's reviewers.
@@ -431,7 +463,7 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
 }
 
 pub fn read_ratings(text: &str) -> Result<Vec<Rating>> {
-    Ok(json_in::<Judged>(text)?.findings)
+    Ok(one_json_in::<Judged>(text)?.findings)
 }
 
 pub fn fix_prompt(blockers: &str) -> String {
@@ -585,6 +617,27 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
     fn the_answer_is_the_first_object_that_fits() {
         let text = "An example: {\"note\": 1}. The answer: {\"findings\": []} {stray";
         assert!(read_findings(text).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_example_list_before_the_real_one_is_no_answer() {
+        let real = r#"{"findings": [{"title": "Lost email", "file": "a.go", "line": 3}]}"#;
+        let text = format!("The answer looks like {{\"findings\": []}}. Mine:\n{real}");
+        let err = format!("{:#}", read_findings(&text).unwrap_err());
+        assert!(err.contains("2 different lists of findings"), "{err}");
+        let judged = format!(
+            "Like {{\"findings\": []}}, but: {}",
+            r#"{"findings": [{"title": "x", "severity": "High"}]}"#
+        );
+        assert!(read_ratings(&judged).is_err());
+        // The same list twice is still one answer.
+        assert_eq!(
+            read_findings(&format!("{real}\n\n{real}")).unwrap().len(),
+            1
+        );
+        // Other answers still take the first object that fits.
+        let fixed = read_fixed(r#"{"done": "a"} then {"done": "b"}"#).unwrap();
+        assert_eq!(fixed.done, "a");
     }
 
     #[test]

@@ -19,6 +19,10 @@ use crate::bus::Bus;
 use crate::net;
 use crate::network::Whois;
 use crate::proto::{AskAnswer, AskClose, AskShow};
+
+/// The owner a tailnet gives every machine tagged on it: not a person, so
+/// two such machines aren't the same user's.
+pub const TAGGED: &str = "tagged-devices";
 use crate::util::{is_id, new_id};
 
 /// How long an ask's dialogs stay up.
@@ -221,7 +225,9 @@ fn record(bus: &Bus, id: &str, choice: usize, machine: &str) {
 /// sends back the answer.
 pub fn show(bus: &Bus, who: &Whois, req: AskShow) -> Result<(), String> {
     let me = bus.me().map_err(|e| format!("{e:#}"))?;
-    if me.owner.is_empty() || who.owner != me.owner {
+    // As `Bus::allowed` holds: machines tagged on a tailnet share an owner
+    // that isn't a person, so it can't make them the same user's.
+    if me.owner.is_empty() || who.owner != me.owner || who.owner == TAGGED {
         return Err(format!(
             "{} isn't owned by {}, so it can't ask {}'s user anything",
             who.machine, me.owner, me.machine
@@ -375,7 +381,12 @@ mod tests {
             text: "x".into(),
             buttons: vec!["No".into(), "Yes".into()],
         };
-        let refused = show(&bus, &whois("other", "someone-else"), req).unwrap_err();
+        let refused = show(&bus, &whois("other", "someone-else"), req.clone()).unwrap_err();
         assert!(refused.contains("isn't owned by"), "{refused}");
+        // Two tagged machines share an owner, but no user.
+        let tagged = crate::bus::tests::bus_owned_by(TAGGED);
+        let refused = show(&tagged, &whois("other", TAGGED), req).unwrap_err();
+        assert!(refused.contains("isn't owned by"), "{refused}");
+        assert!(!tagged.allowed(&whois("other", TAGGED)).unwrap());
     }
 }

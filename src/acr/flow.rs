@@ -3685,6 +3685,10 @@ lenses:
     #[test]
     fn a_calibration_fingerprints_every_rule() {
         let rules = rules_source();
+        assert!(
+            !rules.contains(super::super::calibration::MISSING),
+            "a rule named for the fingerprint isn't where it's named"
+        );
         for f in [
             "fn ruling(",
             "fn grounded(",

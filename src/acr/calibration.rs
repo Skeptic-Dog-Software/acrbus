@@ -102,14 +102,23 @@ pub fn hash(parts: &[&str]) -> String {
 pub fn source_of(src: &str, starts: &[&str]) -> String {
     starts
         .iter()
-        .filter_map(|start| {
-            let i = src.find(start)?;
-            let end = src[i..].find("\n}\n")?;
-            Some(&src[i..i + end])
+        .map(|start| {
+            src.find(start)
+                .and_then(|i| {
+                    src[i..]
+                        .find("\n}\n")
+                        .map(|end| src[i..i + end].to_string())
+                })
+                // A rule renamed or moved still changes what's hashed, so
+                // the calibrations made under it go stale.
+                .unwrap_or_else(|| format!("{MISSING} {start}"))
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// What stands in the rules' text for a rule that isn't where it's named.
+pub const MISSING: &str = "<not found>";
 
 pub fn path(state: &Path, repo: &str) -> PathBuf {
     state.join("acr-calibration").join(format!("{repo}.json"))
@@ -249,6 +258,11 @@ mod tests {
     fn a_function_is_cut_from_its_source() {
         let src = "fn a() {\n    1\n}\n\nfn b() {\n    2\n}\n";
         assert_eq!(source_of(src, &["fn b("]), "fn b() {\n    2");
+        // A rule renamed away still changes what's hashed.
+        assert_eq!(
+            source_of(src, &["fn b(", "fn c("]),
+            format!("fn b() {{\n    2\n{MISSING} fn c(")
+        );
         assert_eq!(hash(&["x", "y"]), hash(&["x", "y"]));
         assert_ne!(hash(&["x", "y"]), hash(&["xy", ""]));
     }

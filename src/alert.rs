@@ -1,12 +1,15 @@
 //! Dialogs on this Mac, shown with `osascript`. Only a person at the screen
 //! can answer one: nothing on the bus's socket or the network can.
 
+#[cfg(test)]
 use std::env;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use crate::config::APP_NAME;
 use anyhow::{Context, Result, bail};
@@ -22,6 +25,10 @@ end run"#;
 /// For tests: answers every dialog after a second, without showing it.
 /// `no` picks the first button, `yes` the last, and anything else the
 /// button with that label.
+/// Answers every dialog without showing it, in this module's tests only: a
+/// switch in a release build would let anything that sets the daemon's
+/// environment answer its permission prompts.
+#[cfg(test)]
 const TEST_ANSWER: &str = "ACRBUS_TEST_ALERTS";
 
 /// The most buttons a dialog can have.
@@ -35,7 +42,11 @@ pub struct Dialog {
 
 enum Shown {
     Open(Child),
-    Test { choice: Option<usize>, at: Instant },
+    #[cfg(test)]
+    Test {
+        choice: Option<usize>,
+        at: Instant,
+    },
     Closed,
 }
 
@@ -47,6 +58,7 @@ impl Dialog {
             bail!("a dialog has 1 to {MAX_BUTTONS} buttons");
         }
         let owned: Vec<String> = buttons.iter().map(|b| b.to_string()).collect();
+        #[cfg(test)]
         if let Ok(answer) = env::var(TEST_ANSWER) {
             let choice = match answer.as_str() {
                 "no" => Some(0),
@@ -90,6 +102,7 @@ impl Dialog {
                 let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
                 match &mut *shown {
                     Shown::Closed => return None,
+                    #[cfg(test)]
                     Shown::Test { choice, at } => {
                         if Instant::now() >= *at {
                             let choice = *choice;
