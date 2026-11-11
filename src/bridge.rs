@@ -2975,7 +2975,7 @@ mod tests {
             echo "path: $PATH"
             echo "cwd: $(pwd)"
             echo "extra: $EXTRA"
-            echo "leaked: [$CARGO_MANIFEST_DIR$ACRBUS_HOME$ACRBUS_AGENT$TAILBUS_HOME$TAILBUS_AGENT]""#,
+            echo "leaked: [$CARGO_MANIFEST_DIR$ACRBUS_HOME$ACRBUS_AGENT$ACRBUS_CLIENT]""#,
             r#"env = { EXTRA = "yes" }"#,
         );
         let bridge = rig.start(cfg);

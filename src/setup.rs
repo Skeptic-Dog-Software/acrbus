@@ -177,6 +177,12 @@ pub fn claude(install: bool) -> Result<()> {
 
 const PIPE: &str = include_str!("../plugin/commands/pipe.md");
 
+/// The home variable a service is given: under the program's first
+/// environment prefix, which is the one it writes.
+fn home_var() -> String {
+    format!("{}_HOME", app().env.first().copied().unwrap_or("ACRBUS"))
+}
+
 /// The `/pipe` command, naming this program where it says "acrbus".
 fn pipe_text() -> String {
     PIPE.replace("acrbus", app().name)
@@ -336,9 +342,8 @@ impl UserUnit<'_> {
             .chain(self.args.iter().map(|a| a.to_string()))
             .map(|a| quoted(&a))
             .collect();
-        // ACRBUS_HOME is what's written now; TAILBUS_HOME is still read.
         let home_env = env_var("HOME")
-            .map(|h| format!("Environment={}\n", quoted(&format!("ACRBUS_HOME={h}"))))
+            .map(|h| format!("Environment={}\n", quoted(&format!("{}={h}", home_var()))))
             .unwrap_or_default();
         format!(
             "[Unit]\nDescription={}\n{after}\n[Service]\nExecStart={}\n{home_env}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
@@ -439,7 +444,8 @@ impl LaunchAgent<'_> {
         );
         if let Some(home) = env_var("HOME") {
             env_vars.push_str(&format!(
-                "        <key>ACRBUS_HOME</key><string>{}</string>\n",
+                "        <key>{}</key><string>{}</string>\n",
+                home_var(),
                 xml(&home)
             ));
         }
