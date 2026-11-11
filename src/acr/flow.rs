@@ -1491,6 +1491,12 @@ pub(super) fn rules_source() -> String {
             "pub fn adds_text(",
             "pub fn quotes_text(",
             "fn quote_parts(",
+            // Whether a mutant every test passes blocks: it must break a
+            // line the change adds, against one of the change's own tests.
+            "fn in_the_change(",
+            "pub fn changed_tests(",
+            "fn is_test_path(",
+            "fn inline_tests_from(",
         ],
     );
     format!("{flow}\n{stages}")
@@ -3934,6 +3940,10 @@ lenses:
             "fn adds_text(",
             "fn quotes_text(",
             "fn quote_parts(",
+            "fn in_the_change(",
+            "fn changed_tests(",
+            "fn is_test_path(",
+            "fn inline_tests_from(",
         ] {
             assert!(
                 rules.contains(f),
