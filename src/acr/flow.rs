@@ -723,6 +723,15 @@ fn lens_of<'a>(cfg: &'a Config, id: &str) -> Result<&'a Lens> {
 enum Brief {
     /// Review, and answer with findings.
     Review { prompt: String, repo: PathBuf },
+    /// Probe in a copy, and answer with findings; what the prober wrote is
+    /// then kept at `kept`, told from the copy's tree `before`, for the next
+    /// round's prober in its slot.
+    Probe {
+        prompt: String,
+        repo: PathBuf,
+        kept: PathBuf,
+        before: Option<String>,
+    },
     /// Propose mutants, which are then run against the tests in `runs`.
     Mutate {
         prompt: String,
@@ -896,15 +905,30 @@ fn attack(
                     "the probes stage runs scenarios, so its reviewer's binding needs a shell"
                         .into(),
                 ),
-                Some(Kind::Probes) => Brief::Review {
-                    prompt: stages::probes_prompt(
-                        &scope,
-                        &s.not_findings,
-                        command.as_deref(),
-                        &guide,
-                    ),
-                    repo,
-                },
+                Some(Kind::Probes) => {
+                    // Earlier rounds' probes from this slot go back in, to
+                    // run again on the change as it is now.
+                    let kept = s.work_dir.join(format!("probes-{n}.diff"));
+                    let (before, carried) = stages::carry_probes(&repo, &kept);
+                    if carried == stages::Carried::Unapplied {
+                        notes.entry(lens.id.clone()).or_default().push(format!(
+                            "earlier rounds' probes didn't apply to this version, so prober {n} \
+                             was given them to bring over"
+                        ));
+                    }
+                    Brief::Probe {
+                        prompt: stages::probes_prompt(
+                            &scope,
+                            &s.not_findings,
+                            command.as_deref(),
+                            &guide,
+                            &carried,
+                        ),
+                        repo,
+                        kept,
+                        before,
+                    }
+                }
                 Some(Kind::Mutation) => match (&copies, &command) {
                     (Some(dir), Some(command)) => Brief::Mutate {
                         prompt: stages::mutants_prompt(
@@ -941,9 +965,9 @@ fn attack(
                     let binding = cfg.binding(Role::Reviewer, Some(lens))?;
                     let (prompt, repo) = match brief {
                         Brief::Fail(why) => bail!("{why}"),
-                        Brief::Review { prompt, repo } | Brief::Mutate { prompt, repo, .. } => {
-                            (prompt, repo)
-                        }
+                        Brief::Review { prompt, repo }
+                        | Brief::Probe { prompt, repo, .. }
+                        | Brief::Mutate { prompt, repo, .. } => (prompt, repo),
                     };
                     let call = Call {
                         role: Role::Reviewer,
@@ -968,6 +992,15 @@ fn attack(
                             };
                             let (found, summary) = stages::run_mutants(&runner, &mutants)?;
                             Ok((Some(usage), found, Some(summary)))
+                        }
+                        Brief::Probe { kept, before, .. } => {
+                            // Kept before its answer is read, so a prober
+                            // that answers badly still leaves its probes.
+                            let note = before
+                                .as_deref()
+                                .and_then(|before| stages::keep_probes(repo, before, kept));
+                            let found = findings_of(caller, cfg, &answer.text, &call)?;
+                            Ok((Some(usage), found, note))
                         }
                         _ => {
                             let found = findings_of(caller, cfg, &answer.text, &call)?;
@@ -2315,6 +2348,10 @@ lenses:
         warmed: Mutex<Vec<bool>>,
         /// What a fix changes, as the checkout's snapshots would say.
         fixes: Option<Vec<String>>,
+        /// A file every prober writes in its copy.
+        probe_file: Option<&'static str>,
+        /// Whether each prober's copy held that file when it started.
+        probed: Mutex<Vec<bool>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -2330,6 +2367,8 @@ lenses:
                 repos: Mutex::new(Vec::new()),
                 warmed: Mutex::new(Vec::new()),
                 fixes: None,
+                probe_file: None,
+                probed: Mutex::new(Vec::new()),
             }
         }
 
@@ -2362,6 +2401,13 @@ lenses:
                     .lock()
                     .unwrap()
                     .push(call.repo.join("warmed").is_file());
+            }
+            if let Some(file) = self.probe_file.filter(|_| {
+                call.role == Role::Reviewer && call.prompt.contains("You probe a change")
+            }) {
+                let path = call.repo.join(file);
+                self.probed.lock().unwrap().push(path.is_file());
+                fs::write(path, "true\n").unwrap();
             }
             if self.tamper == Some(call.role) {
                 self.changes
@@ -2808,6 +2854,63 @@ lenses:
             run.escalations
                 .iter()
                 .any(|e| e.reason.contains("idle.sh pins nothing"))
+        );
+    }
+
+    #[test]
+    fn after_a_fix_the_probers_run_the_earlier_rounds_probes_again() {
+        use super::super::change::tests::repo_with;
+        let top = "stages: [probes]\ntests: {command: 'sh {tests}'}";
+        let mut cfg = config("exception", 20, 1, "", top);
+        let name = cfg.bindings[&Role::Reviewer].clone();
+        cfg.allowed_bindings.get_mut(&name).unwrap().tools =
+            Some(vec!["Read".into(), "Bash".into()]);
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-reprobe-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.converge = true;
+        s.copies = Some(root.clone());
+        let fixed = Mutex::new(false);
+        let checkout = repo.clone();
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("You probe a change") => CLEAN.to_string(),
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    fs::write(checkout.join("a.src"), "let x = 2;\n").unwrap();
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "x is two now"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        fake.probe_file = Some("probe_test.sh");
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&s.work_dir);
+        assert_eq!(run.status, Status::Confirmed);
+        // Round 1's prober starts clean; every one after the fix starts with
+        // the probe it wrote, to run again.
+        let probed = fake.probed.lock().unwrap().clone();
+        assert!(probed.len() >= 2, "{probed:?}");
+        assert!(!probed[0]);
+        assert!(probed[1..].iter().all(|had| *had), "{probed:?}");
+        let calls = fake.calls.lock().unwrap();
+        let probers: Vec<_> = calls
+            .iter()
+            .filter(|c| c.3.contains("You probe a change"))
+            .collect();
+        assert!(!probers[0].3.contains("Earlier rounds' probes"));
+        assert!(
+            probers[1]
+                .3
+                .contains("Earlier rounds' probes are in your copy already, in `probe_test.sh`")
         );
     }
 

@@ -596,6 +596,85 @@ fn decided(not_findings: &str) -> String {
 
 // ----------------------------------------------------------------- probes
 
+/// What a prober finds in its copy of the probes written in earlier rounds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Carried {
+    /// Nothing from before.
+    Nothing,
+    /// They're in place, in these files.
+    Applied(Vec<String>),
+    /// They don't apply to the change as it is now, so they wait in the
+    /// copy as a diff, at [`EARLIER_PROBES`], for the prober to bring over.
+    Unapplied,
+}
+
+/// Where earlier rounds' probes wait in a prober's copy when they don't
+/// apply to the change as it is now.
+pub const EARLIER_PROBES: &str = "acr-earlier-probes.diff";
+
+/// The most of a prober's work that's kept for the next round.
+const PROBES_KEPT_MAX: usize = 1 << 20;
+
+/// Puts the probes that earlier rounds' probers in this slot wrote, kept at
+/// `kept`, into a new prober's copy, so it runs them again on the change as
+/// it is now: after a fix, that tells whether the fix held. Returns the
+/// copy's tree from before they went in, to tell what the prober changes
+/// by, and what it was given.
+pub fn carry_probes(copy: &Path, kept: &Path) -> (Option<String>, Carried) {
+    let before = super::change::worktree_tree(copy).ok();
+    let diff = match fs::read_to_string(kept) {
+        Ok(diff) if before.is_some() && !diff.trim().is_empty() => diff,
+        _ => return (before, Carried::Nothing),
+    };
+    let applied = Command::new("git")
+        .arg("-C")
+        .arg(copy)
+        .args(["apply", "--whitespace=nowarn"])
+        .arg(kept)
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if applied {
+        (before, Carried::Applied(diff_files(&diff)))
+    } else if fs::write(copy.join(EARLIER_PROBES), &diff).is_ok() {
+        (before, Carried::Unapplied)
+    } else {
+        (before, Carried::Nothing)
+    }
+}
+
+/// Keeps what a prober changed in its copy, the earlier probes it was given
+/// included, for the next round's prober in its slot. A note if it
+/// couldn't.
+pub fn keep_probes(copy: &Path, before: &str, kept: &Path) -> Option<String> {
+    let _ = fs::remove_file(copy.join(EARLIER_PROBES));
+    let diff = super::change::worktree_tree(copy)
+        .and_then(|after| super::change::git(copy, &["diff", "--binary", before, &after]));
+    match diff {
+        Err(e) => Some(format!("its probes weren't kept for the next round: {e:#}")),
+        Ok(diff) if diff.trim().is_empty() => {
+            let _ = fs::remove_file(kept);
+            None
+        }
+        Ok(diff) if diff.len() > PROBES_KEPT_MAX => Some(format!(
+            "its probes weren't kept for the next round: {} KB of changes is more than the {} KB kept",
+            diff.len() / 1024,
+            PROBES_KEPT_MAX / 1024
+        )),
+        Ok(diff) => fs::write(kept, diff)
+            .err()
+            .map(|e| format!("its probes weren't kept for the next round: {e}")),
+    }
+}
+
+/// The files a diff touches, as it leaves them.
+fn diff_files(diff: &str) -> Vec<String> {
+    diff.lines()
+        .filter_map(|l| l.strip_prefix("diff --git "))
+        .filter_map(|l| l.rsplit_once(" b/").map(|(_, path)| path.to_string()))
+        .collect()
+}
+
 /// A prober's brief: it writes scenarios as tests and runs them, in its own
 /// copy.
 pub fn probes_prompt(
@@ -603,6 +682,7 @@ pub fn probes_prompt(
     not_findings: &str,
     command: Option<&str>,
     guide: &str,
+    carried: &Carried,
 ) -> String {
     let command = match command {
         Some(c) => format!(
@@ -611,15 +691,40 @@ pub fn probes_prompt(
         ),
         None => "Find how this repository runs its tests from its own files.".to_string(),
     };
+    let carried = match carried {
+        Carried::Nothing => String::new(),
+        Carried::Applied(files) => format!(
+            "Earlier rounds' probes are in your copy already, in {}, and the change has moved \
+             on since: run them first. One that fails now is a finding, unless what it asserts \
+             is what a fix changed on purpose: then bring it up to date, and don't report it.\n\n",
+            files
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Carried::Unapplied => format!(
+            "Earlier rounds' probes no longer apply to the change as it is now: they're in \
+             `{EARLIER_PROBES}` in your copy, as a diff. Bring over the ones that still matter \
+             and run them first; one that fails now is a finding, unless what it asserts is \
+             what a fix changed on purpose.\n\n"
+        ),
+    };
     let attached = super::change::ATTACHED;
     format!(
         "You probe a change by running it. Scope: {scope}. {attached} Your working directory is your own copy of the \
          repository, as the change leaves it, and nothing you do there reaches the change.\n\n\
+         {carried}\
          Write small scenarios, as tests in this repository's own test framework, of what the \
          change says it does and the edges around it: doing it twice, or in another order; \
-         after a reopen or a restart; at a boundary, such as midnight, a month's end, the first \
-         or last item, or an empty or missing value; and after something it depends on was \
-         changed or deleted. Run each. {command}\n\n\
+         at the same moment as another call that touches the same state, with the language's \
+         race detector on if it has one; after a reopen or a restart; at a boundary, such as \
+         midnight, a month's end, the first or last item, or an empty or missing value; and \
+         after something it depends on was changed or deleted. Run each, with a time limit, so \
+         a hang fails instead of stalling: a call that should return, or give up when it's \
+         cancelled, and doesn't is a finding. {command}\n\n\
+         Change only tests, and leave the code under test as you found it: what you write is \
+         kept, and the next round's probes run it again on the change as fixed.\n\n\
          {guide}\
          A scenario that fails, or shows wrong behaviour, is a finding: give its test code and \
          what it printed. One that passes isn't. Wrong behaviour that was there before the \
@@ -1339,6 +1444,65 @@ pub fn mutation_dir(copies: &Path, lens: &str, n: u32) -> PathBuf {
 mod tests {
     use super::*;
     use crate::acr::change::tests::{commit, repo_with};
+
+    #[test]
+    fn a_probers_work_goes_into_the_next_rounds_copy_and_waits_if_it_no_longer_applies() {
+        use crate::acr::change::copy_of;
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-carry-{}", crate::util::new_id()));
+        let kept = root.join("probes-1.diff");
+        fs::create_dir_all(&root).unwrap();
+        let copy = |n: u32| {
+            let to = root.join(format!("c{n}")).join("repo");
+            copy_of(&repo, &to).unwrap();
+            to
+        };
+        // Round 1: nothing from before; it writes a probe.
+        let one = copy(1);
+        let (before, carried) = carry_probes(&one, &kept);
+        assert_eq!(carried, Carried::Nothing);
+        fs::write(
+            one.join("probe_test.sh"),
+            "test \"$(cat a.src)\" = 'let x = 1;'\n",
+        )
+        .unwrap();
+        assert_eq!(keep_probes(&one, &before.unwrap(), &kept), None);
+        assert!(fs::read_to_string(&kept).unwrap().contains("probe_test.sh"));
+        // Round 2: the probe is in the new copy before the prober starts.
+        let two = copy(2);
+        let (before, carried) = carry_probes(&two, &kept);
+        assert_eq!(carried, Carried::Applied(vec!["probe_test.sh".into()]));
+        assert!(two.join("probe_test.sh").is_file());
+        // What's kept now is the earlier probe and this round's too.
+        fs::write(two.join("more_test.sh"), "true\n").unwrap();
+        assert_eq!(keep_probes(&two, &before.unwrap(), &kept), None);
+        let diff = fs::read_to_string(&kept).unwrap();
+        assert!(diff.contains("probe_test.sh") && diff.contains("more_test.sh"));
+        // A fix that took the probe's path: it waits in the copy as a diff,
+        // and is gone from it before what the prober did is kept.
+        fs::write(repo.join("probe_test.sh"), "true\n").unwrap();
+        let three = copy(3);
+        let (before, carried) = carry_probes(&three, &kept);
+        assert_eq!(carried, Carried::Unapplied);
+        assert!(three.join(EARLIER_PROBES).is_file());
+        assert_eq!(keep_probes(&three, &before.unwrap(), &kept), None);
+        assert!(!three.join(EARLIER_PROBES).exists());
+        assert!(
+            !kept.exists(),
+            "it brought nothing over, so nothing is kept"
+        );
+        let prompt = |c: &Carried| probes_prompt("the change", "", None, "", c);
+        let applied = prompt(&Carried::Applied(vec!["probe_test.sh".into()]));
+        assert!(applied.contains("`probe_test.sh`") && applied.contains("run them first"));
+        assert!(prompt(&Carried::Unapplied).contains(EARLIER_PROBES));
+        let fresh = prompt(&Carried::Nothing);
+        assert!(!fresh.contains("Earlier rounds"));
+        // Concurrency and hangs are edges every prober tries.
+        assert!(fresh.contains("at the same moment") && fresh.contains("race detector"));
+        assert!(fresh.contains("with a time limit"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&repo);
+    }
 
     const DIFF_LINES: [&str; 20] = [
         "diff --git a/lib/a.dart b/lib/a.dart",
