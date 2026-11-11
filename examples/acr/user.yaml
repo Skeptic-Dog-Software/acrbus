@@ -3,7 +3,7 @@
 # tools. A repository chooses among these names. acrbus assumes no provider,
 # model or binding of its own, so everything here is an example: set your own.
 # ACR runs on one machine: every agent here must be on the machine with the
-# code, where its reviewers read the repository itself, read-only.
+# code. Reviewers that can run things each work in a copy of their own.
 version: 1
 allowed_bindings:
   small:
@@ -11,8 +11,8 @@ allowed_bindings:
     model: example/small-model
     tools: [read, grep, glob]
     timeout: 14400   # 4 hours: a cap no review should ever reach
-  medium:
-    agent: models@my-mac
+  medium:          # reviewers; add bash, write and edit for probes, which are on
+    agent: models@my-mac  # by default and run in a copy of each reviewer's own
     model: example/medium-model
     effort: high
     tools: [read, grep, glob]

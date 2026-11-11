@@ -526,10 +526,13 @@ impl Binding {
     /// Whether it names a tool that can change files. A reviewer that has
     /// one works in a copy of its own, to run and break things in, and never
     /// in the checkout.
+    /// Whether its tools can run or change things. Agents spell their
+    /// tools in their own case, `Bash` or `bash`.
     pub fn changes_files(&self) -> bool {
-        self.tools
-            .as_ref()
-            .is_some_and(|t| t.iter().any(|t| CHANGING_TOOLS.contains(&t.as_str())))
+        self.tools.as_ref().is_some_and(|t| {
+            t.iter()
+                .any(|t| CHANGING_TOOLS.iter().any(|c| c.eq_ignore_ascii_case(t)))
+        })
     }
 }
 
@@ -578,6 +581,10 @@ pub struct Config {
     pub outside: bool,
     #[serde(default)]
     pub stages: Vec<Stage>,
+    /// Probes, on by default, are off: no stages were chosen, and the
+    /// reviewers' binding can't run things.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probes_off: bool,
     #[serde(default)]
     pub tests: Tests,
     #[serde(default)]
@@ -585,15 +592,23 @@ pub struct Config {
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
-/// which model does each role is the user's to say.
+/// which model does each role is the user's to say. Probes are on: every
+/// change says it does something, and running scenarios of that finds
+/// what reading it misses.
 fn framework_defaults() -> Policy {
     Policy {
         human_gate: Some(HumanGate::Exception),
         max_rounds: Some(3),
         review_scope: Some(ReviewScope::WholePr),
+        stages: Some(vec![Stage::Probes]),
         ..Policy::default()
     }
 }
+
+/// Why probes are off, for what shows a config.
+pub const PROBES_OFF: &str = "Probes are off: they're on by default, but they run scenarios, and \
+     the reviewers' binding has no Bash, Write or Edit. Give it those, since each reviewer works \
+     in a copy of its own, or list `stages` in the repository's config to choose for yourself.";
 
 /// Where a role's binding can be set.
 fn no_binding(role: Role) -> String {
@@ -633,6 +648,9 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         bindings: flags.bindings.clone(),
         ..Policy::default()
     };
+    // Stages someone chose, rather than the framework's.
+    let chosen =
+        repo.stages.is_some() || user.defaults.as_ref().is_some_and(|d| d.stages.is_some());
     let merged = framework_defaults()
         .over(user.defaults.clone().unwrap_or_default())
         .over(repo)
@@ -655,11 +673,26 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         costs: merged.costs.unwrap_or_default(),
         outside: false,
         stages: merged.stages.unwrap_or_default(),
+        probes_off: false,
         tests: merged.tests.unwrap_or_default(),
         runbook: merged.runbook,
     };
     config.check()?;
-    with_stage_lenses(with_universal_lenses(config))
+    with_stage_lenses(with_universal_lenses(default_probes(config, chosen)))
+}
+
+/// Probes by default need reviewers that can run things: without that,
+/// they're left out, rather than failing every round. Chosen, they stay,
+/// and say why they can't run.
+fn default_probes(mut config: Config, chosen: bool) -> Config {
+    let runs = config
+        .binding(Role::Reviewer, None)
+        .is_ok_and(Binding::changes_files);
+    if !chosen && !runs && config.stages.contains(&Stage::Probes) {
+        config.stages.retain(|s| *s != Stage::Probes);
+        config.probes_off = true;
+    }
+    config
 }
 
 /// The lens every repository gets, whatever its dimensions: elegance.
@@ -1152,6 +1185,44 @@ mod tests {
 
     const SMALL: &str = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
                          lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+
+    #[test]
+    fn probes_are_on_by_default_wherever_reviewers_can_run_things() {
+        let probes = |cfg: &Config| cfg.stages.contains(&Stage::Probes) && cfg.has_lens("probes");
+        let mut runs = user();
+        runs.allowed_bindings.get_mut("medium").unwrap().tools =
+            Some(vec!["read".into(), "bash".into(), "write".into()]);
+        let read_only = user();
+        let chose = |stages: &str| format!("{SMALL}stages: {stages}\n");
+        // Nobody chose: on, if the reviewers can run them.
+        let cfg = resolve(&runs, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap();
+        assert!(probes(&cfg) && !cfg.probes_off);
+        // Read-only reviewers: off, and saying so, not failing every round.
+        let cfg = resolve(&read_only, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap();
+        assert!(!probes(&cfg) && cfg.probes_off);
+        // A repository that chose stages gets what it chose.
+        let cfg = resolve(
+            &runs,
+            parse_repo(&chose("[gate]")).unwrap(),
+            &Flags::default(),
+        );
+        let cfg = cfg.unwrap();
+        assert!(!probes(&cfg) && !cfg.probes_off);
+        let cfg = resolve(
+            &read_only,
+            parse_repo(&chose("[probes]")).unwrap(),
+            &Flags::default(),
+        );
+        assert!(
+            probes(&cfg.unwrap()),
+            "chosen, it stays, and says it needs a shell"
+        );
+        // So does a user's own default.
+        let mut theirs = read_only.clone();
+        theirs.defaults.as_mut().unwrap().stages = Some(Vec::new());
+        let cfg = resolve(&theirs, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap();
+        assert!(!probes(&cfg) && !cfg.probes_off);
+    }
 
     #[test]
     fn costs_merge_model_by_model_and_role_by_role() {

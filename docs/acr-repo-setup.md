@@ -23,8 +23,10 @@ acrbus acr add-repo <path>       # let ACR review the repository here
 
 Every role's binding comes from `~/.config/acrbus/acr.yaml`. Reviewers do
 best when they can run things: give the reviewer binding a shell and the
-writing tools. A reviewer with them works in a copy of its own, so nothing
-it does reaches the checkout.
+writing tools, as `acrbus setup acr` does. A reviewer with them works in a
+copy of its own, so nothing it does reaches the checkout. The probes stage,
+on by default, needs them: without them it's left out, and `acr validate`
+and `acr plan` say so.
 
 ```yaml
 allowed_bindings:
@@ -149,6 +151,10 @@ tests:
   mutants: 12
 ```
 
+- **`stages`** left out means `[probes]`: every change says it does
+  something, and running scenarios of that finds what reading misses. List
+  `stages` to choose for yourself, and keep `probes` in it unless the
+  repository has nothing a scenario could run.
 - **`gate`** runs first in every round. It finds changed lines no test runs
   (from the coverage report) and mutants of the changed code every test
   passes, and tells every reviewer what it found. Set `tests.coverage` to

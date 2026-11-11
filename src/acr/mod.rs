@@ -952,6 +952,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 cfg.tiers.len(),
                 cfg.lenses.len()
             );
+            if cfg.probes_off {
+                println!("{}", config::PROBES_OFF);
+            }
             if cfg.allowed_bindings.is_empty() {
                 println!(
                     "Bindings not checked: there's no {}.",
@@ -974,6 +977,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
+                if cfg.probes_off {
+                    println!("{}", config::PROBES_OFF);
+                }
                 describe_plan(&plan);
             }
         }
