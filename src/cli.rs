@@ -20,8 +20,8 @@ use crate::{acr, bridge, call, daemon, format, hook, local, mcp, setup, usage, u
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Act as this agent. Defaults to $ACRBUS_AGENT (or $TAILBUS_AGENT), then
-    /// the repository you're in.
+    /// Act as this agent. Defaults to $ACRBUS_AGENT, then the repository
+    /// you're in.
     #[arg(long = "as", global = true, value_name = "NAME")]
     agent: Option<String>,
 
@@ -282,7 +282,7 @@ pub fn main() -> ExitCode {
 }
 
 /// The command line, named as this program, with `--as` from
-/// `ACRBUS_AGENT` (or `TAILBUS_AGENT`) when it's left out.
+/// the program's `<PREFIX>_AGENT` when it's left out.
 fn parse() -> Cli {
     let app = app();
     let command = Cli::command()

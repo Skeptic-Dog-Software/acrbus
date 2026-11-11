@@ -1,8 +1,5 @@
 # Setting up ACR review for a repository
 
-The commands here are acrbus's. On tailbus, which is built on acrbus, run the
-same ones as `tailbus ...`, with its config under `~/.config/tailbus/`.
-
 How to set up a repository you don't know yet, on a machine that may be new,
 so that its review is configured correctly. The pipeline reviews well only
 when its reviewers know two things the diff can't tell them. Each lens needs

@@ -3,7 +3,8 @@
 //!
 //! A local bus is the one every program knows: its name and owner come from
 //! the config, and it reaches no other machine. A program built on acrbus
-//! can know more, such as tailbus's Tailscale, through its `App`.
+//! can know more through its `App`, such as one that reaches other
+//! machines.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -53,6 +54,8 @@ pub trait Network: Send + Sync {
 pub struct Kind {
     pub name: &'static str,
     pub open: fn(&Config) -> Result<Box<dyn Network>>,
+    /// The keys of config.toml it reads, from `Config::network_settings`.
+    pub settings: &'static [&'static str],
 }
 
 /// The network every program knows: this machine alone.
