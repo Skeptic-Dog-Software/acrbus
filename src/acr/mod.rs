@@ -1104,10 +1104,15 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
             let _active = keep::active_guard(paths, &run_id)?;
             let cfg: Config = stored_config(&read("config.json")?)?;
-            check_machine(paths, &cfg)?;
-            // Until a fix, the review is of its head, which must be checked out.
-            if run.lenses.values().all(|l| l.done.is_empty()) {
-                change::checked_out(&run.repo, run.head.as_deref())?;
+            // Ending a review calls nothing and reads no code, so neither its
+            // agents nor its checkout has to be as it was.
+            if !stop {
+                check_machine(paths, &cfg)?;
+                // Until a fix, the review is of its head, which must be
+                // checked out.
+                if run.lenses.values().all(|l| l.done.is_empty()) {
+                    change::checked_out(&run.repo, run.head.as_deref())?;
+                }
             }
             let decision = Decision {
                 fold,
@@ -2198,6 +2203,51 @@ mod tests {
         );
         assert!(err.contains("[bridges.agent-x.options]"), "{err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_waiting_review_can_be_stopped_whatever_its_agents_and_checkout_are() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // Waiting on a head that's no longer checked out, on a machine with
+        // no bus to say which machine it is.
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-stop", "repo": repo, "base": "main", "head": "0000000",
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "review",
+            "status": "waiting", "waiting": "escalation", "lenses": {},
+            "escalations": [{"reason": "a person should see this", "seen": false}],
+            "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        save(&paths, &run, &cfg).unwrap();
+        let resume = |stop: bool| AcrCmd::Resume {
+            run_id: "r-stop".into(),
+            fold: Vec::new(),
+            waive: Vec::new(),
+            approve: !stop,
+            stop,
+            post_pr: None,
+        };
+        assert!(
+            super::run(&paths, resume(false)).is_err(),
+            "going on needs both"
+        );
+        super::run(&paths, resume(true)).unwrap();
+        // Ended, and tidied away as a finished review is.
+        assert!(!run_dir(&paths, "r-stop").join("run.json").exists());
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
