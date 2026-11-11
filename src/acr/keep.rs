@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 
 use super::flow::Run;
 use super::plan::Record;
-use crate::config::Paths;
+use crate::config::{APP_NAME, Paths};
 
 const HISTORY: &str = "history.jsonl";
 /// The finished reviews of each repository that history keeps.
@@ -176,6 +176,16 @@ pub fn finished(paths: &Paths, run: &Run, noted: bool) -> Result<()> {
     }
     if noted && let Some(record) = Record::of(run) {
         add(paths, record)?;
+    }
+    // Its findings stay a while, for its user to say how it did. A review
+    // that can't keep them still finishes.
+    if noted
+        && let Err(e) = super::configure::keep_findings(&paths.state, run, crate::util::now_ms())
+    {
+        eprintln!(
+            "{APP_NAME}: couldn't keep review {}'s findings for feedback: {e:#}",
+            run.id
+        );
     }
     let review = dir(paths).join(&run.id);
     match fs::remove_dir_all(&review) {

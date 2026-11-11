@@ -823,7 +823,7 @@ max_timeout_secs = 14400
 tools = ["Read", "Grep", "Glob", "Bash", "Write"]
 tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
 models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
-efforts = ["low", "medium", "high"]
+efforts = ["low", "medium", "high", "xhigh", "max"]
 effort_args = ["--effort", "{{EFFORT}}"]
 workdirs = []
 
@@ -934,12 +934,20 @@ allowed_bindings:
     tools: [Read, Grep, Glob, Bash, Write]
     timeout: 14400
     subscription: true
+  opus-configure:  # the configurer: reviews a whole repository to configure its review
+    agent: {agent}
+    model: claude-opus-5-5
+    effort: max
+    tools: [Read, Grep, Glob, Bash, Write]
+    timeout: 14400
+    subscription: true
 defaults:
   bindings:
     sizer: haiku-low
     reviewer: sonnet-high
     orchestrator: opus-medium
     judge: opus-judge
+    configurer: opus-configure
 "#
     )
 }

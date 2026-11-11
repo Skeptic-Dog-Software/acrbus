@@ -6,6 +6,7 @@ mod calibration;
 mod carry;
 mod change;
 mod config;
+mod configure;
 mod flow;
 mod generated;
 mod keep;
@@ -145,12 +146,52 @@ pub enum AcrCmd {
     Schema,
     /// How the pipeline's Judge rates what each key's own review found, set
     /// against how that review rated it: blockers agreed on, missed, and
-    /// overrated. Runs no reviewer: one Judge call for each dimension.
-    Calibrate {
+    /// overrated. A benchmark of the Judge against a past review, which
+    /// calibrates nothing. Runs no reviewer: one Judge call for each
+    /// dimension.
+    JudgeCheck {
         keys: Vec<PathBuf>,
         /// Append each key's result to this file, as a line of JSON.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Configure a repository's review from what's in it. The configurer, a
+    /// strong model, reviews the whole repository, in a clone of its own, and
+    /// proposes its review config: the dimensions that matter, what blocks in
+    /// each, and how to work and test in it. Accept it with `acr calibration
+    /// --accept`.
+    Configure {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Fold what you've said of a repository's reviews, with `acr feedback`,
+    /// into its config: the configurer reviews the repository again, with its
+    /// config and that feedback, and proposes a revised config.
+    Calibrate {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Say how a finished review did, so `acr calibrate` can make the next
+    /// ones better. With only the review's ID, it lists the findings to say
+    /// it of.
+    Feedback {
+        /// The review's ID.
+        run: String,
+        /// A finding, by its number in the list or its ID.
+        #[arg(long, requires = "verdict", conflicts_with = "missed")]
+        finding: Option<String>,
+        /// How the finding did.
+        #[arg(long, value_enum, requires = "finding")]
+        verdict: Option<configure::Verdict>,
+        /// A defect the review missed.
+        #[arg(long)]
+        missed: Option<String>,
+        /// The lens a missed defect belongs to.
+        #[arg(long, requires = "missed")]
+        lens: Option<String>,
+        /// Anything else to say of it.
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Whether the defects a key's review found, and the blockers a saved
     /// run upheld, are still present in a final version of the change: the
@@ -262,9 +303,10 @@ pub enum AcrCmd {
         #[arg(long, value_name = "PATH")]
         head: PathBuf,
     },
-    /// Where a repository's calibration stands. With `--accept`, accept the
-    /// latest, once you've read where the Judge and the keys' own review
-    /// disagree.
+    /// Where a repository's calibration stands: whether its config is
+    /// accepted, a proposal waits, or feedback is still to fold in. With
+    /// `--accept`, put a waiting proposal in place, or take the config as it
+    /// is, and accept it, once you've read it.
     Calibration {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -1046,6 +1088,19 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             config,
             accept,
         } => {
+            let name = change::name(&repo)?;
+            let kept_at = match &config {
+                Some(file) => file.clone(),
+                None => outside_config(paths, &repo)?,
+            };
+            let mut folded = None;
+            if accept {
+                // A waiting proposal goes in first, so it's what's accepted.
+                if let Some(applied) = configure::apply(&kept_at, crate::util::now_ms())? {
+                    println!("Put the proposed config in place at {}.", kept_at.display());
+                    folded = applied.folded;
+                }
+            }
             let target = Target {
                 repo: repo.clone(),
                 base: base.clone(),
@@ -1063,48 +1118,28 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let (text, _) = repo_layer(paths, &repo, Some(&base), config.as_deref())?;
             let decided = not_findings(&cfg, &source, &repo, &base)?;
             let now = fingerprint(&cfg, &text, &decided)?;
-            let name = change::name(&repo)?;
             if accept {
-                let a = calibration::accept(&paths.state, &name, &now, crate::util::now_ms())?;
-                println!("Accepted {name}'s calibration, on {} runs.", a.runs);
+                calibration::accept(&paths.state, &name, &now, crate::util::now_ms(), folded)?;
+                println!("Accepted {name}'s review config.");
             }
             let record = calibration::load(&paths.state, &name)?;
-            println!("{}", calibration::report(&name, &record, &now));
+            let unfolded =
+                configure::feedback(&paths.state, &name, record.feedback_folded_at)?.len();
+            let waiting = configure::pending(&kept_at).config;
+            println!(
+                "{}",
+                calibration::report(
+                    &name,
+                    &record,
+                    &now,
+                    unfolded,
+                    waiting.exists().then_some(waiting.as_path())
+                )
+            );
         }
-        AcrCmd::Calibrate { keys, out } => {
-            let mut runs: Vec<(String, String, calibration::CalibrationRun)> = Vec::new();
+        AcrCmd::JudgeCheck { keys, out } => {
             for key in keys {
                 let result = calibrate(paths, &key)?;
-                let fp: calibration::Fingerprint =
-                    serde_json::from_value(result["fingerprint"].clone())?;
-                let repo = result["repo"].as_str().unwrap_or_default().to_string();
-                let count = |k: &str| result[k].as_u64().unwrap_or_default() as usize;
-                let name = result["key"].as_str().unwrap_or_default().to_string();
-                match runs
-                    .iter_mut()
-                    .find(|(r, _, run)| r == &repo && run.fingerprint == fp)
-                {
-                    Some((_, _, run)) => {
-                        run.keys.push(name);
-                        run.agreed += count("agreed_blockers");
-                        run.missed += count("missed_blockers");
-                        run.overrated += count("overrated");
-                        run.dropped += count("dropped");
-                    }
-                    None => runs.push((
-                        repo,
-                        result["repo_path"].as_str().unwrap_or_default().to_string(),
-                        calibration::CalibrationRun {
-                            at: crate::util::now_ms(),
-                            keys: vec![name],
-                            fingerprint: fp,
-                            agreed: count("agreed_blockers"),
-                            missed: count("missed_blockers"),
-                            overrated: count("overrated"),
-                            dropped: count("dropped"),
-                        },
-                    )),
-                }
                 println!(
                     "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
                     result["key"].as_str().unwrap_or_default(),
@@ -1119,16 +1154,49 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
                 }
             }
-            for (repo, path, run) in runs {
-                let fp = run.fingerprint.clone();
-                let record = calibration::add_run(&paths.state, &repo, run)?;
-                println!(
-                    "Recorded for {repo}: {} run(s) on its current config and Judge. Read where \
-                     the Judge and the keys disagree, then accept it with `{APP_NAME} acr \
-                     calibration --repo {path} --accept`.",
-                    record.runs_on(&fp).len()
-                );
+        }
+        AcrCmd::Configure { repo } => configure_repo(paths, &repo, false)?,
+        AcrCmd::Calibrate { repo } => configure_repo(paths, &repo, true)?,
+        AcrCmd::Feedback {
+            run,
+            finding,
+            verdict,
+            missed,
+            lens,
+            note,
+        } => {
+            let kept = configure::kept(&paths.state, &run)?;
+            let mut f = configure::Feedback {
+                at: crate::util::now_ms(),
+                run: run.clone(),
+                finding: None,
+                verdict: None,
+                missed: None,
+                lens: None,
+                note,
+            };
+            match (finding, verdict, missed) {
+                (Some(which), Some(v), _) => {
+                    f.finding = Some(configure::finding(&kept, &which)?.clone());
+                    f.verdict = Some(v);
+                }
+                (_, _, Some(m)) => {
+                    f.missed = Some(m);
+                    f.lens = lens;
+                }
+                _ if f.note.is_some() => {}
+                _ => {
+                    println!("{}", configure::listed(&kept));
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
+            configure::add_feedback(&paths.state, &kept.repo, &f)?;
+            println!(
+                "Noted: {}\n`{APP_NAME} acr calibrate` folds it into {}'s config when you're \
+                 ready.",
+                f.described(),
+                kept.repo
+            );
         }
         AcrCmd::Residual {
             key,
@@ -1655,6 +1723,110 @@ fn pipeline_arm(
 /// `acrbus acr calibrate`, for one key: its own review's findings, each
 /// tagged, go to the pipeline's Judge one dimension at a time, in a copy of
 /// the change, and its ratings are set against the review's.
+/// A folder that goes when this does.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `acr configure` and `acr calibrate`: the configurer reviews the repository
+/// in a clone of its own, with its history, and proposes its review config,
+/// which waits beside the config for a person to read and accept. A
+/// recalibration also hands it the config and the feedback not yet folded in.
+fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("finding {}", repo.display()))?;
+    let name = change::name(&repo)?;
+    let user = config::load_user(&user_config_path(paths))?;
+    let (binding_name, binding) = configure::binding(&user)?;
+    let kept_at = outside_config(paths, &repo)?;
+    let current = fs::read_to_string(&kept_at).ok();
+    let record = calibration::load(&paths.state, &name)?;
+    let feedback = if recalibrate {
+        if current.is_none() {
+            bail!(
+                "{name} has no review config at {} to recalibrate: `{APP_NAME} acr configure \
+                 --repo {}` proposes one",
+                kept_at.display(),
+                repo.display()
+            );
+        }
+        let feedback = configure::feedback(&paths.state, &name, record.feedback_folded_at)?;
+        if feedback.is_empty() {
+            bail!(
+                "there's no feedback on {name}'s reviews since its config was last \
+                 recalibrated: say how a review did with `{APP_NAME} acr feedback <review>`"
+            );
+        }
+        feedback
+    } else {
+        Vec::new()
+    };
+    let folds = feedback.iter().map(|f| f.at).max();
+    let root = copies_root(paths).join(format!("configure-{}", crate::util::new_id()));
+    let _gone = Gone(root.clone());
+    fs::create_dir_all(&root)?;
+    let clone = root.join(&name);
+    let cloned = std::process::Command::new("git")
+        .args(["clone", "--quiet", "--no-hardlinks"])
+        .arg(&repo)
+        .arg(&clone)
+        .output()
+        .context("running git clone")?;
+    if !cloned.status.success() {
+        bail!(
+            "cloning {} for the configurer: {}",
+            repo.display(),
+            String::from_utf8_lossy(&cloned.stderr).trim()
+        );
+    }
+    let bridge = binding
+        .agent
+        .split('@')
+        .next()
+        .unwrap_or(&binding.agent)
+        .to_string();
+    crate::setup::acr_dir(paths, &copies_root(paths), &bridge)?;
+    let caller = BridgeCaller::new(paths)?;
+    let brief = configure::prompt(&name, current.as_deref().filter(|_| recalibrate), &feedback);
+    eprintln!(
+        "{APP_NAME}: {binding_name} is reviewing {name} to {}. It reads the whole \
+         repository, so this takes a while.",
+        if recalibrate {
+            format!(
+                "fold {} piece(s) of feedback into its config",
+                feedback.len()
+            )
+        } else {
+            "configure its review".to_string()
+        }
+    );
+    let proposal = configure::propose(&caller, &user, (&binding_name, &binding), &clone, &brief)?;
+    let waiting = configure::save(&kept_at, &proposal, folds)?;
+    if current.is_some() {
+        let diff = std::process::Command::new("git")
+            .args(["diff", "--no-index", "--no-color", "--"])
+            .arg(&kept_at)
+            .arg(&waiting.config)
+            .output()?;
+        println!("{}", String::from_utf8_lossy(&diff.stdout));
+    }
+    println!("{}", proposal.why);
+    println!(
+        "\nProposed a review config for {name}: {}, with its reasons in {}. Read them, change \
+         the config if you like, then accept it with `{APP_NAME} acr calibration --repo {} \
+         --accept`.",
+        waiting.config.display(),
+        waiting.why.display(),
+        repo.display()
+    );
+    Ok(())
+}
+
 fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
     use serde_json::json;
     let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
@@ -1847,32 +2019,42 @@ fn calibrated(
     use calibration::Standing;
     let record = calibration::load(&paths.state, name)?;
     let how = format!(
-        "Run `{APP_NAME} acr calibrate` on its keys twice, then `{APP_NAME} acr calibration \
-         --accept` (section 7 of docs/acr-repo-setup.md)"
+        "`{APP_NAME} acr configure` proposes a config from a review of the whole repository, \
+         and `{APP_NAME} acr calibration --accept` accepts it, or a config you wrote yourself \
+         (section 7 of docs/acr-repo-setup.md)"
     );
+    let unfolded = configure::feedback(&paths.state, name, record.feedback_folded_at)?.len();
+    let feedback = if unfolded > 0 {
+        format!(
+            " {unfolded} piece(s) of your feedback on its reviews aren't in its config yet: \
+             `{APP_NAME} acr calibrate` folds them in."
+        )
+    } else {
+        String::new()
+    };
     match calibration::standing(&record, now) {
-        Standing::Calibrated => Ok(None),
+        Standing::Calibrated => Ok((!feedback.is_empty()).then(|| format!("Note:{feedback}"))),
         Standing::JudgeChanged => Ok(Some(format!(
-            "Note: the Judge (its binding, prompt or rules) has changed since {name} was \
-             calibrated. {how}."
+            "Note: the Judge (its binding, prompt or rules) has changed since {name}'s config was \
+             accepted. Check its config still fits, then accept it again with `{APP_NAME} acr \
+             calibration --accept`.{feedback}"
         ))),
         _ if anyway => Ok(Some(format!(
-            "Note: {name} isn't calibrated for this config, so its rulings haven't been checked \
-             against a full review."
+            "Note: {name}'s config isn't one accepted for it, so it hasn't been checked for \
+             this repository."
         ))),
         Standing::Never => bail!(
-            "{name} isn't calibrated, so the pipeline's rulings here haven't been checked \
-             against a full review. Build its keys from one full ACR, then: {how}. \
-             `--uncalibrated` reviews it anyway."
+            "{name}'s review config was never accepted for it. {how}. `--uncalibrated` reviews \
+             it anyway."
         ),
         Standing::ConfigChanged => bail!(
-            "{name}'s review config has changed since it was calibrated. {how}. \
-             `--uncalibrated` reviews it anyway."
+            "{name}'s review config has changed since it was accepted. Read it, then accept it \
+             with `{APP_NAME} acr calibration --accept`. `--uncalibrated` reviews it anyway."
         ),
     }
 }
 
-/// A run's config, as it was when it started: resuming can't pick up a/// A run's config, as it was when it started: resuming can't pick up a
+/// A run's config, as it was when it started: resuming can't pick up a
 /// config that's changed since.
 fn stored_config(bytes: &[u8]) -> Result<Config> {
     serde_json::from_slice(bytes).map_err(|e| anyhow!("reading the run's config: {e}"))
