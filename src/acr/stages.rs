@@ -368,46 +368,191 @@ fn is_test_path(path: &str) -> bool {
     p.contains("test") || p.contains("spec")
 }
 
-/// Where a source file's own tests start, in a language that keeps them in
-/// the file they test: in Rust, the top-level `#[cfg(test)]` module, by
-/// convention the file's last item, so its tests run from there to the
-/// end. The line, from 1. None for a test file, or one with no tests in it.
-fn inline_tests_from(path: &str, text: &str) -> Option<u64> {
+/// A Rust file's own test modules: each top-level `#[cfg(test)]` module
+/// with a body, from its attribute's line to its closing brace's, from 1.
+/// None for a test file, or a file in another language: only Rust's in-file
+/// tests are known. A module declared without a body, `mod tests;`, keeps its
+/// tests in another file, and isn't one.
+fn test_modules(path: &str, text: &str) -> Vec<(u64, u64)> {
     if is_test_path(path) || !path.ends_with(".rs") {
-        return None;
+        return Vec::new();
     }
-    let lines: Vec<&str> = text.lines().collect();
-    lines.iter().enumerate().find_map(|(i, line)| {
-        let module = lines[i + 1..]
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut at = 0;
+    let mut starts = Vec::with_capacity(lines.len());
+    for line in &lines {
+        starts.push(at);
+        at += line.len();
+    }
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_end() != "#[cfg(test)]" {
+            continue;
+        }
+        // The item the attribute is on: past other attributes and comments.
+        let Some((j, item)) = lines
             .iter()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
-            .is_some_and(|l| l.split_whitespace().any(|w| w == "mod"));
-        (line.trim_end() == "#[cfg(test)]" && module).then_some(i as u64 + 1)
-    })
+            .enumerate()
+            .skip(i + 1)
+            .map(|(j, l)| (j, l.trim()))
+            .find(|(_, l)| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+        else {
+            continue;
+        };
+        let module = item.split_whitespace().find(|w| !w.starts_with("pub")) == Some("mod");
+        if !module || !item.trim_end().ends_with('{') {
+            continue;
+        }
+        if let Some(close) = closing_line(text, starts[j]) {
+            out.push((i as u64 + 1, close));
+        }
+    }
+    out
 }
 
-/// A file as it was before a fix, with the tests it has after: for a pin
-/// that sits in the file it tests, which copying whole would bring the fix
-/// with it. None where the file keeps no tests of its own.
+/// The line, from 1, where the block opened by the first `{` at or after
+/// byte `from` closes, reading past comments, strings, raw strings and
+/// character literals, whose braces don't count. None if it never closes.
+fn closing_line(text: &str, from: usize) -> Option<u64> {
+    let b = text.as_bytes();
+    let ident = |i: usize| i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+    let mut line = text[..from].matches('\n').count() as u64 + 1;
+    let mut depth = 0u32;
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => line += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i + 1 < b.len() && b[i + 1] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut nested = 1;
+                i += 2;
+                while i < b.len() && nested > 0 {
+                    match (b[i], b.get(i + 1)) {
+                        (b'/', Some(b'*')) => {
+                            nested += 1;
+                            i += 1;
+                        }
+                        (b'*', Some(b'/')) => {
+                            nested -= 1;
+                            i += 1;
+                        }
+                        (b'\n', _) => line += 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            // A raw string, r"…" or r#"…"#, byte ones too; not r#ident.
+            b'r' if !ident(i) || (b[i - 1] == b'b' && !ident(i - 1)) => {
+                let mut j = i + 1;
+                while b.get(j) == Some(&b'#') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    let hashes = j - i - 1;
+                    let mut k = j + 1;
+                    loop {
+                        match b.get(k) {
+                            None => return None,
+                            Some(b'\n') => line += 1,
+                            Some(b'"')
+                                if b[k + 1..]
+                                    .iter()
+                                    .take(hashes)
+                                    .filter(|c| **c == b'#')
+                                    .count()
+                                    == hashes =>
+                            {
+                                break;
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    i = k + hashes;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    match b[i] {
+                        // An escape, a line's end continued with `\` too.
+                        b'\\' => {
+                            i += 1;
+                            if b.get(i) == Some(&b'\n') {
+                                line += 1;
+                            }
+                        }
+                        b'\n' => line += 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // A character literal, not a lifetime: '{', '\'', 'é'.
+            b'\'' => {
+                let rest = &text[i + 1..];
+                match rest.chars().next() {
+                    // An escape, such as '\'' or '\u{7f}': the quote after it.
+                    Some('\\') => {
+                        if let Some(end) = rest.get(2..).and_then(|r| r.find('\'')) {
+                            i += 3 + end;
+                        }
+                    }
+                    Some(c) if rest[c.len_utf8()..].starts_with('\'') => i += c.len_utf8() + 1,
+                    _ => {}
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(line);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A file as it was before a fix, with the test module it has after: for a
+/// pin that sits in the file it tests, which copied whole would bring the
+/// fix with it. The old code stays as it was, around the old test module if
+/// it had one, or with the new one after it. None where the file keeps no
+/// tests of its own.
 pub fn with_tests_of(path: &str, before: &str, after: &str) -> Option<String> {
-    let at = |text: &str, line: u64| -> usize {
-        text.split_inclusive('\n')
-            .take(line as usize - 1)
-            .map(str::len)
-            .sum()
+    let span = |text: &str, (from, to): (u64, u64)| -> (usize, usize) {
+        let mut at = 0;
+        let mut out = (text.len(), text.len());
+        for (n, line) in text.split_inclusive('\n').enumerate() {
+            let n = n as u64 + 1;
+            if n == from {
+                out.0 = at;
+            }
+            at += line.len();
+            if n == to {
+                out.1 = at;
+            }
+        }
+        out
     };
-    let from = inline_tests_from(path, after)?;
-    let code = match inline_tests_from(path, before) {
-        Some(line) => &before[..at(before, line)],
-        None => before,
-    };
-    let code = if code.is_empty() || code.ends_with('\n') {
-        code.to_string()
-    } else {
-        format!("{code}\n")
-    };
-    Some(code + &after[at(after, from)..])
+    let (a, b) = span(after, *test_modules(path, after).last()?);
+    let tests = &after[a..b];
+    Some(match test_modules(path, before).last() {
+        Some(&old) => {
+            let (from, to) = span(before, old);
+            format!("{}{tests}{}", &before[..from], &before[to..])
+        }
+        None if before.is_empty() || before.ends_with('\n') => format!("{before}\n{tests}"),
+        None => format!("{before}\n\n{tests}"),
+    })
 }
 
 /// Text cut to `max` bytes, at a character's edge.
@@ -837,7 +982,7 @@ pub fn mutants_prompt(scope: &str, count: u32, guide: &str) -> String {
          lookup by the wrong id or key; a condition flipped or dropped; a call or a write left \
          out; a boundary moved by one; a value not cleared or not reset; an error swallowed; an \
          order swapped. Fewer only if the change has fewer places a break could go, and never \
-         pad the list with a break that changes nothing. Each must still compile. Name the test files that should catch each, or, for tests kept in the file they test, that file: the change's own tests, and the \
+         pad the list with a break that changes nothing. Each must still compile. Name the test files that should catch each, or, for a Rust file's own `#[cfg(test)]` module, that file: the change's own tests, and the \
          existing tests of the code it touches.\n\n\
          For each: the file; `find`, text copied exactly from that file, long enough to occur \
          only once in it; `replace`, what it becomes; and `why`, the behaviour a test should \
@@ -1016,6 +1161,10 @@ fn mutate(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<(usize, Raw)>, String)>
             r.limit.as_secs()
         ));
     }
+    // Mutants that all came to nothing measured nothing: that's no pass.
+    if !mutants.is_empty() && killed + survived == 0 {
+        bail!("none of its mutants could be run to a verdict: {summary}");
+    }
     Ok((found, summary))
 }
 
@@ -1031,6 +1180,17 @@ fn one_mutant(
     let copy = dir.join(name);
     let fate = (|| -> Result<Fate> {
         copy_of(base, &copy)?;
+        // A file named by a model's answer, so held inside the copy: a path
+        // that's absolute or climbs out would write somewhere else.
+        let inside = Path::new(&m.file).components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if !inside {
+            return Ok(Fate::Unusable);
+        }
         let path = copy.join(&m.file);
         let Ok(text) = fs::read_to_string(&path) else {
             return Ok(Fate::Unusable);
@@ -1200,18 +1360,21 @@ pub struct GateRuns<'a> {
 /// The test files a diff adds or changes.
 pub fn changed_tests(repo: &Path, diff: &str) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    // Where each file's own tests start, as the change leaves it.
-    let mut inline: std::collections::BTreeMap<String, Option<u64>> = Default::default();
+    // Each file's own test modules, as the change leaves it.
+    let mut inline: std::collections::BTreeMap<String, Vec<(u64, u64)>> = Default::default();
     for (f, n, _) in added_lines(diff) {
         if files.contains(&f) || is_doc(&f) {
             continue;
         }
-        let from = inline.entry(f.clone()).or_insert_with(|| {
-            fs::read_to_string(repo.join(&f))
-                .ok()
-                .and_then(|text| inline_tests_from(&f, &text))
-        });
-        if is_test_path(&f) || from.is_some_and(|from| n >= from) {
+        let test = is_test_path(&f) || {
+            let modules = inline.entry(f.clone()).or_insert_with(|| {
+                fs::read_to_string(repo.join(&f))
+                    .map(|text| test_modules(&f, &text))
+                    .unwrap_or_default()
+            });
+            modules.iter().any(|(from, to)| (*from..=*to).contains(&n))
+        };
+        if test {
             files.push(f);
         }
     }
@@ -1516,60 +1679,103 @@ mod tests {
     const INLINE: &str = "fn x() -> u32 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn one() {\n        assert_eq!(x(), 1);\n    }\n}\n";
 
     #[test]
-    fn a_rust_files_own_tests_count_as_the_changes_tests() {
-        assert_eq!(inline_tests_from("src/a.rs", INLINE), Some(5));
-        // Not a test module: a test-only import, an indented one, another
-        // language, or a file that's all tests anyway.
-        assert_eq!(
-            inline_tests_from("src/a.rs", "#[cfg(test)]\nuse std::fs;\n"),
-            None
+    fn a_rust_files_own_tests_are_its_test_module_brace_to_brace() {
+        assert_eq!(test_modules("src/a.rs", INLINE), [(5, 13)]);
+        // Not a test module: a test-only import, a module whose tests are in
+        // another file, an indented one, another language, or a test file.
+        assert!(test_modules("src/a.rs", "#[cfg(test)]\nuse std::fs;\n").is_empty());
+        let declared = "#[cfg(test)]\nmod tests;\n\nfn x() -> u32 {\n    1\n}\n";
+        assert!(test_modules("src/a.rs", declared).is_empty());
+        let nested = "mod m {\n    #[cfg(test)]\n    mod tests {}\n}\n";
+        assert!(test_modules("src/a.rs", nested).is_empty());
+        assert!(test_modules("src/a.go", INLINE).is_empty());
+        assert!(test_modules("tests/a.rs", INLINE).is_empty());
+        // Code after the module isn't its tests, and braces in comments,
+        // strings, raw strings and character literals don't count.
+        let tricky = concat!(
+            "fn a() {}\n",                                 // 1
+            "#[cfg(test)]\n",                              // 2
+            "pub(crate) mod tests {\n",                    // 3
+            "    // a } in a comment\n",                   // 4
+            "    /* and { here /* nested } */ */\n",       // 5
+            "    const S: &str = \"}\\\"}\";\n",           // 6
+            "    const R: &str = r#\"\n",                  // 7
+            "}\n",                                         // 8
+            "\"#;\n",                                      // 9
+            "    const C: char = '}';\n",                  // 10
+            "    const Q: char = '\\'';\n",                // 11
+            "    const L: &str = \"a \\\n",                // 12, continued
+            "}\";\n",                                      // 13
+            "    fn f<'a>(x: &'a str) -> &'a str { x }\n", // 14
+            "}\n",                                         // 15
+            "fn after() {}\n",                             // 16
         );
-        assert_eq!(
-            inline_tests_from(
-                "src/a.rs",
-                "mod m {\n    #[cfg(test)]\n    mod tests {}\n}\n"
-            ),
-            None
-        );
-        assert_eq!(inline_tests_from("src/a.go", INLINE), None);
-        assert_eq!(inline_tests_from("tests/a.rs", INLINE), None);
-        let repo = repo_with(&[("src/a.rs", INLINE), ("src/b.rs", "fn b() {}\n")]);
+        assert_eq!(test_modules("src/a.rs", tricky), [(2, 15)]);
+        // As the crate's own files have them: a module running to the end.
+        for (name, text) in [
+            ("src/acr/stages.rs", include_str!("stages.rs")),
+            ("src/acr/roles.rs", include_str!("roles.rs")),
+            ("src/bridge.rs", include_str!("../bridge.rs")),
+        ] {
+            let last = text.lines().count() as u64;
+            assert_eq!(
+                test_modules(name, text).last().map(|m| m.1),
+                Some(last),
+                "{name}"
+            );
+        }
+        let repo = repo_with(&[("src/a.rs", tricky), ("src/b.rs", "fn b() {}\n")]);
         let diff = |file: &str, line: u32| {
             format!(
                 "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -{line},0 +{line},1 @@\n+        let y = 2;\n"
             )
         };
         // A line in its tests makes it one of the change's tests; a line in
-        // its code doesn't.
-        assert_eq!(changed_tests(&repo, &diff("src/a.rs", 11)), ["src/a.rs"]);
-        assert!(changed_tests(&repo, &diff("src/a.rs", 2)).is_empty());
+        // its code, before the module or after it, doesn't.
+        assert_eq!(changed_tests(&repo, &diff("src/a.rs", 14)), ["src/a.rs"]);
+        assert!(changed_tests(&repo, &diff("src/a.rs", 1)).is_empty());
+        assert!(changed_tests(&repo, &diff("src/a.rs", 16)).is_empty());
         assert!(changed_tests(&repo, &diff("src/b.rs", 1)).is_empty());
+        let declared_repo = repo_with(&[("src/a.rs", declared)]);
+        assert!(changed_tests(&declared_repo, &diff("src/a.rs", 5)).is_empty());
         let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&declared_repo);
     }
 
     #[test]
-    fn an_inline_pin_goes_onto_the_old_code_without_the_fix() {
-        let before = INLINE;
-        let after = INLINE
+    fn an_inline_pin_is_the_old_code_with_only_the_new_test_module() {
+        let before = format!("{INLINE}fn later() -> u32 {{\n    3\n}}\n");
+        let after = before
             .replace("    1\n", "    2\n")
+            .replace("    3\n", "    4\n")
             .replace("assert_eq!(x(), 1)", "assert_eq!(x(), 2)");
-        let pinned = with_tests_of("src/a.rs", before, &after).unwrap();
-        assert!(pinned.contains("    1\n"), "the old code: {pinned}");
+        let pinned = with_tests_of("src/a.rs", &before, &after).unwrap();
+        // The old code, before the module and after it, and the new tests.
         assert!(
-            pinned.contains("assert_eq!(x(), 2)"),
-            "the new tests: {pinned}"
+            pinned.contains("    1\n") && pinned.contains("    3\n"),
+            "{pinned}"
         );
+        assert!(
+            !pinned.contains("    2\n") && !pinned.contains("    4\n"),
+            "{pinned}"
+        );
+        assert!(pinned.contains("assert_eq!(x(), 2)"), "{pinned}");
         assert!(!pinned.contains("assert_eq!(x(), 1)"));
+        assert_eq!(pinned.matches("#[cfg(test)]").count(), 1);
         // Old code with no tests yet gets them after it.
         let bare = "fn x() -> u32 {\n    1\n}";
         let pinned = with_tests_of("src/a.rs", bare, &after).unwrap();
         assert!(
-            pinned.starts_with("fn x() -> u32 {\n    1\n}\n#[cfg(test)]"),
+            pinned.starts_with("fn x() -> u32 {\n    1\n}\n\n#[cfg(test)]"),
             "{pinned}"
         );
+        assert!(
+            !pinned.contains("fn later"),
+            "only the test module comes over"
+        );
         // A file that keeps no tests of its own is copied whole, as before.
-        assert_eq!(with_tests_of("tests/a.rs", before, &after), None);
-        assert_eq!(with_tests_of("src/a.rs", before, "fn x() {}\n"), None);
+        assert_eq!(with_tests_of("tests/a.rs", &before, &after), None);
+        assert_eq!(with_tests_of("src/a.rs", &before, "fn x() {}\n"), None);
     }
 
     #[test]
@@ -1815,12 +2021,33 @@ mod tests {
             parallel: 1,
             limit: Duration::from_secs(3),
         };
-        let (found, summary) = run_mutants(&quick, &hangs).unwrap();
-        assert!(found.is_empty());
-        assert_eq!(
-            summary,
-            "1 mutants: 0 caught, 0 missed, 0 unusable, 1 timed out (past 3 s, so no verdict)"
+        // Mutants that all come to nothing measured nothing: no pass.
+        let err = format!("{:#}", run_mutants(&quick, &hangs).unwrap_err());
+        assert!(
+            err.contains(
+                "none of its mutants could be run to a verdict: 1 mutants: 0 caught, 0 \
+                          missed, 0 unusable, 1 timed out (past 3 s, so no verdict)"
+            ),
+            "{err}"
         );
+        // A mutant that names a file outside its copy is never applied.
+        let outside = dir.join("outside.sh");
+        fs::write(&outside, "add() { echo 1; }\n").unwrap();
+        let escapes: Vec<Mutant> = [outside.display().to_string(), "../outside.sh".into()]
+            .into_iter()
+            .map(|file| Mutant {
+                file,
+                find: "echo 1".into(),
+                replace: "echo 2".into(),
+                why: "it's elsewhere".into(),
+                tests: vec!["t.sh".into()],
+            })
+            .collect();
+        assert!(
+            run_mutants(&quick, &escapes).is_err(),
+            "neither could be used"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "add() { echo 1; }\n");
         // Tests that fail before any break judge nothing.
         let failing = Runner {
             command: "false",

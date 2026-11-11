@@ -904,7 +904,17 @@ fn attack(
             )
             .and_then(|text| briefs_of(run, s, caller, &text, &unbriefed))
             {
-                Ok(briefs) => briefs,
+                // A lens the briefs leave out, whatever form they came in,
+                // is no brief, and says so.
+                Ok(briefs) => {
+                    for id in unbriefed.iter().filter(|id| !briefs.contains_key(*id)) {
+                        notes
+                            .entry(id.clone())
+                            .or_default()
+                            .push("no brief: the briefer's answer has none for it".into());
+                    }
+                    briefs
+                }
                 Err(e) => {
                     for id in &unbriefed {
                         notes
@@ -1293,18 +1303,7 @@ fn gate_round(
                         .and_then(|c| c[1].parse::<usize>().ok())
                         .and_then(|i| gaps.get(i))
                         .is_some_and(|g| g.blocks);
-                    // What the gate measured blocks by rule, unless the
-                    // Judge found it no defect at all.
-                    if measured && f.state != FindingState::Dropped && !f.blocks() {
-                        f.severity = Severity::High;
-                        f.action = cfg.action(lens, Severity::High);
-                        f.state = FindingState::Open;
-                        f.reason = format!(
-                            "{} (Blocks by rule: the gate measured it in the change's own \
-                             code and tests.)",
-                            f.reason
-                        );
-                    }
+                    gate_ruling(cfg, lens, f, measured);
                 }
                 round.findings = findings;
             }
@@ -1469,10 +1468,6 @@ fn prune_copies(root: &Path) {
     }
 }
 
-/// A reviewer's findings. One that reported in prose, not the JSON asked
-/// for, has its report put in that form by a quick call with the Sizer's
-/// binding, adding and dropping nothing: a review isn't thrown away over its
-/// format. A report that still can't be read is a failure, as before.
 /// The briefs in a briefer's answer. One written in prose is put in form
 /// by one more call; only an answer that's still unreadable is no brief.
 fn briefs_of(
@@ -1494,6 +1489,10 @@ fn briefs_of(
         })
 }
 
+/// A reviewer's findings. One that reported in prose, not the JSON asked
+/// for, has its report put in that form by a quick call with the Sizer's
+/// binding, adding and dropping nothing: a review isn't thrown away over its
+/// format. A report that still can't be read is a failure, as before.
 fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> Result<Vec<Raw>> {
     let unread = match roles::read_findings(text) {
         Ok(found) => return Ok(found),
@@ -1556,12 +1555,30 @@ pub(super) fn ruling(cfg: &Config, lens: &Lens, r: &roles::Rating) -> Ruled {
     Ruled::plain(r.severity, cfg.action(lens, r.severity))
 }
 
+/// What the gate measured in the change's own code and tests blocks by
+/// rule, unless the Judge found it no defect at all.
+pub(super) fn gate_ruling(cfg: &Config, lens: &Lens, f: &mut Finding, measured: bool) {
+    if measured && f.state != FindingState::Dropped && !f.blocks() {
+        f.severity = Severity::High;
+        f.action = cfg.action(lens, Severity::High);
+        f.state = FindingState::Open;
+        f.reason = format!(
+            "{} (Blocks by rule: the gate measured it in the change's own code and tests.)",
+            f.reason
+        );
+    }
+}
+
 /// The text of the rules that decide what blocks: a calibration made before
 /// they changed is stale.
 pub(super) fn rules_source() -> String {
     let flow = super::calibration::source_of(
         include_str!("flow.rs"),
-        &["pub(super) fn ruling(", "pub(super) fn grounded("],
+        &[
+            "pub(super) fn ruling(",
+            "pub(super) fn grounded(",
+            "pub(super) fn gate_ruling(",
+        ],
     );
     let stages = super::calibration::source_of(
         include_str!("stages.rs"),
@@ -1574,8 +1591,13 @@ pub(super) fn rules_source() -> String {
             // line the change adds, against one of the change's own tests.
             "fn in_the_change(",
             "pub fn changed_tests(",
+            "fn added_lines(",
+            "fn is_doc(",
             "fn is_test_path(",
-            "fn inline_tests_from(",
+            "fn test_modules(",
+            "fn closing_line(",
+            // Which of the gate's gaps block: by rule, and as the Judge rates.
+            "pub fn run_gate(",
         ],
     );
     format!("{flow}\n{stages}")
@@ -3346,11 +3368,41 @@ lenses:
     }
 
     #[test]
+    fn a_lens_the_briefs_leave_out_is_no_brief_and_says_so() {
+        // Put in form with a lens missing, or nothing at all: those lenses
+        // were never briefed, which is a failure, not a pass.
+        for form in [
+            r#"{"briefs": {"alpha": "Break the lookup."}}"#,
+            r#"{"briefs": {}}"#,
+        ] {
+            let cfg = config("exception", 1, 1, "", "stages: [brief]");
+            let fake = Fake::new(|role, prompt: &str| {
+                Ok(match role {
+                    Role::Orchestrator if prompt.contains("You brief the reviewers") => {
+                        "In prose, as briefers sometimes answer.".to_string()
+                    }
+                    Role::Sizer if prompt.contains("A briefer wrote briefs") => form.to_string(),
+                    Role::Reviewer => CLEAN.to_string(),
+                    _ => NOTHING.to_string(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            let failed = failures(&run);
+            assert!(
+                failed
+                    .iter()
+                    .any(|f| f.starts_with("beta") && f.contains("has none for it")),
+                "{form}: {failed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn briefs_written_in_prose_are_put_in_form_not_lost() {
         let top = "stages: [brief]";
         for (form, briefed) in [
             (
-                r#"{"briefs": {"alpha": "Break the lookup in a.src."}}"#,
+                r#"{"briefs": {"alpha": "Break the lookup in a.src.", "beta": "Try none."}}"#,
                 true,
             ),
             ("unreadable", false),
@@ -3380,10 +3432,10 @@ lenses:
             assert_eq!(alpha.3.contains("Break the lookup in a.src."), briefed);
             // Only a briefer still unreadable after that is a failure.
             assert_eq!(failed.is_empty(), briefed, "{failed:?}");
+            drop(calls);
             if !briefed {
                 assert!(failed[0].contains("didn't work either"), "{failed:?}");
             }
-            drop(calls);
             // The extra call is counted with the rest.
             let counted = run.usage.iter().filter(|u| u.role == Role::Sizer).count();
             assert_eq!(counted, fake.count(Role::Sizer));
@@ -4081,8 +4133,13 @@ lenses:
             "fn quote_parts(",
             "fn in_the_change(",
             "fn changed_tests(",
+            "fn added_lines(",
+            "fn is_doc(",
             "fn is_test_path(",
-            "fn inline_tests_from(",
+            "fn test_modules(",
+            "fn closing_line(",
+            "fn run_gate(",
+            "fn gate_ruling(",
         ] {
             assert!(
                 rules.contains(f),

@@ -400,15 +400,22 @@ fn repo_layer(
         Some(text) => Ok((text, Source::Base)),
         // Neither place has one: the repository hasn't been configured,
         // which is what to say, not that a change can't bring its own.
-        None => bail!(
-            "{} has no review config yet: there's none at {}, and no {REPO_CONFIG} on {base}. \
-             Have the configurer propose one with `{APP_NAME} acr configure --repo {}`, then \
-             read it and accept it with `{APP_NAME} acr calibration --repo {} --accept`",
-            change::name(repo)?,
-            outside_config(paths, repo)?.display(),
-            repo.display(),
-            repo.display(),
-        ),
+        None => {
+            // Said even if naming where it would be fails: that's not the news.
+            let kept = outside_config(paths, repo).map_or_else(
+                |_| "where it's kept outside the repository".into(),
+                |p| p.display().to_string(),
+            );
+            let name = change::name(repo).unwrap_or_else(|_| repo.display().to_string());
+            bail!(
+                "{name} has no review config yet: there's none at {kept}, and no {REPO_CONFIG} \
+                 on {base}. Have the configurer propose one with `{APP_NAME} acr configure \
+                 --repo {}`, then read it and accept it with `{APP_NAME} acr calibration --repo \
+                 {} --accept`",
+                repo.display(),
+                repo.display(),
+            )
+        }
     }
 }
 
@@ -442,7 +449,6 @@ fn not_findings(cfg: &Config, source: &Source, repo: &Path, base: &str) -> Resul
     }
 }
 
-/// This machine's name on the tailnet, as the bus knows it.
 /// What a call on a binding asks its bridge for, wherever it works.
 pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
     RunOptions {
@@ -474,33 +480,76 @@ pub(crate) fn bindings_options(text: &str) -> Result<Vec<(String, RunOptions)>> 
 }
 
 /// Every agent a review calls is on this machine, and its bridge takes what
-/// each binding asks for. A binding its bridge refuses would fail every
-/// call it made, found only once a review was under way.
-fn check_machine(paths: &Paths, cfg: &Config) -> Result<()> {
-    let machine = this_machine(paths)?;
-    cfg.check_local(&machine)?;
-    check_bridges(paths, &cfg.chosen_bindings())
+/// each binding asks for, working in `repo`. A binding its bridge refuses
+/// would fail every call it made, found only once a review was under way.
+/// `saved`: the review's bindings are the ones it was saved with.
+fn check_machine(paths: &Paths, cfg: &Config, repo: &Path, saved: bool) -> Result<()> {
+    check_on(paths, cfg, &this_machine(paths)?, repo, saved)
 }
 
-/// Each binding against its bridge, if its bridge is one of this machine's.
-fn check_bridges(paths: &Paths, bindings: &[(&str, &config::Binding)]) -> Result<()> {
+/// [`check_machine`], on a machine already named.
+fn check_on(paths: &Paths, cfg: &Config, machine: &str, repo: &Path, saved: bool) -> Result<()> {
+    cfg.check_local(machine)?;
+    check_bridges(paths, &cfg.chosen_bindings(), machine, repo, saved)
+}
+
+/// Each binding on `machine` against its bridge there, by the check a
+/// request meets, with its working directory: `workdir`, where the roles
+/// work. The copies reviewers work in are allowed when a review starts.
+fn check_bridges(
+    paths: &Paths,
+    bindings: &[(&str, &config::Binding)],
+    machine: &str,
+    workdir: &Path,
+    saved: bool,
+) -> Result<()> {
+    let workdir = workdir
+        .canonicalize()
+        .with_context(|| format!("finding {}", workdir.display()))?;
     for (name, b) in bindings {
-        let Some((agent, _)) = b.agent.split_once('@') else {
+        let Some((agent, on)) = b.agent.split_once('@') else {
             continue;
         };
-        if let Some(why) = crate::bridge::would_refuse(paths, agent, &options_for(b))? {
-            bail!(
-                "the {agent} bridge would refuse every call on binding {name}: {why}. Allow it \
-                 in [bridges.{agent}.options] in {}, then restart the bridge, or change the \
-                 binding in {}",
+        // Another machine's binding is `check_local`'s to refuse.
+        if !on
+            .split('.')
+            .next()
+            .unwrap_or(on)
+            .eq_ignore_ascii_case(machine)
+        {
+            continue;
+        }
+        let options = RunOptions {
+            workdir: Some(workdir.display().to_string()),
+            ..options_for(b)
+        };
+        let refused = crate::bridge::would_refuse(paths, agent, &options)
+            .with_context(|| format!("checking binding {name} against the {agent} bridge"))?;
+        let Some(why) = refused else {
+            continue;
+        };
+        let fix = if saved {
+            format!(
+                "This review was saved with that binding, so changing it in {} can't help: \
+                 allow it in [bridges.{agent}.options] in {} and restart the bridge, or end \
+                 the review with --stop",
+                user_config_path(paths).display(),
+                paths.config.display()
+            )
+        } else {
+            format!(
+                "Allow it in [bridges.{agent}.options] in {}, then restart the bridge, or \
+                 change the binding in {}",
                 paths.config.display(),
                 user_config_path(paths).display()
-            );
-        }
+            )
+        };
+        bail!("the {agent} bridge would refuse every call on binding {name}: {why}. {fix}");
     }
     Ok(())
 }
 
+/// This machine's name on the tailnet, as the bus knows it.
 fn this_machine(paths: &Paths) -> Result<String> {
     let status: crate::local::Status = crate::local::call(&paths.socket(), &Request::Status)
         .context("asking the bus which machine this is")?;
@@ -1029,16 +1078,13 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 );
             }
             match this_machine(paths) {
-                Ok(machine) => {
-                    cfg.check_local(&machine)?;
-                    check_bridges(paths, &cfg.chosen_bindings())?;
-                }
+                Ok(machine) => check_on(paths, &cfg, &machine, &repo, false)?,
                 Err(e) => println!("Not checked that every agent is on this machine: {e:#}."),
             }
         }
         AcrCmd::Plan { target, json } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
-            check_machine(paths, &cfg)?;
+            check_machine(paths, &cfg, &target.repo, false)?;
             let change = reload(&cfg, &target.repo, &target.base, target.head.as_deref())?;
             let plan = plan::dry_run(&cfg, &change, &history(paths, &target.repo))?;
             if !json && let Source::File(file) = &source {
@@ -1072,7 +1118,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             if let Some(note) = calibrated(paths, &name, &now, uncalibrated)? {
                 eprintln!("{note}");
             }
-            check_machine(paths, &cfg)?;
+            check_machine(paths, &cfg, &target.repo, false)?;
             change::checked_out(&target.repo, target.head.as_deref())?;
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
@@ -1112,13 +1158,18 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let cfg: Config = stored_config(&read("config.json")?)?;
             // Ending a review calls nothing and reads no code, so neither its
             // agents nor its checkout has to be as it was.
-            if !stop {
-                check_machine(paths, &cfg)?;
+            if stop {
+                eprintln!(
+                    "{APP_NAME}: ending review {run_id}, as asked. `{APP_NAME} acr feedback \
+                     {run_id}` lists its findings."
+                );
+            } else {
                 // Until a fix, the review is of its head, which must be
                 // checked out.
                 if run.lenses.values().all(|l| l.done.is_empty()) {
                     change::checked_out(&run.repo, run.head.as_deref())?;
                 }
+                check_machine(paths, &cfg, &run.repo, true)?;
             }
             let decision = Decision {
                 fold,
@@ -1563,7 +1614,7 @@ fn pipeline_run(
     flags.human_gate = Some(HumanGate::Exception);
     let (cfg, source) = load_config(paths, target, &flags)?;
     cfg.check_bindings()?;
-    check_machine(paths, &cfg)?;
+    check_machine(paths, &cfg, &target.repo, false)?;
     if converge {
         let name = cfg.binding_name(Role::Orchestrator, None)?;
         if !cfg.binding(Role::Orchestrator, None)?.writes {
@@ -1848,8 +1899,6 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
         })
         .unwrap_or_default();
     config::check_models(&allowed, &configuring)?;
-    // An hour of the configurer's work is no time to find its bridge says no.
-    check_bridges(paths, &configuring)?;
     let record = calibration::load(&paths.state, &name)?;
     let feedback = if recalibrate {
         if current.is_none() {
@@ -1896,6 +1945,23 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
         .unwrap_or(&binding.agent)
         .to_string();
     crate::setup::acr_dir(paths, &copies_root(paths), &bridge)?;
+    // An hour of the configurer's work is no time to find its bridge says
+    // no. It runs here, as every role does, and works in its clone.
+    let machine = this_machine(paths)?;
+    for (name, b) in &configuring {
+        let on = b
+            .agent
+            .split_once('@')
+            .map(|(_, m)| m.split('.').next().unwrap_or(m));
+        if on.is_some_and(|m| !m.eq_ignore_ascii_case(&machine)) {
+            bail!(
+                "ACR runs on one machine: binding {name} reaches {}, but the code is on \
+                 {machine}. Bind the configurer to an agent on {machine}.",
+                b.agent
+            );
+        }
+    }
+    check_bridges(paths, &configuring, &machine, &copies_root(paths), false)?;
     let bridged = BridgeCaller::new(paths)?;
     let caller = flow::WithFallbacks {
         inner: &bridged,
@@ -2191,9 +2257,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_binding_its_bridge_would_refuse_stops_a_review_before_it_starts() {
-        let paths = paths();
+    /// A bridge here, `agent-x`, that may work only in `workdir`, and a
+    /// user's bindings: `fits`, which it takes, `edits`, which asks for a
+    /// tool it doesn't allow, and `away`, on another machine.
+    fn bridge_and_bindings(paths: &Paths, workdir: &Path) -> config::UserConfig {
         let dir = paths.config.parent().unwrap().to_path_buf();
         let home = dir.join("home");
         fs::create_dir_all(&home).unwrap();
@@ -2207,24 +2274,54 @@ mod tests {
                  [bridges.agent-x.options]\ntools = [\"Read\", \"Bash\"]\n\
                  tools_args = [\"--tools\", \"{{TOOLS}}\"]\n\
                  effort_args = [\"--effort\", \"{{EFFORT}}\"]\n\
-                 models = [\"m\"]\nefforts = [\"high\"]\nmax_timeout_secs = 600\n",
+                 models = [\"m\"]\nefforts = [\"high\"]\nmax_timeout_secs = 600\n\
+                 workdirs = [\"{w}\"]\n",
                 bin.display(),
-                h = home.display()
+                h = home.display(),
+                w = workdir.canonicalize().unwrap().display()
             ),
         )
         .unwrap();
-        let user = config::parse_user(
+        config::parse_user(
             "version: 1\nallowed_bindings:\n\
              \x20 fits: {agent: agent-x@here, model: m, effort: high, tools: [Read, Bash], timeout: 600}\n\
              \x20 edits: {agent: agent-x@here, model: m, effort: high, tools: [Read, Edit]}\n\
-             \x20 elsewhere: {agent: someone@here, model: m, tools: [Edit]}\n",
+             \x20 away: {agent: agent-x@there, model: m, tools: [Edit]}\n\
+             defaults:\n  bindings: {sizer: fits, reviewer: fits, orchestrator: fits, judge: fits}\n",
         )
-        .unwrap();
-        let fits = ("fits", &user.allowed_bindings["fits"]);
-        let edits = ("edits", &user.allowed_bindings["edits"]);
-        let elsewhere = ("elsewhere", &user.allowed_bindings["elsewhere"]);
-        check_bridges(&paths, &[fits, elsewhere]).unwrap();
-        let err = format!("{:#}", check_bridges(&paths, &[fits, edits]).unwrap_err());
+        .unwrap()
+    }
+
+    #[test]
+    fn a_binding_its_bridge_would_refuse_stops_a_review_before_it_starts() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let user = bridge_and_bindings(&paths, &repo);
+        let small = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                     lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let cfg = |extra: &str| {
+            config::resolve(
+                &user,
+                config::parse_repo(&format!("{small}{extra}")).unwrap(),
+                &Flags::default(),
+            )
+            .unwrap()
+        };
+        // What a review is checked by before it starts: this machine, and
+        // what each binding asks its bridge for, where it will work.
+        check_on(&paths, &cfg(""), "here", &repo, false).unwrap();
+        let err = format!(
+            "{:#}",
+            check_on(
+                &paths,
+                &cfg("bindings: {judge: edits}\n"),
+                "here",
+                &repo,
+                false
+            )
+            .unwrap_err()
+        );
         assert!(
             err.contains("would refuse every call on binding edits"),
             "{err}"
@@ -2233,15 +2330,74 @@ mod tests {
             err.contains("tool \"Edit\" isn't one this agent's config allows"),
             "{err}"
         );
-        assert!(err.contains("[bridges.agent-x.options]"), "{err}");
-        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("change the binding in"), "{err}");
+        // A review saved with it is told what can help.
+        let err = format!(
+            "{:#}",
+            check_on(
+                &paths,
+                &cfg("bindings: {judge: edits}\n"),
+                "here",
+                &repo,
+                true
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("saved with that binding") && err.contains("--stop"),
+            "{err}"
+        );
+        // Where it works is checked too: a repository the bridge doesn't allow.
+        let other = repo_with(&[("b.txt", "two\n")]);
+        let err = format!(
+            "{:#}",
+            check_on(&paths, &cfg(""), "here", &other, false).unwrap_err()
+        );
+        assert!(err.contains("working directory"), "{err}");
+        // A binding on another machine is refused for that, not checked
+        // against this machine's bridge of the same name.
+        let err = format!(
+            "{:#}",
+            check_on(
+                &paths,
+                &cfg("bindings: {judge: away}\n"),
+                "here",
+                &repo,
+                false
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("ACR runs on one machine"), "{err}");
+        check_bridges(
+            &paths,
+            &[("away", &user.allowed_bindings["away"])],
+            "here",
+            &repo,
+            false,
+        )
+        .unwrap();
+        // And every call says it's a review, which a bridge takes only from
+        // its own machine.
+        assert_eq!(
+            options_for(&user.allowed_bindings["fits"]).review,
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&other);
     }
 
     #[test]
     fn a_waiting_review_can_be_stopped_whatever_its_agents_and_checkout_are() {
-        use super::change::tests::repo_with;
+        use super::change::tests::{commit, repo_with};
         let paths = paths();
         let repo = repo_with(&[("a.txt", "one\n")]);
+        // The head the review was of, and a commit after it, checked out.
+        let head = change::git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        commit(&repo, &[("a.txt", "two\n")], "moved on");
         let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
         let cfg = config::resolve(
             &user,
@@ -2256,7 +2412,7 @@ mod tests {
         // Waiting on a head that's no longer checked out, on a machine with
         // no bus to say which machine it is.
         let run: Run = serde_json::from_value(serde_json::json!({
-            "id": "r-stop", "repo": repo, "base": "main", "head": "0000000",
+            "id": "r-stop", "repo": repo, "base": "main", "head": head,
             "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "review",
             "status": "waiting", "waiting": "escalation", "lenses": {},
             "escalations": [{"reason": "a person should see this", "seen": false}],
@@ -2272,13 +2428,13 @@ mod tests {
             stop,
             post_pr: None,
         };
-        assert!(
-            super::run(&paths, resume(false)).is_err(),
-            "going on needs both"
-        );
+        // Going on needs the head checked out, before anything else.
+        let err = format!("{:#}", super::run(&paths, resume(false)).unwrap_err());
+        assert!(err.contains("has to be what's checked out"), "{err}");
         super::run(&paths, resume(true)).unwrap();
         // Ended, and tidied away as a finished review is.
         assert!(!run_dir(&paths, "r-stop").join("run.json").exists());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -2293,6 +2449,14 @@ mod tests {
         );
         assert!(err.contains("has no review config yet"), "{err}");
         assert!(err.contains("acr configure --repo"), "{err}");
+        // One that only a change brings along doesn't count.
+        super::change::tests::branch(&repo, "work");
+        super::change::tests::commit(&repo, &[(REPO_CONFIG, "version: 1\n")], "bring my own");
+        let err = format!(
+            "{:#}",
+            repo_layer(&paths, &repo, Some("main"), None).unwrap_err()
+        );
+        assert!(err.contains("has no review config yet"), "{err}");
         assert!(err.contains(&outside_config(&paths, &repo).unwrap().display().to_string()));
         let _ = fs::remove_dir_all(&repo);
     }
