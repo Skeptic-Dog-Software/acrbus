@@ -7,7 +7,7 @@
   "required": ["version"],
   "properties": {
     "version": {"const": 1},
-    "human_gate": {"enum": ["per-round", "ends", "exception"]},
+    "human_gate": {"enum": ["in-the-loop", "per-round", "ends", "exception"], "description": "When a person is asked. in-the-loop, the default: at scope, every fold and the result. ends: at scope and the result. per-round: at every fold. exception: only for escalations."},
     "max_rounds": {"type": "integer", "minimum": 1},
     "review_scope": {"enum": ["whole-pr", "bottom-of-stack"]},
     "not_findings": {"type": "string", "description": "Path to the decided non-issues list"},

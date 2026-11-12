@@ -1,7 +1,7 @@
 # A second repository, in another language, to show the framework needs no
 # change for one: this is acrbus's own review, in Rust.
 version: 1
-human_gate: ends
+human_gate: in-the-loop
 max_rounds: 3
 review_scope: whole-pr
 not_findings: .acr/not-findings.md

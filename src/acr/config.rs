@@ -63,12 +63,32 @@ impl Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HumanGate {
+    /// At every step: they approve the scope, decide what's folded in each
+    /// round, and approve the result. The default for a review.
+    InTheLoop,
     /// They decide what's folded in, each round.
     PerRound,
     /// They approve the scope and the final result.
     Ends,
     /// Only escalations.
     Exception,
+}
+
+impl HumanGate {
+    /// They approve the scope before any reviewer runs.
+    pub fn asks_scope(self) -> bool {
+        matches!(self, HumanGate::InTheLoop | HumanGate::Ends)
+    }
+
+    /// They decide which blockers are fixed, each round.
+    pub fn asks_fold(self) -> bool {
+        matches!(self, HumanGate::InTheLoop | HumanGate::PerRound)
+    }
+
+    /// They approve the result once every lens agrees.
+    pub fn asks_final(self) -> bool {
+        matches!(self, HumanGate::InTheLoop | HumanGate::Ends)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,10 +636,12 @@ pub struct Config {
 /// what reading it misses.
 fn framework_defaults() -> Policy {
     Policy {
-        human_gate: Some(HumanGate::Exception),
+        human_gate: Some(HumanGate::InTheLoop),
         max_rounds: Some(3),
         review_scope: Some(ReviewScope::WholePr),
-        stages: Some(vec![Stage::Probes]),
+        // Git's word on the changed files costs no call, and saves every
+        // reviewer looking it up; probes, where reviewers can run things.
+        stages: Some(vec![Stage::Context, Stage::Probes]),
         ..Policy::default()
     }
 }
@@ -1130,7 +1152,7 @@ mod tests {
     #[test]
     fn the_go_example_is_valid() {
         let cfg = resolved(GO).unwrap();
-        assert_eq!(cfg.human_gate, HumanGate::PerRound);
+        assert_eq!(cfg.human_gate, HumanGate::InTheLoop);
         // A pull request merges whole, so it's reviewed whole.
         assert_eq!(cfg.review_scope, ReviewScope::WholePr);
         // Its five, and elegance, which every repository gets.
@@ -1371,6 +1393,8 @@ mod tests {
         // Read-only reviewers: off, and saying so, not failing every round.
         let cfg = resolve(&read_only, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap();
         assert!(!probes(&cfg) && cfg.probes_off);
+        // Git's context costs no call, so it's on for both.
+        assert!(cfg.stages.contains(&Stage::Context));
         // A repository that chose stages gets what it chose.
         let cfg = resolve(
             &runs,

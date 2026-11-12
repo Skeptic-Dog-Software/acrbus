@@ -218,7 +218,7 @@ fn show(item: &Item, args: &Args) -> Result<u8> {
     Ok(code)
 }
 
-fn cancel_run(socket: &Path, agent: &str, run: &str) -> Result<Sent> {
+pub(crate) fn cancel_run(socket: &Path, agent: &str, run: &str) -> Result<Sent> {
     local::call(
         socket,
         &Request::Cancel {

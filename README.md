@@ -53,23 +53,34 @@ Reviewers that run things get a copy of the repository of their own, and
 probes write and run scenarios of what the change says it does. Nobody has
 to take a model's word that it ran the tests.
 
-**It converges.** After a round with blockers, the Orchestrator fixes them,
-if its binding may write, or hands them to you, and new reviewers attack
+**It converges.** After a round with blockers, whoever you choose folds
+them in: the session that ran the review, which holds the change's context,
+or the Orchestrator, if its binding may write. Then new reviewers attack
 again, until every lens's latest round has no blocker. A review to
 convergence goes further: after each fix every lens attacks again, since a
 fix for one can break another, and it ends only when every lens agrees on
-the same version. Gates hand a person the calls that are theirs.
+the same version.
+
+**You're in the loop.** A review asks you at the scope, at every round's
+blockers and at the result, and whenever something is your call: a values
+call, a split, a lens that didn't finish. Each ask is a question carousel,
+in the shape Claude Code's AskUserQuestion takes, or a numbered prompt in a
+terminal. A defect found by several lenses is asked about once. Your
+verdicts, and the defects you say were missed, become feedback for the
+calibration. The rules guide; you decide.
 
 **It's sized to the change.** A tier, chosen from what the change touches,
 decides which lenses run and how many reviewers each gets, so a docs fix
 doesn't pay for a security review. `acrbus acr plan` shows the lenses and an
 estimate before anything runs, and every model call is counted.
 
-**It survives its agents.** Each headless run gets an environment of its
-own, a time limit, and a watch for going quiet: a run whose process tree
-stops using CPU and writing is woken, and if it can't be, ended and tried
-again in a fresh session. A failed reviewer or Judge is never taken for a
-clean pass.
+**It survives its agents, and says what they're doing.** Each headless run
+gets an environment of its own, and a watch for going quiet: a run whose
+process tree stops using CPU and writing is woken, and if it can't be,
+ended and tried again in a fresh session. Nothing cuts off a call that's
+working. A review says what each call is doing at least once a minute, and
+stopping a review stops its calls. A failed reviewer or Judge is never
+taken for a clean pass.
 
 **It keeps reviewers in their lane.** Reviewers read the code under review,
 not your other files, and nothing they do is written back to the
@@ -137,7 +148,8 @@ the config, for reading a proposal or writing one yourself, and
 | `acrbus acr feedback <review id>` | List a finished review's findings, and say how each did and what it missed. |
 | `acrbus acr calibrate` | Fold your feedback into the config: the configurer proposes a revised one. |
 | `acrbus acr run` | Review a change. |
-| `acrbus acr resume <run id>` | Go on past a gate that's waiting for a person. |
+| `acrbus acr ask <run id>` | What a review waiting for you asks: question carousels, or `--text`. |
+| `acrbus acr resume <run id>` | Answer it, `--answers <json>`, or say your fixes are in, `--fixed`. |
 | `acrbus acr carry` | Carry work that isn't code, such as a document, into git so it can be reviewed. |
 | `acrbus acr check`, `acrbus acr trial` | Check that a trial can run, then measure a review design on a change whose defects are known. |
 | `acrbus acr judge-check <key>...` | Compare the Judge's rulings with a past review's, as a benchmark. |

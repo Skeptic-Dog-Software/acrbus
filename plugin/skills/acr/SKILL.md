@@ -49,3 +49,13 @@ For `pipe_result`, or for your user:
 ## Cost
 
 This costs two to three times the tokens of working alone, and takes longer. It's spent on purpose where being wrong is expensive. Your user may waive it for something trivial, but it's never yours to skip.
+
+## When acrbus runs it
+
+When your user has acrbus set up for the repository (`acrbus acr doctor --repo .` says it's ready) and wants the review run by it, acrbus starts the reviewers and the Judge. You do what the builder does in the method above: brief them, bring every question to your user, and fold in what they choose.
+
+1. **Brief the reviewers.** Write the builder's brief to a file, in YAML: `scope:`, what the change does, mechanism by mechanism, and what it doesn't touch; and `lenses:`, a map from each lens to what to attack in this change, and how: what to run, what to break, which edges and callers to check. Every role reads your scope as claims to check, not to trust.
+2. **Start it in the background.** Run `acrbus acr run --repo . --base <base> --head <head> --brief <file>`. It says what it's doing on stderr, and in `progress.log` in its folder, at least once a minute: every call at work, how long it has run, and when it last did anything. A quiet stretch isn't a hang. A call that stalls is ended by its bridge, and the progress says when.
+3. **Every question goes to your user.** When it exits 3 or 4, run `acrbus acr ask <id>`. Show each carousel to your user with AskUserQuestion, exactly as given and in order. Then pass all their answers, keyed by each question's text, with `acrbus acr resume <id> --answers '<json>'`, in the background. Never answer for your user, and don't drop or reword a question.
+4. **Fold in what they choose.** When it waits for fixes, `acrbus acr ask <id>` lists them, with your user's notes. Fix each one in the working tree, with your context. Write tests that pin the fixes. Brief the next round on what changed, in the same format, then run `acrbus acr resume <id> --fixed --brief <file>`.
+5. **At the end,** exit 0 means confirmed. Report as below, from what it printed and `acrbus acr feedback <id>`.

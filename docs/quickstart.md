@@ -178,30 +178,50 @@ code says how it ended:
 | --- | --- | --- |
 | 0 | Every lens is confirmed. | Nothing. |
 | 1 | It ended with lenses open. | Its last line says why. Fix the blockers and review again. |
-| 3 | It's waiting for a person at a scope, fold or final gate. | Answer the gate, below. |
+| 3 | It's waiting for you at a scope, fold, fix or final gate. | `acrbus acr ask <id>`, then answer: below. |
 | 4 | It's waiting for a person on an escalation. | Read it, then go on or stop. |
 
-The gates, and how to answer each with `acrbus acr resume <id>`:
+**Answering a review.** A review that waits for you asks questions.
+`acrbus acr ask <id>` prints them as question carousels, in the JSON shape
+Claude Code's AskUserQuestion takes, and `--text` prints them as a numbered
+list. Answer them all at once, as a JSON object keyed by each question's
+text:
 
-| Waits for | When | Answer |
+```sh
+acrbus acr ask <id>                                  # or --text
+acrbus acr resume <id> --answers '{"<question>": "<answer>", ...}'   # or @file, or -
+```
+
+Run from a terminal, the review asks you there instead, and carries on.
+In Claude Code, the ACR skill shows each carousel to you as given. Your
+verdicts on findings, and the defects you say were missed, are kept as
+feedback for `acr calibrate`.
+
+The gates:
+
+| Waits for | When | It asks |
 | --- | --- | --- |
-| scope | before any reviewer runs, with `human_gate: ends` | `--approve` to go on, `--stop` to end it |
-| fold | after a round with blockers, with `human_gate: per-round` | `--fold <ids>` to have them fixed, `--waive <ids>` to waive them, `--stop` |
-| final | at the end, with `human_gate: ends` | `--approve` or `--stop` |
-| escalation | whenever something must go to a person, whatever `human_gate` says | `--approve` to go on, `--stop` |
+| scope | before any reviewer runs | approve the tier and lenses, one tier higher, or stop; and who fixes, this session or the Orchestrator |
+| fold | after a round with blockers | for each blocker: fix it (with your note to the fixer, in your own words), waive it, not a blocker, or not a defect; which logged findings should block; and what the reviewers missed |
+| fix | when this session fixes | nothing: fold in what `acr ask` lists, write tests that pin it, then `acr resume <id> --fixed`, with `--brief <file>` for the next round |
+| final | when every lens agrees | approve, or another round; and the same logged and missed questions |
+| escalation | whenever something must go to a person | a values call or split: as ruled, or the other way; a lens that didn't finish: try again or go on without it; otherwise go on or stop |
 
 `human_gate` in the review config chooses the gates:
-- **`exception`**, the default, stops only for escalations.
-- **`ends`** also asks you to approve the scope before it starts and the
-  result at the end.
-- **`per-round`** also asks, after each round with blockers, which ones get
-  fixed.
+- **`in-the-loop`**, the default, asks at scope, every fold and the result.
+- **`ends`** asks at scope and the result only.
+- **`per-round`** asks at every fold only.
+- **`exception`** asks only for escalations, as for a review nobody
+  watches. Trials always run this way.
 
-**Fixes.** Except with `per-round`, a round's blockers go straight to the
-Orchestrator to fix. It fixes them only if its binding may write: `writes:
-true` in `acr.yaml`, with Write or Edit in its tools. The binding `setup
-acr` writes can't, so the review escalates that to you instead: approve,
-and it ends with the blockers listed. Fix them, then review again.
+The old answers still work: `--approve`, `--stop`, `--fold <ids>` and
+`--waive <ids>`.
+
+**Fixes.** Whoever you chose at the scope gate fixes what you fold in. This
+session, or you at the terminal, fixes with the change's context, as the
+builder does in an in-session review. The Orchestrator fixes only if its
+binding may write: `writes: true` in `acr.yaml`, with Write or Edit in its
+tools. The binding `setup acr` writes can't, so a review defaults to you.
 
 **Findings.** Each finding has a severity, an action and a state:
 - **Severity:** Critical, High, Medium, Low, or Rejected by the Judge.
@@ -325,7 +345,7 @@ Things that matter for an agent other than Claude Code:
 | "the … bridge would refuse every call on binding …" | Allow what it names in that bridge's `options`, or change the binding. |
 | the doctor: reviewers can't run `cargo` (or `go`, `node`…) | Add the folder it names to the bridge's `path`, and restart the bridge. |
 | the doctor: the bridge's crate cache lacks the crates | Run the `cargo fetch` it gives, once, with the network. |
-| exit 3 or 4 | The review is waiting for you: see the gates in step 8. |
+| exit 3 or 4 | The review is waiting for you: `acrbus acr ask <id>` says what it asks; see the gates in step 8. |
 | exit 1 | Its last line says what's left: fix it and review again. |
 | a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
 | a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, and when it last did anything. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
