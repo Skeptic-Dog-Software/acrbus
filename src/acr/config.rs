@@ -570,14 +570,6 @@ impl Binding {
                 .any(|t| CHANGING_TOOLS.iter().any(|c| c.eq_ignore_ascii_case(t)))
         })
     }
-
-    /// Whether a session on it has a shell: one its tools name, or, with no
-    /// list, whatever its bridge gives, which may be one.
-    pub fn has_shell(&self) -> bool {
-        self.tools
-            .as_ref()
-            .is_none_or(|t| t.iter().any(|t| t.eq_ignore_ascii_case("bash")))
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

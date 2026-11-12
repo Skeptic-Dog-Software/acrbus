@@ -29,10 +29,9 @@ acrbus acr add-repo <path>       # let ACR review the repository here
 Every role's binding comes from `~/.config/acrbus/acr.yaml`. Reviewers do
 best when they can run things: give the reviewer binding a shell and the
 writing tools, as `acrbus setup acr` does. A reviewer with them works in a
-copy of its own, so nothing it does reaches the checkout. Its shell still
-reaches whatever you can, unless its bridge fences it: on a machine holding
-tokens or keys a reviewer mustn't read, see
-[Fencing an agent's shell](../README.md#fencing-an-agents-shell). The probes stage,
+copy of its own, so nothing it does reaches the checkout. What guides it
+beyond that is ACR's system prompt, which every role gets through its
+bridge: see "The system prompt" in the README. The probes stage,
 on by default, needs them: without them it's left out, and `acr validate`
 and `acr plan` say so.
 

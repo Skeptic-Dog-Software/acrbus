@@ -151,11 +151,6 @@ pub struct Settings {
     /// Where the agent records what its model calls used, for results that
     /// carry real usage.
     pub usage: Option<UsageFrom>,
-    /// Fences the shell the agent runs: each command its tool layer runs
-    /// through `<app> fence` reads and writes only the run's working
-    /// directory, its history and toolchains, reaches no network, and gets
-    /// no secret. Without it, the agent's shell reaches all you can.
-    pub fence: Option<crate::fence::Settings>,
 }
 
 /// How a run sees its message's attachments.
@@ -395,9 +390,6 @@ impl Settings {
                 );
             }
         }
-        if let Some(fence) = &self.fence {
-            crate::fence::check_settings(fence, self.secrets.keys(), plain_env_name)?;
-        }
         for (name, path) in &self.secrets {
             read_secret(name, path)?;
         }
@@ -449,7 +441,7 @@ fn plain_tool(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
-pub(crate) fn plain_env_name(name: &str) -> bool {
+fn plain_env_name(name: &str) -> bool {
     !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -796,7 +788,7 @@ fn secret_value_at(text: &str, out: &mut String) -> Option<usize> {
 }
 
 /// Creates a file only you can read.
-pub(crate) fn create_private(path: &Path) -> io::Result<File> {
+fn create_private(path: &Path) -> io::Result<File> {
     File::options()
         .write(true)
         .create(true)
@@ -2616,16 +2608,6 @@ impl Bridge {
             drop(known);
             command.env(name, value);
         }
-        // Last, so nothing in env can name another fence.
-        if let Some(fence) = &self.cfg.fence {
-            let file = crate::fence::write_policy(run_dir, &plan.workdir, &self.cfg.path, fence)?;
-            let bin = env::current_exe().context("finding this program, which runs the fence")?;
-            for prefix in crate::config::app().env {
-                command
-                    .env(format!("{prefix}_{}", crate::fence::POLICY_VAR), &file)
-                    .env(format!("{prefix}_{}", crate::fence::BIN_VAR), &bin);
-            }
-        }
         Ok(command)
     }
 
@@ -3121,45 +3103,6 @@ mod tests {
         rig.wait_acked(&id);
         bridge.stop().unwrap();
         assert!(rig.log.text().contains(&format!("replied {id}")));
-    }
-
-    #[test]
-    fn a_fenced_bridge_writes_each_runs_fence_and_names_it_to_its_agent() {
-        let rig = Rig::new();
-        let cfg = rig.settings(
-            r#"echo "bin: $ACRBUS_FENCE_BIN"
-            cat "$ACRBUS_FENCE""#,
-            r#"fence = { read = ["/opt/go"], env = { GOFLAGS = "-mod=mod" } }"#,
-        );
-        let bridge = rig.start(cfg);
-        let id = rig.ask("the question");
-        let reply = rig.reply_to(&id);
-        bridge.stop().unwrap();
-        let bin = env::current_exe().unwrap();
-        assert!(
-            reply.contains(&format!("bin: {}", bin.display())),
-            "{reply}"
-        );
-        let json = &reply[reply.find('{').unwrap()..];
-        let policy: serde_json::Value = serde_json::from_str(json).unwrap();
-        let work = rig.dir.join("work");
-        assert_eq!(policy["copy"], work.display().to_string(), "{reply}");
-        assert_eq!(policy["path"], "/usr/bin:/bin");
-        assert_eq!(policy["fence"]["read"][0], "/opt/go");
-        assert_eq!(policy["fence"]["env"]["GOFLAGS"], "-mod=mod");
-        assert_eq!(policy["fence"]["network"], "none");
-        let state = policy["state"].as_str().unwrap();
-        assert!(state.ends_with("/tmp/fence"), "{state}");
-    }
-
-    #[test]
-    fn a_fence_cant_set_what_the_fence_sets() {
-        let rig = Rig::new();
-        let cfg = rig.unchecked("cat", r#"fence = { env = { HOME = "/x" } }"#);
-        let e = cfg.check().unwrap_err().to_string();
-        assert!(e.contains("the fence sets it"), "{e}");
-        let cfg = rig.unchecked("cat", r#"fence = { write = ["relative"] }"#);
-        assert!(cfg.check().is_err());
     }
 
     #[test]
