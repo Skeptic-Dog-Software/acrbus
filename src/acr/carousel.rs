@@ -80,9 +80,11 @@ enum Topic {
 }
 
 impl Topic {
-    /// It must be answered for the review to go on.
+    /// It must be answered for the review to go on. Whether logged findings
+    /// should block is: an answer left out would keep them logged, and a
+    /// review could end confirmed with a person's choice to block lost.
     fn required(&self) -> bool {
-        !matches!(self, Topic::ShouldBlock(_) | Topic::Missed)
+        !matches!(self, Topic::Missed)
     }
 }
 
@@ -266,7 +268,20 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
         }
         _ => {}
     }
+    unique(&mut out);
     out
+}
+
+/// Answers are keyed by a question's text, so no two may share it: a later
+/// one that would gets its header added.
+fn unique(asked: &mut [Asked]) {
+    for i in 1..asked.len() {
+        let (before, rest) = asked.split_at_mut(i);
+        let q = &mut rest[0].question;
+        if before.iter().any(|a| a.question.question == q.question) {
+            q.question = format!("{} [{}]", q.question, q.header);
+        }
+    }
 }
 
 fn escalation(run: &Run, reason: &str, about: Option<&About>) -> Question {
@@ -446,21 +461,86 @@ fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
 
 /// What's asked at the end of a round, besides its blockers: whether a
 /// logged finding should block, and what the reviewers missed.
+/// The findings in each lens's latest round that are the same defect as
+/// `id`, found by another lens, as (lens, id).
+fn same_as(run: &Run, id: &str) -> Vec<(String, String)> {
+    run.lenses
+        .values()
+        .filter_map(|l| l.rounds.last().map(|r| (l.id.clone(), r)))
+        .flat_map(|(lens, r)| {
+            r.findings
+                .iter()
+                .filter(|g| g.same_as.as_deref() == Some(id))
+                .map(move |g| (lens.clone(), g.id.clone()))
+        })
+        .collect()
+}
+
 fn after_round(run: &Run) -> Vec<Asked> {
     let mut out = Vec::new();
+    // Every logged finding reaches the person: one found by several lenses
+    // once, naming the others, and the rejected counted.
     let logged = latest(run, |f| f.state == FindingState::Logged);
+    let in_round = |keep: &dyn Fn(&Finding) -> bool| {
+        run.lenses
+            .values()
+            .filter_map(|l| l.rounds.last())
+            .flat_map(|r| r.findings.iter())
+            .filter(|f| keep(f))
+            .count()
+    };
+    let all_logged = in_round(&|f| f.state == FindingState::Logged);
+    let rejected = in_round(&|f| f.state == FindingState::Dropped);
+    let mut counted = Vec::new();
+    if all_logged > logged.len() {
+        counted.push(format!(
+            "{} more are the same defect another lens found, shown with it",
+            all_logged - logged.len()
+        ));
+    }
+    if rejected > 0 {
+        counted.push(format!("{rejected} rejected, not shown"));
+    }
+    let counted = if counted.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", counted.join("; "))
+    };
     let chunks: Vec<&[(String, Finding)]> = logged.chunks(PER_QUESTION).collect();
+    let mut first = 1;
     for (n, chunk) in chunks.iter().enumerate() {
         let mut options: Vec<Choice> = chunk
             .iter()
             .map(|(lens, f)| {
+                let others: Vec<String> = same_as(run, &f.id)
+                    .into_iter()
+                    .map(|(l, id)| format!("{l} ({id})"))
+                    .collect();
+                let also = if others.is_empty() {
+                    String::new()
+                } else {
+                    format!("; also found by {}", others.join(", "))
+                };
                 choice(
                     &f.id,
-                    cut(&format!("{:?} in {lens}: {}", f.severity, f.title), 200),
+                    cut(
+                        &format!("{:?} in {lens}: {}{also}", f.severity, f.title),
+                        300,
+                    ),
                 )
             })
             .collect();
         options.push(choice(NONE, "They stay logged"));
+        let last = first + chunk.len() - 1;
+        // Numbered, so no two questions share their text: answers are keyed
+        // by it.
+        let which = if logged.len() == 1 {
+            "The logged finding".to_string()
+        } else if first == last {
+            format!("Logged finding {first} of {}", logged.len())
+        } else {
+            format!("Logged findings {first}-{last} of {}", logged.len())
+        };
         out.push(Asked {
             topic: Topic::ShouldBlock(
                 chunk
@@ -474,11 +554,16 @@ fn after_round(run: &Run) -> Vec<Asked> {
                 } else {
                     "Logged".to_string()
                 },
-                "Should any of these block? They're upheld, but logged, not blocking.".into(),
+                format!(
+                    "{which}{}: should any of these block? They're upheld, but logged, not \
+                     blocking.",
+                    if n == 0 { counted.as_str() } else { "" }
+                ),
                 options,
                 true,
             ),
         });
+        first = last + 1;
     }
     out.push(Asked {
         topic: Topic::Missed,
@@ -527,10 +612,12 @@ pub fn ask(run: &Run, cfg: &Config, app: &str) -> Ask {
         .collect();
     let summary = match (run.status, run.waiting) {
         (Status::Waiting, Some(gate)) => format!(
-            "Review {id} is waiting for you at its {} gate, round {}: {} question(s).",
+            "Review {id} is waiting for you at its {} gate, round {}: {} question(s), in {} \
+             carousel(s).",
             gate.as_str(),
             run.round,
-            all.len()
+            all.len(),
+            all.len().div_ceil(PER_CAROUSEL)
         ),
         _ => format!("Review {id} isn't waiting for anyone."),
     };
@@ -542,10 +629,13 @@ pub fn ask(run: &Run, cfg: &Config, app: &str) -> Ask {
             String::new()
         } else {
             format!(
-                "Show each carousel to your user with AskUserQuestion, exactly as given and in \
-                 order, and never answer for them. Then pass every answer, keyed by its \
-                 question's text, as one JSON object: `{app} acr resume {id} --answers \
-                 '<json>'`, or `--answers @<file>`."
+                "Show all {} carousel(s) to your user, each with one AskUserQuestion call, \
+                 exactly as given and in order, and never answer for them. Then pass every \
+                 answer, from every carousel, keyed by its question's text (or by \"[header] \
+                 text\"), as one JSON object: `{app} acr resume {id} --answers '<json>'`, or \
+                 `--answers @<file>`. An answer left out of a question that needs one, or one \
+                 for no question, is refused, so nothing is lost.",
+                carousels.len()
             )
         },
         carousels,
@@ -612,24 +702,24 @@ fn picked(q: &Question, value: &Value) -> Picked {
     }
 }
 
-/// The answer to `q` among `answers`: by its text as given, or else by its
-/// first line, which an agent may have kept alone.
+/// Whether answer `key` is for `q`: its text, as given or trimmed; its first
+/// line, which an agent may have kept alone; or `[header] text`, as a
+/// refusal names a question.
+fn keyed(key: &str, q: &Question) -> bool {
+    let key = key.trim();
+    let text = q.question.trim();
+    let tagged = format!("[{}] {text}", q.header);
+    key == text
+        || key == tagged
+        || key.lines().next().unwrap_or_default().trim()
+            == text.lines().next().unwrap_or_default().trim()
+}
+
+/// The answer to `q` among `answers`, by [`keyed`], its exact text first.
 fn answer_to<'a>(answers: &'a BTreeMap<String, Value>, q: &Question) -> Option<&'a Value> {
     answers
         .get(&q.question)
-        .or_else(|| {
-            answers
-                .iter()
-                .find(|(k, _)| k.trim() == q.question.trim())
-                .map(|(_, v)| v)
-        })
-        .or_else(|| {
-            let first = q.question.lines().next().unwrap_or_default().trim();
-            answers
-                .iter()
-                .find(|(k, _)| k.lines().next().unwrap_or_default().trim() == first)
-                .map(|(_, v)| v)
-        })
+        .or_else(|| answers.iter().find(|(k, _)| keyed(k, q)).map(|(_, v)| v))
 }
 
 /// What applying answers did, for whoever ran the review.
@@ -640,6 +730,8 @@ pub struct Applied {
     pub feedback: Vec<Feedback>,
     /// The person ended the review.
     pub stopped: bool,
+    /// What a person should hear about how their answers were applied.
+    pub notes: Vec<String>,
 }
 
 /// Applies a person's answers to the questions the review asks now.
@@ -661,6 +753,27 @@ pub fn apply(
             }
         );
     }
+    // An answer that's for no question would be lost without a word.
+    let stray: Vec<&String> = answers
+        .keys()
+        .filter(|k| !all.iter().any(|a| keyed(k, &a.question)))
+        .collect();
+    if !stray.is_empty() {
+        let asked: Vec<String> = all
+            .iter()
+            .map(|a| format!("[{}] {}", a.question.header, a.question.question))
+            .collect();
+        bail!(
+            "these answers are for no question it asks: {}. Key each answer by its question's \
+             text, or by \"[header] text\". It asks:\n- {}",
+            stray
+                .iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            asked.join("\n- ")
+        );
+    }
     let mut missing = Vec::new();
     let mut picks: Vec<(Topic, Question, Option<Picked>)> = Vec::new();
     for a in all {
@@ -672,7 +785,7 @@ pub fn apply(
     }
     if !missing.is_empty() {
         bail!(
-            "these need an answer, keyed by the question's text:\n- {}",
+            "these need an answer, keyed by the question's text or by \"[header] text\":\n- {}",
             missing.join("\n- ")
         );
     }
@@ -708,6 +821,7 @@ pub fn apply(
         e.seen = true;
     }
     let mut fold = false;
+    let mut blocked = 0;
     for (topic, _, pick) in &picks {
         match topic {
             Topic::Escalation(n) => match run.escalations[*n].about.clone() {
@@ -823,13 +937,20 @@ pub fn apply(
             Topic::ShouldBlock(offered) => {
                 if let Some(Picked::Chose(labels)) = pick {
                     for (lens, id) in offered.iter().filter(|(_, id)| labels.contains(id)) {
-                        to_blocker(run, cfg, lens, id);
-                        if let Some(f) = finding_mut(run, id) {
-                            f.state = FindingState::Folded;
+                        // A defect several lenses found blocks in each.
+                        let same = std::iter::once((lens.clone(), id.clone()))
+                            .chain(same_as(run, id))
+                            .collect::<Vec<_>>();
+                        for (lens, id) in same {
+                            to_blocker(run, cfg, &lens, &id);
+                            if let Some(f) = finding_mut(run, &id) {
+                                f.state = FindingState::Folded;
+                            }
+                            applied
+                                .feedback
+                                .extend(verdict(run, &id, Verdict::ShouldBlock, None));
+                            blocked += 1;
                         }
-                        applied
-                            .feedback
-                            .extend(verdict(run, id, Verdict::ShouldBlock, None));
                         fold = true;
                     }
                 }
@@ -870,6 +991,18 @@ pub fn apply(
         run.stage = Stage::Done;
         applied.stopped = true;
         return Ok(applied);
+    }
+    // Approving the result while saying findings should block: the choice to
+    // block wins, so they're fixed rather than lost, and the review goes on.
+    let approved = picks
+        .iter()
+        .any(|(t, _, p)| *t == Topic::Final && chose(p, APPROVE));
+    if approved && blocked > 0 {
+        applied.notes.push(format!(
+            "You approved the result and said {blocked} finding(s) should block: they're \
+             blockers now, so the review doesn't end yet. They're fixed, and every lens attacks \
+             the fix."
+        ));
     }
     // A lens with nothing left to fix or decide is settled the way its
     // blockers were.

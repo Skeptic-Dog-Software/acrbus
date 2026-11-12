@@ -409,6 +409,166 @@ fn linguist_generated(repo: &Path, base: &str, files: &[String]) -> Vec<String> 
         .collect()
 }
 
+/// Each changed file, with the lines it adds and removes, generated ones
+/// too: the Sizer's first look at a change.
+pub fn diffstat(change: &Change) -> Vec<(String, u64, u64)> {
+    per_file(change.full.as_deref().unwrap_or(&change.diff))
+        .into_iter()
+        .map(|(path, part)| {
+            let (added, removed) = counts(&part);
+            (path, added, removed)
+        })
+        .collect()
+}
+
+/// How far from a hunk a finding's line may be and still point at it.
+const NEAR: u64 = 10;
+/// The most hunks one finding brings in, when it names no line.
+const HUNKS_PER_FINDING: usize = 6;
+/// The most lines of hunks a Judge's brief carries.
+const HUNK_LINES: usize = 1500;
+
+/// A path as a finding or a diff may write it, to compare.
+fn bare_path(p: &str) -> &str {
+    let p = p.trim().trim_start_matches("./");
+    let p = p
+        .strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p);
+    // `src/x.rs:12` names a line too.
+    match p.rsplit_once(':') {
+        Some((path, line)) if !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) => path,
+        _ => p,
+    }
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    let (a, b) = (bare_path(a), bare_path(b));
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// A hunk: where it starts in the new file, how many lines it spans there,
+/// and its text.
+type Hunk = (u64, u64, String);
+
+/// A file's hunks.
+fn hunks(part: &str) -> Vec<Hunk> {
+    let mut out: Vec<Hunk> = Vec::new();
+    for line in part.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            // `@@ -a,b +c,d @@`: c is the new start, d its length.
+            let new = rest.split_whitespace().find(|w| w.starts_with('+'));
+            let (start, len) = new
+                .map(|w| {
+                    let mut it = w[1..].split(',');
+                    let start = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let len = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                    (start, len)
+                })
+                .unwrap_or((0, 0));
+            out.push((start, len, line.to_string()));
+        } else if let Some((_, _, text)) = out.last_mut() {
+            text.push_str(line);
+        }
+    }
+    out
+}
+
+/// The diff hunks `findings` point at, for a Judge to start from: for a
+/// finding with a file and line, the hunks of that file near it; with a file
+/// only, that file's first hunks; with neither, those of the changed files
+/// it names. Each hunk keeps the diff's own lines of context. None if they
+/// point at nothing in it.
+pub fn hunks_for<'a>(
+    diff: &str,
+    findings: impl IntoIterator<Item = &'a super::roles::Raw>,
+) -> Option<String> {
+    let files = per_file(diff);
+    let parsed: Vec<(String, Vec<Hunk>)> = files
+        .iter()
+        .map(|(path, part)| (path.clone(), hunks(part)))
+        .collect();
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    let mut take = |f: usize, h: usize| {
+        if !chosen.contains(&(f, h)) {
+            chosen.push((f, h));
+        }
+    };
+    for finding in findings {
+        let named: Vec<usize> = match finding.file.as_deref().filter(|f| !f.trim().is_empty()) {
+            Some(file) => parsed
+                .iter()
+                .enumerate()
+                .filter(|(_, (path, _))| same_file(path, file))
+                .map(|(i, _)| i)
+                .collect(),
+            None => {
+                let text = format!("{} {}", finding.title, finding.detail);
+                parsed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (path, _))| {
+                        let name = path.rsplit('/').next().unwrap_or(path);
+                        text.contains(path.as_str()) || (name.contains('.') && text.contains(name))
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        };
+        for f in named {
+            let near: Vec<usize> = match finding.line {
+                Some(line) => parsed[f]
+                    .1
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (start, len, _))| {
+                        line + NEAR >= *start && line <= start + len + NEAR
+                    })
+                    .map(|(h, _)| h)
+                    .collect(),
+                None => Vec::new(),
+            };
+            let picked = if near.is_empty() {
+                (0..parsed[f].1.len().min(HUNKS_PER_FINDING)).collect()
+            } else {
+                near
+            };
+            for h in picked {
+                take(f, h);
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return None;
+    }
+    chosen.sort();
+    let mut out = String::new();
+    let mut lines = 0;
+    let mut current = None;
+    let mut cut = false;
+    for (f, h) in chosen {
+        let text = &parsed[f].1[h].2;
+        let n = text.lines().count();
+        if lines + n > HUNK_LINES {
+            cut = true;
+            break;
+        }
+        if current != Some(f) {
+            out.push_str(&format!("--- {}\n", parsed[f].0));
+            current = Some(f);
+        }
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+        lines += n;
+    }
+    if cut {
+        out.push_str("(more hunks are in the attached diff)\n");
+    }
+    Some(out)
+}
+
 /// Splits a diff into each file's part, by its `diff --git` line.
 fn per_file(diff: &str) -> Vec<(String, String)> {
     let mut parts: Vec<(String, String)> = Vec::new();
@@ -531,6 +691,61 @@ pub mod tests {
     use crate::acr::config::REPO_CONFIG;
 
     use super::*;
+
+    #[test]
+    fn a_judge_gets_the_hunks_its_findings_point_at() {
+        use super::super::roles::Raw;
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+@@ -1,3 +1,4 @@\n ctx a1\n+added near the top\n ctx a2\n ctx a3\n\
+@@ -100,3 +101,4 @@\n ctx a100\n+added far down\n ctx a101\n ctx a102\n\
+diff --git a/docs/b.md b/docs/b.md\n--- a/docs/b.md\n+++ b/docs/b.md\n\
+@@ -5,2 +5,3 @@\n ctx b5\n+a doc line\n ctx b6\n";
+        let raw = |file: Option<&str>, line: Option<u64>, detail: &str| Raw {
+            title: "t".into(),
+            detail: detail.into(),
+            file: file.map(str::to_string),
+            line,
+        };
+        // A file and a line: only the hunk near it, with its context.
+        let near = hunks_for(diff, &[raw(Some("src/a.rs"), Some(102), "")]).unwrap();
+        assert!(
+            near.contains("--- src/a.rs") && near.contains("+added far down"),
+            "{near}"
+        );
+        assert!(
+            near.contains(" ctx a100") && near.contains(" ctx a102"),
+            "{near}"
+        );
+        assert!(
+            !near.contains("added near the top") && !near.contains("a doc line"),
+            "{near}"
+        );
+        // A file, however written, with no line: its hunks.
+        let file = hunks_for(diff, &[raw(Some("./src/a.rs:7"), None, "")]).unwrap();
+        assert!(
+            file.contains("near the top") && file.contains("far down"),
+            "{file}"
+        );
+        // Neither: the changed files it names.
+        let named = hunks_for(diff, &[raw(None, None, "the wording in b.md is wrong")]).unwrap();
+        assert!(
+            named.contains("--- docs/b.md") && named.contains("+a doc line"),
+            "{named}"
+        );
+        assert!(!named.contains("src/a.rs"), "{named}");
+        // Several findings, each hunk once.
+        let both = hunks_for(
+            diff,
+            &[
+                raw(Some("src/a.rs"), Some(2), ""),
+                raw(Some("src/a.rs"), Some(1), ""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(both.matches("+added near the top").count(), 1, "{both}");
+        // Nothing it can place.
+        assert!(hunks_for(diff, &[raw(None, None, "a general worry")]).is_none());
+    }
     use crate::util::new_id;
 
     /// A git repository with one commit of `files` on `main`.

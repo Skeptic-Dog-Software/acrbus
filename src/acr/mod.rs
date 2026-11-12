@@ -157,6 +157,16 @@ pub enum AcrCmd {
         #[arg(long)]
         no_tests: bool,
     },
+    /// Clear the copies reviews, checks, the doctor and the configurer left,
+    /// now rather than at the daemon's scheduled cleanup: those of reviews
+    /// that have finished or been stopped, and of checks, doctor runs and
+    /// configure runs that have ended. A review running or waiting keeps
+    /// its copies.
+    Clean {
+        /// List what would go, and its size, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print the published schema.
     Schema,
     /// How the pipeline's Judge rates what each key's own review found, set
@@ -444,6 +454,38 @@ fn claim(paths: &Paths, repo: &str, target: &Target, post_pr: Option<u64>, id: &
     )
 }
 
+/// Where each lens of a running review's round stands, as text or JSON.
+fn lens_states(paths: &Paths, id: &str, text: bool) -> Result<String> {
+    let path = run_dir(paths, id).join(flow::LENS_STATES);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Ok(if text {
+            format!("Review {id} is running, between rounds: it asks nothing yet.\n")
+        } else {
+            format!("{}\n", serde_json::json!({"running": true, "lenses": {}}))
+        });
+    };
+    let states: flow::LensStates = serde_json::from_str(&raw)?;
+    if !text {
+        return Ok(format!(
+            "{}\n",
+            serde_json::json!({"running": true, "round": states.round, "lenses": states.lenses})
+        ));
+    }
+    let now = crate::util::now_ms();
+    let mut out = format!(
+        "Review {id} is running, round {}: it asks nothing yet. Each lens:\n",
+        states.round
+    );
+    for (lens, l) in &states.lenses {
+        let ago = progress::took(std::time::Duration::from_millis((now - l.at).max(0) as u64));
+        out.push_str(&format!(
+            "  {lens}: {}, {} of {} reviewer(s) answered, {ago} ago\n",
+            l.state, l.answered, l.reviewers
+        ));
+    }
+    Ok(out)
+}
+
 /// Refuses to go on with a review that's finished: its files stay a while,
 /// to be looked at, but it's over.
 fn not_finished(paths: &Paths, id: &str) -> Result<()> {
@@ -553,6 +595,32 @@ fn not_findings(cfg: &Config, source: &Source, repo: &Path, base: &str) -> Resul
 }
 
 /// What a call on a binding asks its bridge for, wherever it works.
+/// What a call asks its bridge for: its binding's options, in its
+/// repository, and its binding's tools unchanged, unless it asks for none.
+fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOptions {
+    let options = RunOptions {
+        // Every role works in the repository, so reviewers read the
+        // code itself, read-only, and an Orchestrator fixes it there.
+        workdir: Some(call.repo.display().to_string()),
+        // A trial asks its bridge to copy transcripts into the log too.
+        log: Some(keep_logs),
+        // Nothing cuts a call off while it works: it asks for as long as
+        // its bridge allows, unless its binding caps it, and the bridge
+        // ends one that stalls.
+        timeout,
+        ..options_for(call.binding)
+    };
+    // No tools at all: it answers from what it's given.
+    if call.no_tools {
+        RunOptions {
+            tools: Some(Vec::new()),
+            ..options
+        }
+    } else {
+        options
+    }
+}
+
 pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
     RunOptions {
         // The binding's tools, writing ones too: some headless agents may
@@ -705,6 +773,7 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
             None
         }
     };
+    out.extend(copies_note(paths).map(Said::Note));
     // The user's bindings.
     let user_path = user_config_path(paths);
     if !user_path.exists() {
@@ -1188,6 +1257,9 @@ struct BridgeCaller {
     paths: Paths,
     /// What a person following the review is told as it goes.
     progress: progress::Progress,
+    /// Each role's share of the most the plan allows, for one call, to warn
+    /// of a call that passes it.
+    shares: std::sync::Mutex<Vec<(Role, u64)>>,
     /// The requests sent and not yet answered, and the file they're kept
     /// in, so that stopping the review stops them too, even if this
     /// process is gone by then.
@@ -1224,9 +1296,71 @@ impl BridgeCaller {
                 config: paths.config.clone(),
             },
             progress: progress::Progress::new(paths),
+            shares: Default::default(),
             calls: Default::default(),
             calls_file: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The plan's estimate for this review of `change`, for its progress to
+    /// say the run's total against, and each call's share of the most it
+    /// allows: one call's estimate for its role, scaled as the most scales
+    /// the least. `spent`: what the review used before, when resumed.
+    fn budget(
+        &self,
+        paths: &Paths,
+        cfg: &Config,
+        change: &Change,
+        repo: &Path,
+        before: &[flow::Usage],
+    ) {
+        let Ok(plan) = plan::dry_run(cfg, change, &history(paths, repo)) else {
+            return;
+        };
+        // Tokens not read from a cache, as the plan estimates them, on both
+        // sides: an agent's cache reads can be many times the rest.
+        let scale = plan.most.fresh as f64 / plan.least.fresh.max(1) as f64;
+        let shares = plan
+            .first_round
+            .iter()
+            .chain(plan.fix.iter())
+            .filter(|c| c.calls > 0)
+            .map(|c| {
+                let one = c.fresh() as f64 / c.calls as f64;
+                (c.role, (one * scale).ceil() as u64)
+            })
+            .collect();
+        let spent = progress::Spent {
+            fresh: before
+                .iter()
+                .map(|u| u.tokens_in + u.cache_write + u.tokens_out)
+                .sum(),
+            cached: before.iter().map(|u| u.cache_read).sum(),
+            usd: before.iter().filter_map(|u| u.usd).sum(),
+        };
+        *self.shares.lock().unwrap_or_else(|e| e.into_inner()) = shares;
+        let budget = progress::Budget {
+            expected: plan.expected.map(|e| e.fresh),
+            most: plan.most.fresh,
+        };
+        self.progress.budget(budget, spent);
+        let expected = budget
+            .expected
+            .map(|e| format!("about {} tokens expected, ", progress::short(e)))
+            .unwrap_or_default();
+        self.progress.line(&format!(
+            "the plan: {expected}{} at most, not counting tokens read from a cache",
+            progress::short(budget.most)
+        ));
+    }
+
+    fn share(&self, role: Role) -> Option<u64> {
+        self.shares
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, share)| *share)
     }
 
     /// Keeps the requests in flight in `path`, and on a signal to stop,
@@ -1348,12 +1482,24 @@ impl Caller for BridgeCaller {
         self.progress.note(what);
     }
 
+    fn say(&self, what: &str) {
+        self.progress.line(what);
+    }
+
     fn call(&self, call: &Call) -> Result<Answer> {
         let bridge = call.binding.agent.split('@').next().unwrap_or_default();
-        let token = self.progress.start(&call.label, call.binding_name, bridge);
+        let share = self.share(call.role);
+        let token = self
+            .progress
+            .start(&call.label, call.binding_name, bridge, share);
         let answer = self.call_once(call, bridge, token);
         let failed = answer.as_ref().err().map(|e| format!("{e:#}"));
-        self.progress.end(token, failed.as_deref());
+        let used = answer
+            .as_ref()
+            .ok()
+            .and_then(|a| a.usage.as_ref())
+            .map(crate::bridge::LiveTokens::of);
+        self.progress.end(token, failed.as_deref(), used);
         answer
     }
 }
@@ -1368,19 +1514,7 @@ impl BridgeCaller {
                 call.binding_name
             );
         }
-        let options = RunOptions {
-            // Every role works in the repository, so reviewers read the
-            // code itself, read-only, and an Orchestrator fixes it there.
-            workdir: Some(call.repo.display().to_string()),
-            // A review keeps its own record, and leaves nothing behind,
-            // unless it's a trial's, kept to see what each agent did.
-            log: Some(self.keep_logs),
-            // Nothing cuts a call off while it works: it asks for as long as
-            // its bridge allows, unless its binding caps it, and the bridge
-            // ends one that stalls.
-            timeout: self.asks_for(b, bridge),
-            ..options_for(b)
-        };
+        let options = call_options(call, self.keep_logs, self.asks_for(b, bridge));
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {
             let name = path
@@ -1457,6 +1591,7 @@ impl BridgeCaller {
                     text,
                     run_id: sent.id,
                     usage: result.and_then(|r| r.usage.clone()),
+                    secs: Some(asked.elapsed().as_secs()),
                 })
             }
             Awaited::Undelivered { why } => bail!("{}: {why}", b.agent),
@@ -1620,7 +1755,12 @@ fn attend(
                 }
             }
             match carousel::apply(run, cfg, &answers, crate::util::now_ms()) {
-                Ok(applied) => keep_feedback(paths, run, &applied.feedback),
+                Ok(applied) => {
+                    keep_feedback(paths, run, &applied.feedback);
+                    for note in &applied.notes {
+                        eprintln!("{APP_NAME}: {note}");
+                    }
+                }
                 Err(e) => {
                     eprintln!("{APP_NAME}: {e:#}");
                     continue;
@@ -1809,6 +1949,159 @@ fn next_steps(run: &Run, cfg: &Config) -> String {
 /// Where reviewers that can change files get their copies of the checkout.
 fn copies_root(paths: &Paths) -> PathBuf {
     paths.state.join("acr-copies")
+}
+
+/// A copy kept under [`copies_root`], and whether it's left over.
+struct KeptCopy {
+    path: PathBuf,
+    /// Apparent size, in bytes: on macOS, copies are clones that share
+    /// blocks with the repository, so they use less disk than this.
+    bytes: u64,
+    /// Why it's no longer needed, if it isn't.
+    leftover: Option<String>,
+}
+
+/// A copy of a check, the doctor or the configurer younger than this may
+/// still be in use: none of them runs this long.
+const IN_USE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Every copy kept, with its size, and why each that's left over is.
+fn kept_copies(paths: &Paths) -> Vec<KeptCopy> {
+    let running = keep::active(paths);
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(copies_root(paths)) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let base = crate::util::unstamped(&name);
+        let review = base
+            .get(..26)
+            .filter(|id| crate::util::is_id(id) && base[26..].starts_with("-r"));
+        let leftover = match review {
+            Some(id) if running.iter().any(|r| r == id) => None,
+            Some(id) if keep::is_finished(paths, id) => Some("its review has finished".into()),
+            // Waiting for a person, and a fix may still need its copies.
+            Some(id) if run_dir(paths, id).exists() => None,
+            Some(_) => Some("its review is gone".into()),
+            None => ["check", "doctor", "configure"]
+                .into_iter()
+                .find(|what| base.starts_with(&format!("{what}-")))
+                .filter(|_| crate::util::older_than(&path, IN_USE))
+                .map(|what| format!("its {what} has ended")),
+        };
+        out.push(KeptCopy {
+            bytes: apparent_size(&path),
+            path,
+            leftover,
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// The bytes of every file under `path`, links not followed.
+fn apparent_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => stack.push(entry.path()),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// `12 MB`, `1.4 GB`.
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        0..1_000_000 => format!("{} KB", bytes.div_ceil(1000)),
+        1_000_000..1_000_000_000 => format!("{} MB", bytes / 1_000_000),
+        _ => format!("{:.1} GB", bytes as f64 / 1e9),
+    }
+}
+
+const CLONES: &str = "on macOS they're clones that share blocks with the repository, so they \
+                      use less disk than that";
+
+/// `acr clean`: removes the copies left over, or with `dry_run`, lists them.
+fn clean(paths: &Paths, dry_run: bool) -> Result<()> {
+    let kept = kept_copies(paths);
+    let leftovers: Vec<&KeptCopy> = kept.iter().filter(|k| k.leftover.is_some()).collect();
+    if leftovers.is_empty() {
+        println!(
+            "No copies to clear: {} kept, each for a review running or waiting, or a check \
+             still in use.",
+            kept.len()
+        );
+        return Ok(());
+    }
+    let mut cleared = 0;
+    let mut bytes = 0;
+    for k in &leftovers {
+        let name = k.path.file_name().unwrap_or_default().to_string_lossy();
+        let why = k.leftover.as_deref().unwrap_or_default();
+        if dry_run {
+            println!("  would remove {name}: {}, {why}", size_text(k.bytes));
+        } else {
+            match fs::remove_dir_all(&k.path) {
+                Ok(()) => {
+                    println!("  removed {name}: {}, {why}", size_text(k.bytes));
+                    cleared += 1;
+                    bytes += k.bytes;
+                }
+                Err(e) => println!("  couldn't remove {name}: {e}"),
+            }
+        }
+    }
+    let total: u64 = leftovers.iter().map(|k| k.bytes).sum();
+    if dry_run {
+        println!(
+            "{} copies would go, {} apparent; {CLONES}. Nothing was removed.",
+            leftovers.len(),
+            size_text(total)
+        );
+    } else {
+        println!(
+            "Removed {cleared} copies, {} apparent; {CLONES}.",
+            size_text(bytes)
+        );
+    }
+    Ok(())
+}
+
+/// What doctor says of the copies kept, if there are any.
+fn copies_note(paths: &Paths) -> Option<String> {
+    let kept = kept_copies(paths);
+    if kept.is_empty() {
+        return None;
+    }
+    let total: u64 = kept.iter().map(|k| k.bytes).sum();
+    let leftover = kept.iter().filter(|k| k.leftover.is_some()).count();
+    let clear = if leftover > 0 {
+        format!(
+            "; {leftover} of them are left over from finished work, and `{APP_NAME} acr clean` \
+             removes those now"
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} copies kept in {}, {} apparent ({CLONES}){clear}. The daemon's cleanup clears each \
+         {} days after it's made",
+        kept.len(),
+        copies_root(paths).display(),
+        size_text(total),
+        crate::cleanup::KEEP_DAYS
+    ))
 }
 
 /// The bridges that reviewers who can change files go through: each must
@@ -2145,6 +2438,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                      pass it with --brief next time",
                 );
             }
+            caller.budget(paths, &cfg, &change, repo, &[]);
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             run.starter = starter;
             // After a fix, the change is the working tree.
@@ -2154,8 +2448,14 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
             return finish(paths, &run, &cfg, post_pr);
         }
+        AcrCmd::Clean { dry_run } => clean(paths, dry_run)?,
         AcrCmd::Ask { run_id, text } => {
             not_finished(paths, &run_id)?;
+            // Running, it asks nothing yet: where each lens stands instead.
+            if keep::active(paths).contains(&run_id) {
+                print!("{}", lens_states(paths, &run_id, text)?);
+                return Ok(ExitCode::SUCCESS);
+            }
             let dir = run_dir(paths, &run_id);
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
@@ -2205,6 +2505,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     crate::util::now_ms(),
                 )?;
                 keep_feedback(paths, &run, &applied.feedback);
+                for note in &applied.notes {
+                    eprintln!("{APP_NAME}: {note}");
+                }
                 stop |= applied.stopped;
             }
             let fixing = fixed || run.waiting == Some(flow::Gate::Fix);
@@ -2250,6 +2553,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
             following(&caller, paths, &run_id, &cfg, "resumed");
+            if let Ok(change) = reload(&cfg, &repo, &base, run.head.as_deref()) {
+                caller.budget(paths, &cfg, &change, &repo, &run.usage);
+            }
             if fixed {
                 let briefs = brief
                     .as_deref()
@@ -2642,6 +2948,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             prompt: &prompt,
             artifact: None,
             writes: false,
+            no_tools: false,
             repo: &tree,
             label: format!(
                 "the check: {name}{place}",
@@ -2716,6 +3023,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             prompt: &prompt,
             artifact: None,
             writes: true,
+            no_tools: false,
             repo: &s.tree,
             label: "the check: the steelman".to_string(),
         });
@@ -3238,6 +3546,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             prompt: &prompt,
             artifact: Some(&artifact),
             writes: false,
+            no_tools: false,
             repo: &s.tree,
             label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
@@ -4054,6 +4363,7 @@ mod tests {
             prompt: "Fix these",
             artifact: None,
             writes: true,
+            no_tools: false,
             repo: Path::new("."),
             label: "the Orchestrator, fixing".into(),
         };
@@ -4102,5 +4412,146 @@ mod tests {
         assert_eq!(s.not_findings, "the list");
         let again = setting(&paths, &cfg, "r1", None).unwrap();
         assert_eq!(again.not_findings, "the list");
+    }
+
+    #[test]
+    fn clean_clears_only_copies_left_over_and_doctor_counts_them() {
+        let p = paths();
+        let root = copies_root(&p);
+        let stamp = |ago: u64| crate::util::stamp(crate::util::now_ms() - (ago as i64) * 1000);
+        let copy = |name: String| {
+            let dir = root.join(&name).join("repo");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("a.src"), "x".repeat(2000)).unwrap();
+            name
+        };
+        let (done, waiting, running, gone) = (new_id(), new_id(), new_id(), new_id());
+        // A finished review, packed; one waiting for a person; one running.
+        fs::create_dir_all(keep::dir(&p)).unwrap();
+        fs::write(
+            keep::dir(&p).join(format!("{}-{done}.tar.gz", stamp(60))),
+            "x",
+        )
+        .unwrap();
+        fs::create_dir_all(run_dir(&p, &waiting)).unwrap();
+        fs::write(run_dir(&p, &waiting).join("run.json"), "{}").unwrap();
+        let _running = keep::active_guard(&p, &running).unwrap();
+        let names = [
+            copy(format!("{}-{done}-r1-aaaaaa", stamp(60))),
+            copy(format!("{}-{waiting}-r1-bbbbbb", stamp(60))),
+            copy(format!("{}-{running}-r1-cccccc", stamp(60))),
+            copy(format!("{}-{gone}-r2-dddddd", stamp(60))),
+            copy(format!("{}-check-{}", stamp(3600), new_id())),
+            copy(format!("{}-check-{}", stamp(5), new_id())),
+        ];
+        let leftover: std::collections::BTreeSet<String> = kept_copies(&p)
+            .into_iter()
+            .filter(|k| k.leftover.is_some())
+            .map(|k| k.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let expected: std::collections::BTreeSet<String> = [&names[0], &names[3], &names[4]]
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(leftover, expected);
+        let note = copies_note(&p).unwrap();
+        assert!(
+            note.starts_with("6 copies kept in")
+                && note.contains("12 KB apparent")
+                && note.contains("3 of them are left over"),
+            "{note}"
+        );
+        // A dry run removes nothing; then only the leftovers go.
+        clean(&p, true).unwrap();
+        assert!(names.iter().all(|n| root.join(n).exists()));
+        clean(&p, false).unwrap();
+        for (n, name) in names.iter().enumerate() {
+            assert_eq!(root.join(name).exists(), ![0, 3, 4].contains(&n), "{name}");
+        }
+        drop(_running);
+        let _ = fs::remove_dir_all(&p.state);
+    }
+
+    #[test]
+    fn ask_shows_a_running_reviews_lenses_where_they_stand() {
+        let p = paths();
+        let id = new_id();
+        let _running = keep::active_guard(&p, &id).unwrap();
+        let said = lens_states(&p, &id, true).unwrap();
+        assert!(said.contains("between rounds"), "{said}");
+        let mut states = flow::LensStates {
+            round: 2,
+            ..flow::LensStates::default()
+        };
+        states.lenses.insert(
+            "probes".into(),
+            flow::LensNow {
+                state: "no findings".into(),
+                reviewers: 1,
+                answered: 1,
+                at: crate::util::now_ms(),
+            },
+        );
+        fs::write(
+            run_dir(&p, &id).join(flow::LENS_STATES),
+            serde_json::to_vec(&states).unwrap(),
+        )
+        .unwrap();
+        let said = lens_states(&p, &id, true).unwrap();
+        assert!(
+            said.contains("round 2")
+                && said.contains("probes: no findings, 1 of 1 reviewer(s) answered"),
+            "{said}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&lens_states(&p, &id, false).unwrap()).unwrap();
+        assert_eq!(json["lenses"]["probes"]["state"], "no findings");
+        drop(_running);
+        let _ = fs::remove_dir_all(&p.state);
+    }
+
+    #[test]
+    fn a_call_asks_for_its_bindings_tools_unchanged_unless_it_asks_for_none() {
+        let binding = config::Binding {
+            agent: "pi@here".into(),
+            model: Some("m".into()),
+            tools: Some(vec![
+                "read".into(),
+                "grep".into(),
+                "find".into(),
+                "ls".into(),
+            ]),
+            ..config::Binding::default()
+        };
+        let repo = PathBuf::from("/repo");
+        let call = |role, no_tools| flow::Call {
+            role,
+            binding_name: "b",
+            binding: &binding,
+            prompt: "p",
+            artifact: None,
+            writes: false,
+            no_tools,
+            repo: &repo,
+            label: "x".into(),
+        };
+        for role in [Role::Judge, Role::Reviewer, Role::Orchestrator, Role::Sizer] {
+            let options = call_options(&call(role, false), false, Some(60));
+            assert_eq!(options.tools, binding.tools, "{role:?}");
+            assert_eq!(options.workdir.as_deref(), Some("/repo"));
+            assert_eq!(options.model.as_deref(), Some("m"));
+        }
+        let bare = call_options(&call(Role::Sizer, true), false, Some(60));
+        assert_eq!(bare.tools, Some(Vec::new()));
+        // A binding with no list leaves the bridge's own tools.
+        let open = config::Binding {
+            tools: None,
+            ..binding.clone()
+        };
+        let any = flow::Call {
+            binding: &open,
+            ..call(Role::Judge, false)
+        };
+        assert_eq!(call_options(&any, false, None).tools, None);
     }
 }

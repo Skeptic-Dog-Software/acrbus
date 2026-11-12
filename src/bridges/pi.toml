@@ -14,6 +14,7 @@ max_concurrent = 3
 max_timeout_secs = 14400
 tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 tools_args = ["--tools", "{TOOLS}"]
+no_tools_args = ["--no-tools", "--no-mcp"]
 efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 effort_args = ["--thinking", "{EFFORT}"]
 workdirs = []
