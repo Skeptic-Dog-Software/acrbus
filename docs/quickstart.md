@@ -155,14 +155,20 @@ acrbus acr run --repo <path> --base <base> --head <head>
 
 - **`--base`** is where the change starts: the branch it goes into, or the
   commit before it.
-- **`--head`** is its last commit, and it must be checked out, with nothing
-  on top. Leave the checkout alone until the review ends. Leave `--head` out
-  to review the working tree.
+- **`--head`** is its last commit. The review reads a copy of that commit,
+  made under acrbus's state, so the checkout can be on any branch, with any
+  changes, while it runs, and nothing the review does reaches it. Fixes are
+  the exception: they go into the checkout, so before the first one the
+  review asks you to check `--head` out, with nothing on top. Leave `--head`
+  out to review the working tree, which is read where it is.
 - **What's reviewed** is all of `<base>..<head>` as one diff, which is what
   merging the pull request puts on the base. `review_scope: bottom-of-stack`
   in the config, or `--review-scope bottom-of-stack` on a run, reviews only
-  the first commit after the base instead, and then that commit is the one
-  to check out.
+  the first commit after the base instead, and then the copy, and the
+  checkout for fixes, is of that commit.
+- **`--pr <number>`** reads the pull request's description, and gives every
+  reviewer and Judge its title, description, review comments and the issues
+  it links, in the shared facts, fetched with `gh` each round.
 - **`plan`** shows the tier, the lenses and an estimate. The estimate counts
   only the text ACR sends and reads back. What agents' tools read adds more,
   often several times as much, so treat it as a floor.

@@ -289,11 +289,12 @@ pub fn tree_diff(repo: &Path, from: &str, to: &str) -> Result<(Vec<String>, Stri
     Ok((files.lines().map(str::to_string).collect(), diff))
 }
 
-/// Reviewers read the checkout itself, so the commit a review is of must be
-/// the one checked out, with nothing changed on top. That's `head`, or with
-/// `bottom-of-stack`, the first commit after the base on the way to it.
-/// Without `head`, the review is of the working tree, which is the checkout
-/// already.
+/// The commit a review is of must be the one checked out, with nothing
+/// changed on top, wherever the checkout is read or written: by a review's
+/// fixes, which go into the checkout, and by a review saved before reviews
+/// read a copy of their commit. That's `head`, or with `bottom-of-stack`,
+/// the first commit after the base on the way to it. Without `head`, the
+/// review is of the working tree, which is the checkout already.
 pub fn checked_out(repo: &Path, base: &str, head: Option<&str>, scope: ReviewScope) -> Result<()> {
     let Some(given) = head else {
         return Ok(());
@@ -311,27 +312,77 @@ pub fn checked_out(repo: &Path, base: &str, head: Option<&str>, scope: ReviewSco
         if want != commit(given)? {
             bail!(
                 "review_scope is bottom-of-stack, so the review is of {}, the first commit \
-                 after {base} on the way to {given}, and reviewers read the checkout, which is \
-                 {}. Check {} out, or pass --review-scope whole-pr to review all of \
-                 {base}..{given}.",
+                 after {base} on the way to {given}, which has to be what's checked out, and \
+                 the checkout is at {}. Check {} out, or pass --review-scope whole-pr to review \
+                 all of {base}..{given}.",
                 short(&want),
                 short(&have),
                 short(&want)
             );
         }
         bail!(
-            "reviewers read the checkout, so {given} has to be what's checked out, and it's \
-             {}. Check {given} out, or leave --head out to review the working tree.",
+            "{given} has to be what's checked out, and the checkout is at {}. Check {given} \
+             out.",
             short(&have)
         );
     }
     let changed = git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
     if !changed.trim().is_empty() {
-        bail!(
-            "reviewers read the checkout, which has changes on top of {given}. Commit or \
-             stash them, or leave --head out to review the working tree."
-        );
+        bail!("the checkout has changes on top of {given}. Commit or stash them.");
     }
+    Ok(())
+}
+
+/// The commit a review is of, in full: `head` resolved, or with
+/// `bottom-of-stack`, the first commit after the base on the way to it.
+/// None for the working tree.
+pub fn reviewed_commit(
+    repo: &Path,
+    base: &str,
+    head: Option<&str>,
+    scope: ReviewScope,
+) -> Result<Option<String>> {
+    let Some(reviewed) = reviewed_head(repo, base, head, scope)? else {
+        return Ok(None);
+    };
+    let full = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{reviewed}^{{commit}}")],
+    )
+    .with_context(|| format!("{reviewed} isn't a commit in {}", repo.display()))?;
+    Ok(Some(full.trim().to_string()))
+}
+
+/// A copy of the repository at `commit`, at `to`, for a review to read: the
+/// commit's files and nothing of the checkout's, so the checkout can be on
+/// any branch, with any changes, while it's reviewed, and nothing done in
+/// the copy reaches it. Like [`copy_of`], its repository is its own, and
+/// reads the checkout's history through git's alternates.
+pub fn copy_at(repo: &Path, commit: &str, to: &Path) -> Result<()> {
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = Path::new(common.trim());
+    let full = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )
+    .with_context(|| format!("{commit} isn't a commit in {}", repo.display()))?;
+    fs::create_dir_all(to)?;
+    git(to, &["init", "--quiet"])?;
+    let objects = to.join(".git/objects/info");
+    fs::create_dir_all(&objects)?;
+    fs::write(
+        objects.join("alternates"),
+        format!("{}\n", common.join("objects").display()),
+    )?;
+    if common.join("shallow").is_file() {
+        fs::copy(common.join("shallow"), to.join(".git/shallow"))?;
+    }
+    git(to, &["update-ref", "--no-deref", "HEAD", full.trim()])?;
+    git(to, &["read-tree", "HEAD"])?;
+    git(to, &["checkout-index", "--all", "--force"])?;
     Ok(())
 }
 
@@ -998,6 +1049,68 @@ diff --git a/docs/b.md b/docs/b.md\n--- a/docs/b.md\n+++ b/docs/b.md\n\
         assert_eq!(name(&tree).unwrap(), name(&dir).unwrap());
         assert!(name(&dir).unwrap().starts_with("tb-acr-"));
         fs::remove_dir_all(&tree).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copy_of_the_reviewed_commit_leaves_the_checkout_alone() {
+        // The checkout is on another branch, with changes and a new file of
+        // its own, while a commit on another branch is reviewed.
+        let dir = repo_with(&[("a.txt", "one\n"), ("b.txt", "keep\n")]);
+        branch(&dir, "change");
+        commit(&dir, &[("a.txt", "two\n"), ("c.txt", "new\n")], "two");
+        let reviewed = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["checkout", "-q", "main"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::write(dir.join("a.txt"), "mine\n").unwrap();
+        fs::write(dir.join("scratch.txt"), "untracked\n").unwrap();
+        let status_before = git(&dir, &["status", "--porcelain"]).unwrap();
+        let head_before = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let commit = reviewed_commit(&dir, "main", Some("change"), ReviewScope::WholePr)
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit, reviewed.trim());
+        let to = dir.with_extension("head-copy").join("repo");
+        copy_at(&dir, &commit, &to).unwrap();
+
+        // The copy is the commit: its files, its HEAD, nothing changed on top.
+        assert_eq!(fs::read_to_string(to.join("a.txt")).unwrap(), "two\n");
+        assert_eq!(fs::read_to_string(to.join("c.txt")).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(to.join("b.txt")).unwrap(), "keep\n");
+        assert!(!to.join("scratch.txt").exists());
+        assert_eq!(git(&to, &["rev-parse", "HEAD"]).unwrap().trim(), commit);
+        assert!(
+            git(&to, &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        // And the checkout is just as it was.
+        assert_eq!(
+            git(&dir, &["status", "--porcelain"]).unwrap(),
+            status_before
+        );
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "mine\n");
+        // Writing in the copy doesn't reach the checkout's history.
+        fs::write(to.join("a.txt"), "edited in the copy\n").unwrap();
+        assert_eq!(
+            git(&dir, &["status", "--porcelain"]).unwrap(),
+            status_before
+        );
+        // A head that's no commit says so.
+        let err = format!(
+            "{:#}",
+            reviewed_commit(&dir, "main", Some("nope"), ReviewScope::WholePr).unwrap_err()
+        );
+        assert!(err.contains("nope"), "{err}");
+        fs::remove_dir_all(to.parent().unwrap()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

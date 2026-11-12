@@ -8,10 +8,17 @@
 //! those names appear in the code, and the tests that name them. References
 //! are found by name with `git grep`, which every repository has.
 //!
+//! With a pull request, its words come too, fetched with `gh` once a round:
+//! its title and description and the issues it links, which a Judge ruling
+//! on what the change missed would otherwise read for itself, each call
+//! paying for them fresh, and its review comments.
+//!
 //! The order is the cache's. A prompt cache hits on an identical prefix, so
-//! what stays the same comes first and what changes comes last: files a fix
-//! hasn't touched since they were first mapped, in path order, then files
-//! touched in each later round, oldest touch first, then this round's gate.
+//! what stays the same comes first and what changes comes last: the pull
+//! request's title, description and issues, then files a fix hasn't touched
+//! since they were first mapped, in path order, then files touched in each
+//! later round, oldest touch first, then the round, the pull request's
+//! review comments, which can grow during a review, and this round's gate.
 //! Nothing that varies between rounds or calls, no round number, count of
 //! calls, time or path of a copy, sits before a fact that doesn't.
 
@@ -19,7 +26,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +41,12 @@ const MAX_SYMBOLS: usize = 20;
 const MAX_REFS: usize = 25;
 /// Names this short match too much to be worth a search.
 const MIN_NAME: usize = 3;
+/// The most bytes of a pull request's text, or of one issue it links, the
+/// facts carry: a longer one is cut, and says so.
+const MAX_PR_TEXT: usize = 32 * 1024;
+/// The most issues a pull request's facts carry.
+const MAX_ISSUES: usize = 10;
+
 /// The most searches for references one round's facts make, in the diff's
 /// file order, so a change of hundreds of files maps in seconds: a file
 /// past them names its definitions without their references.
@@ -94,12 +109,29 @@ impl Facts {
     /// round, and the same as the last round's up to the first file a fix
     /// touched. `gate` is this round's test gate, if it ran, and goes last,
     /// after the only line that names the round.
+    #[cfg(test)]
     pub fn render(&self, round: u32, gate: Option<&str>) -> String {
+        self.render_with(round, gate, None)
+    }
+
+    /// [`Facts::render`], with the pull request's words: its title,
+    /// description and issues after the head, ahead of every file, and its
+    /// review comments after the round, before the gate.
+    pub fn render_with(&self, round: u32, gate: Option<&str>, pr: Option<&PrText>) -> String {
         let mut out = String::from(HEAD);
+        if let Some(pr) = pr {
+            out.push_str(&pr.said());
+        }
         for f in &self.files {
             out.push_str(&render_file(f));
         }
         out.push_str(&format!("\n# This round\n\nRound {round}.\n"));
+        if let Some(c) = pr.map(|p| p.comments.trim()).filter(|c| !c.is_empty()) {
+            out.push_str(&format!(
+                "\n## The pull request's review comments\n\n{}\n",
+                normalize(c)
+            ));
+        }
         if let Some(g) = gate.map(str::trim).filter(|g| !g.is_empty()) {
             out.push_str(&format!("\n## The test gate\n\n{}\n", normalize(g)));
         }
@@ -118,6 +150,180 @@ const HEAD: &str = "# The change's facts\n\n\
     them. Names are matched by text, so a reference may be a namesake. A file's references are \
     as of the round it was first mapped; files a fix touched come after the rest, with their \
     own. The change and its claims are also in the attached file.\n";
+
+/// A pull request's words, as `gh` gave them: what it says, the issues it
+/// links, and its review comments, the last apart since they can grow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrText {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    /// Each linked issue: its number, title and body.
+    pub issues: Vec<(u64, String, String)>,
+    /// Its conversation, its reviews and their comments on lines, oldest
+    /// first, each with who wrote it.
+    pub comments: String,
+}
+
+impl PrText {
+    /// Its title, description and issues, as the facts carry them.
+    fn said(&self) -> String {
+        let mut out = format!(
+            "\n# The pull request, #{}\n\nWhat its author and its issues say, as `gh` gave \
+             them: claims to check, like the change's own words.\n\n## {}\n\n{}\n",
+            self.number,
+            normalize(self.title.trim()).trim_end(),
+            normalize(&cut(self.body.trim(), MAX_PR_TEXT))
+        );
+        for (n, title, body) in self.issues.iter().take(MAX_ISSUES) {
+            out.push_str(&format!(
+                "\n## Issue #{n}: {}\n\n{}\n",
+                normalize(title.trim()).trim_end(),
+                normalize(&cut(body.trim(), MAX_PR_TEXT))
+            ));
+        }
+        out
+    }
+}
+
+/// `text`, cut to `max` bytes at a character's edge, saying so if it was.
+fn cut(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n(cut here: {} bytes in all)",
+        &text[..end],
+        text.len()
+    )
+}
+
+/// Pull request `pr`'s words, with `gh` in the checkout at `repo`: its
+/// title, description and review comments, and the issues it links.
+pub fn fetch_pr(repo: &Path, pr: u64) -> Result<PrText> {
+    let gh = |args: &[&str]| -> Result<String> {
+        let out = Command::new("gh")
+            .args(args)
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .output()
+            .context("running gh")?;
+        if !out.status.success() {
+            bail!(
+                "gh {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let number = pr.to_string();
+    let view = gh(&[
+        "pr",
+        "view",
+        &number,
+        "--json",
+        "number,title,body,closingIssuesReferences,comments,reviews",
+    ])?;
+    let inline = gh(&[
+        "api",
+        "--paginate",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments"),
+    ])
+    .unwrap_or_default();
+    let mut text = pr_text(&view, &inline)?;
+    for (n, title, body) in &mut text.issues {
+        if let Ok(issue) = gh(&["issue", "view", &n.to_string(), "--json", "title,body"]) {
+            let v: serde_json::Value = serde_json::from_str(&issue).unwrap_or_default();
+            *title = v["title"].as_str().unwrap_or(title).to_string();
+            *body = v["body"].as_str().unwrap_or_default().to_string();
+        }
+    }
+    Ok(text)
+}
+
+/// A pull request's words from what `gh pr view --json` and the API's
+/// review comments gave: the issues by number, their text fetched apart.
+pub fn pr_text(view: &str, inline: &str) -> Result<PrText> {
+    let v: serde_json::Value = serde_json::from_str(view).context("reading gh's pull request")?;
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let issues = v["closingIssuesReferences"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| Some((i["number"].as_u64()?, s(&i["title"]), String::new())))
+        .collect();
+    // Every comment, oldest first, with who wrote it and when.
+    let mut said: Vec<(String, String)> = Vec::new();
+    let author = |c: &serde_json::Value| {
+        c["author"]["login"]
+            .as_str()
+            .or_else(|| c["user"]["login"].as_str())
+            .unwrap_or("someone")
+            .to_string()
+    };
+    for c in v["comments"].as_array().into_iter().flatten() {
+        let body = s(&c["body"]);
+        if !body.trim().is_empty() {
+            said.push((
+                s(&c["createdAt"]),
+                format!("{} commented:\n\n{}", author(c), body.trim()),
+            ));
+        }
+    }
+    for r in v["reviews"].as_array().into_iter().flatten() {
+        let body = s(&r["body"]);
+        let state = s(&r["state"]).to_lowercase().replace('_', " ");
+        if !body.trim().is_empty() || state == "changes requested" {
+            said.push((
+                s(&r["submittedAt"]),
+                format!("{} reviewed ({state}):\n\n{}", author(r), body.trim()),
+            ));
+        }
+    }
+    // The API gives one page of review comments after another; read each.
+    let mut pages: Vec<serde_json::Value> = Vec::new();
+    for part in serde_json::Deserializer::from_str(inline).into_iter::<serde_json::Value>() {
+        match part {
+            Ok(serde_json::Value::Array(items)) => pages.extend(items),
+            Ok(_) | Err(_) => break,
+        }
+    }
+    for c in &pages {
+        let at = match (
+            c["path"].as_str(),
+            c["line"].as_u64().or_else(|| c["original_line"].as_u64()),
+        ) {
+            (Some(p), Some(l)) => format!(" on {p}:{l}"),
+            (Some(p), None) => format!(" on {p}"),
+            _ => String::new(),
+        };
+        let body = s(&c["body"]);
+        if !body.trim().is_empty() {
+            said.push((
+                s(&c["created_at"]),
+                format!("{} commented{at}:\n\n{}", author(c), body.trim()),
+            ));
+        }
+    }
+    said.sort_by(|a, b| a.0.cmp(&b.0));
+    let comments = said
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    Ok(PrText {
+        number: v["number"].as_u64().unwrap_or_default(),
+        title: s(&v["title"]),
+        body: s(&v["body"]),
+        issues,
+        comments: cut(&comments, MAX_PR_TEXT),
+    })
+}
 
 fn render_file(f: &FileFacts) -> String {
     let mut out = format!("\n## {}\n\n", f.path);
@@ -458,6 +664,113 @@ mod tests {
             &crate::acr::config::Generated::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_pull_requests_words_are_read_from_gh_with_every_comment_in_order() {
+        let view = r#"{
+            "number": 7, "title": "Retry the upload", "body": "Fixes #12.\r\nRetries twice.",
+            "closingIssuesReferences": [{"number": 12, "title": "Uploads drop"}],
+            "comments": [
+                {"author": {"login": "ann"}, "body": "Why twice?", "createdAt": "2026-01-02T00:00:00Z"},
+                {"author": {"login": "bot"}, "body": "  ", "createdAt": "2026-01-01T00:00:00Z"}
+            ],
+            "reviews": [
+                {"author": {"login": "bo"}, "body": "", "state": "CHANGES_REQUESTED", "submittedAt": "2026-01-03T00:00:00Z"},
+                {"author": {"login": "cy"}, "body": "", "state": "APPROVED", "submittedAt": "2026-01-04T00:00:00Z"}
+            ]
+        }"#;
+        // Two pages, as `gh api --paginate` prints them.
+        let inline = r#"[{"user": {"login": "bo"}, "path": "up.rs", "line": 9, "body": "Off by one", "created_at": "2026-01-03T00:00:01Z"}]
+[{"user": {"login": "ann"}, "path": "up.rs", "original_line": 4, "body": "And here", "created_at": "2026-01-01T12:00:00Z"}]"#;
+        let pr = pr_text(view, inline).unwrap();
+        assert_eq!((pr.number, pr.title.as_str()), (7, "Retry the upload"));
+        assert_eq!(
+            pr.issues,
+            vec![(12, "Uploads drop".to_string(), String::new())]
+        );
+        // Oldest first; an empty comment and a bare approval say nothing.
+        let order: Vec<usize> = [
+            "ann commented on up.rs:4",
+            "ann commented:",
+            "bo reviewed (changes requested)",
+            "bo commented on up.rs:9",
+        ]
+        .iter()
+        .map(|n| {
+            pr.comments
+                .find(n)
+                .unwrap_or_else(|| panic!("{n} in {}", pr.comments))
+        })
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "{order:?} in {}",
+            pr.comments
+        );
+        assert!(
+            !pr.comments.contains("cy") && !pr.comments.contains("bot"),
+            "{}",
+            pr.comments
+        );
+        // A pull request with none of them still reads.
+        let bare = pr_text(r#"{"number": 3, "title": "t", "body": null}"#, "").unwrap();
+        assert!(bare.issues.is_empty() && bare.comments.is_empty() && bare.body.is_empty());
+    }
+
+    #[test]
+    fn a_pull_requests_words_sit_where_the_cache_wants_them() {
+        let facts = Facts {
+            files: vec![FileFacts {
+                path: "up.rs".into(),
+                blob: "b".into(),
+                since: 1,
+                symbols: vec!["upload".into()],
+                references: Vec::new(),
+                tests: Vec::new(),
+                diff: "+retry\n".into(),
+            }],
+        };
+        let pr = PrText {
+            number: 7,
+            title: "Retry the upload".into(),
+            body: "Retries twice.".into(),
+            issues: vec![(
+                12,
+                "Uploads drop".into(),
+                "They drop on a bad network.".into(),
+            )],
+            comments: "ann commented:\n\nWhy twice?".into(),
+        };
+        let text = facts.render_with(2, Some("ok: 3 passed"), Some(&pr));
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        // What stays the same comes first: the head, the pull request and
+        // its issues, then the files; what changes comes last: the round,
+        // the comments, the gate.
+        assert!(at("# The change's facts") < at("# The pull request, #7"));
+        assert!(at("# The pull request, #7") < at("## Issue #12: Uploads drop"));
+        assert!(at("They drop on a bad network.") < at("up.rs"));
+        assert!(at("up.rs") < at("Round 2."));
+        assert!(at("Round 2.") < at("## The pull request's review comments"));
+        assert!(at("Why twice?") < at("## The test gate"));
+        // A comment added later changes nothing before the round.
+        let mut later = pr.clone();
+        later.comments.push_str("\n\n---\n\nbo commented:\n\nFine.");
+        let after = facts.render_with(2, Some("ok: 3 passed"), Some(&later));
+        assert_eq!(&text[..at("Round 2.")], &after[..at("Round 2.")]);
+        // Without a pull request, the facts are as they were.
+        assert_eq!(
+            facts.render_with(2, Some("ok"), None),
+            facts.render(2, Some("ok"))
+        );
+        // A long description is cut, and says so.
+        let mut long = pr.clone();
+        long.body = "x".repeat(MAX_PR_TEXT + 10);
+        let cut_text = facts.render_with(1, None, Some(&long));
+        assert!(cut_text.contains(&format!("(cut here: {} bytes in all)", MAX_PR_TEXT + 10)));
     }
 
     #[test]
