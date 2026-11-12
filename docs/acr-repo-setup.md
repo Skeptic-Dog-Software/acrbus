@@ -321,12 +321,26 @@ since by then it holds the change's context.
   for a gateway in between that forwards only some of them: the
   `x-session-affinity` header; `x-bf-eh-x-session-affinity`, which Bifrost
   forwards as `x-session-affinity`, unless its allowlist leaves it out;
-  and the request's `user`, in an OpenAI chat request that sets none. Each
-  turn's cached prompt tokens, where the response says, are in the run's
-  stderr (`acrbus bridge log <agent> <id> --stderr`), as `acrbus cache:`
-  lines. pi rounds a thinking level its model doesn't have to one it does,
-  and says so there as `acrbus effort:`: GLM 5.3 on Fireworks has `low`,
-  `high` and `max`, so `medium` runs as `high`. `acrbus acr judge-check
+  and the request's `user`, in an OpenAI chat request that sets none.
+
+  Every role's pi call loads that extension, and its stderr (`acrbus bridge
+  log <agent> <id> --stderr`) says, for each turn, what the cache served,
+  from pi's own usage, which a provider reports in the response body:
+  `acrbus cache: turn 2: 12288 of 13644 prompt tokens read from the cache
+  (1356 fresh, 0 written, 150 out)`. Hits come in whole blocks. A provider
+  that also counts them in a response header gets a `response` line as
+  well. Each call's first turn goes into its usage, so progress and `acrbus
+  acr usage` show whether it read the warmed prefix. A cache-write count of
+  0 on every call says nothing: some providers, Fireworks among them, don't
+  report writes.
+
+  pi rounds a thinking level its model doesn't have to one it does, and
+  says so there as `acrbus effort:`: GLM 5.3 on Fireworks has `low`, `high`
+  and `max`, so `medium` runs as `high`. Where the provider echoes what it
+  applied, as Fireworks does in `fireworks-conversation-options`, a second
+  `acrbus effort:` line says so, once a call, such as `the provider applied
+  reasoning_effort high`. On GLM 5.3 Flash, `--thinking off` still reports
+  `reasoning_effort low`: off isn't off there. `acrbus acr judge-check
   --per-finding` sets per-finding verdicts against per-lens ones on a key,
   before you switch.
 - **Fewer turns.** A reviewer's cost is mostly what each turn reads again:

@@ -13,7 +13,7 @@ max_concurrent = 3
 [env]
 # A review's prompt leaves out pi's pointer to its own docs, which pi says
 # are for questions about pi itself: "0" keeps it. acrbus's extension, which
-# every review call gets while this is on, does it.
+# every review call gets, does it.
 ACRBUS_DROP_PI_DOCS = "1"
 
 [options]

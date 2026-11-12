@@ -83,9 +83,10 @@ const ALLOWED_TOOLS_ENV: &str = "ACRBUS_ALLOWED_TOOLS";
 /// What a review's call to pi is told its thinking level was asked as, so
 /// the extension can say when pi rounds it to one the model has.
 const EFFORT_ENV: &str = "ACRBUS_EFFORT";
-/// "1" in a pi bridge's env, as its kind's defaults set it: acrbus's
-/// extension leaves pi's pointer to its own docs out of a review's prompt.
-const DROP_DOCS_ENV: &str = "ACRBUS_DROP_PI_DOCS";
+/// Set on every review's call to pi: the extension says, for each of its
+/// model calls, what the prompt cache served, from pi's own usage, and the
+/// effort the provider says it applied.
+const TURNS_ENV: &str = "ACRBUS_TURNS";
 /// acrbus's extension for pi, which sends the cache key where a gateway
 /// passes it on, says what the cache served, and holds a call to its tools.
 const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
@@ -1353,7 +1354,7 @@ fn kill_tree(pid: i32, gone: impl Fn() -> bool) {
 }
 
 /// When a process started, which tells it from a later one with its ID.
-fn process_started(pid: i32) -> Option<String> {
+pub(crate) fn process_started(pid: i32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .stdin(Stdio::null())
@@ -1554,6 +1555,9 @@ pub struct LiveTokens {
     /// What its agent says it cost so far, in US dollars, if it says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd: Option<f64>,
+    /// Its first model call alone: what that turn read from a cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn: Option<crate::proto::TurnUsage>,
 }
 
 impl LiveTokens {
@@ -1564,6 +1568,7 @@ impl LiveTokens {
             cache_write: u.cache_write_tokens,
             output: u.output_tokens,
             usd: u.usd,
+            first_turn: u.first_turn,
         }
     }
 
@@ -3070,10 +3075,10 @@ impl Bridge {
                 args.push("--append-system-prompt".into());
                 args.push(path.display().to_string());
             }
-            let drops_docs = self.cfg.env.get(DROP_DOCS_ENV).is_some_and(|v| v == "1");
-            if kind == Kind::Pi
-                && (plan.cache_key.is_some() || plan.allowed_tools.is_some() || drops_docs)
-            {
+            // Every role's call, so each says what its turns read from the
+            // cache and what effort it ran at, not only those that share a
+            // prefix or are held to their tools.
+            if kind == Kind::Pi {
                 args.push("-e".into());
                 args.push(self.extension()?.display().to_string());
             }
@@ -3102,6 +3107,9 @@ impl Bridge {
         }
         if let Some(effort) = plan.effort.as_ref().filter(|_| kind == Some(Kind::Pi)) {
             command.env(EFFORT_ENV, effort);
+        }
+        if kind == Some(Kind::Pi) {
+            command.env(TURNS_ENV, "1");
         }
         // Anthropic's longer-lived prompt cache, which Claude Code takes by
         // this, for a review's calls, whose prefix outlives five minutes.
@@ -3322,6 +3330,10 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::*;
+
+    /// "1" in a pi bridge's env, as its kind's defaults set it: acrbus's
+    /// extension leaves pi's pointer to its own docs out of a review's prompt.
+    const DROP_DOCS_ENV: &str = "ACRBUS_DROP_PI_DOCS";
     use crate::bus::{Bus, Draft};
     use crate::call;
     use crate::daemon;
@@ -5410,7 +5422,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let facts = root.join("round-1.facts.md");
         fs::write(&facts, "# The change\n\nFACTS-CANARY\n").unwrap();
-        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'key=%s\neffort=%s\nallowed=%s\n' "$ACRBUS_CACHE_KEY" "$ACRBUS_EFFORT" "$ACRBUS_ALLOWED_TOOLS""#;
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'turns=%s\nkey=%s\neffort=%s\nallowed=%s\n' "$ACRBUS_TURNS" "$ACRBUS_CACHE_KEY" "$ACRBUS_EFFORT" "$ACRBUS_ALLOWED_TOOLS""#;
         // pi's own options, its thinking levels too, as its kind gives them.
         let pi = format!(
             "{PI_TOOLS}efforts = [\"low\", \"medium\", \"high\"]\neffort_args = [\"--thinking\", \"{{EFFORT}}\"]\n"
@@ -5427,12 +5439,17 @@ mod tests {
             ..RunOptions::default()
         });
         let reply = rig.reply_to(&rig.ask_with(review));
-        // Without a cache key or a limit, no extension is loaded.
+        // Without a cache key or a limit, as an Orchestrator's or Sizer's
+        // call goes, the extension is still loaded, to say what each turn
+        // read from the cache and what effort it ran at.
         let bare = rig.reply_to(&rig.ask_with(with(RunOptions {
             review: Some(true),
             facts: Some(facts.display().to_string()),
+            effort: Some("medium".into()),
             ..RunOptions::default()
         })));
+        // Not a review's call: no extension, nothing set.
+        let plain = rig.reply_to(&rig.ask_with(with(RunOptions::default())));
         bridge.stop().unwrap();
         let first = crate::setup::SYSTEM_PROMPT.lines().next().unwrap();
         let acr = reply.find(&format!("[{first}")).expect("ACR's prompt");
@@ -5454,12 +5471,19 @@ mod tests {
             reply.contains("[--tools]\n[grep,read]"),
             "every tool's definition: {reply}"
         );
-        assert!(!bare.contains("[-e]"), "{bare}");
+        assert!(reply.contains("turns=1\n"), "{reply}");
+        assert!(bare.contains("[-e]"), "{bare}");
         assert!(
-            bare.contains("key=\n")
-                && bare.contains("effort=\n")
+            bare.contains("turns=1\n")
+                && bare.contains("key=\n")
+                && bare.contains("effort=medium\n")
                 && bare.trim_end().ends_with("allowed="),
             "{bare}"
+        );
+        assert!(!plain.contains("[-e]"), "{plain}");
+        assert!(
+            plain.contains("turns=\n") && plain.contains("key=\n"),
+            "{plain}"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -5547,7 +5571,17 @@ out.shaped = req(chat, {});
 out.shapedSystem = req({ model: "m", system: "s", messages: [] }, {});
 if (handlers.after_provider_response) {
   handlers.after_provider_response({ status: 200, headers: { "fireworks-cached-prompt-tokens": "36812" } });
-  handlers.after_provider_response({ status: 200, headers: {} });
+  handlers.after_provider_response({ status: 200, headers: {
+    "Fireworks-Conversation-Options": '{"reasoning_effort":"high","thinking_mode":"enabled","thinking_budget_tokens":null}' } });
+  handlers.after_provider_response({ status: 200, headers: {
+    "fireworks-conversation-options": '{"reasoning_effort":"low"}' } });
+}
+if (handlers.message_end) {
+  out.userEnd = handlers.message_end({ message: { role: "user", content: "u" } }) ?? null;
+  handlers.message_end({ message: { role: "assistant",
+    usage: { input: 13644, output: 200, cacheRead: 0, cacheWrite: 0 } } });
+  out.end = handlers.message_end({ message: { role: "assistant",
+    usage: { input: 1356, output: 150, cacheRead: 12288, cacheWrite: 0 } } }) ?? null;
 }
 if (handlers.before_agent_start) {
   handlers.before_agent_start({}, { thinkingLevel: "high", model: { id: "glm" } });
@@ -5566,7 +5600,8 @@ console.log(JSON.stringify(out));
             c.arg(dir.join("check.mjs"))
                 .env_remove("ACRBUS_CACHE_KEY")
                 .env_remove("ACRBUS_ALLOWED_TOOLS")
-                .env_remove("ACRBUS_EFFORT");
+                .env_remove("ACRBUS_EFFORT")
+                .env_remove("ACRBUS_TURNS");
             for (k, v) in env {
                 c.env(k, v);
             }
@@ -5579,6 +5614,7 @@ console.log(JSON.stringify(out));
             ("ACRBUS_CACHE_KEY", "acr-r1-0a1b2c"),
             ("ACRBUS_ALLOWED_TOOLS", "read,grep"),
             ("ACRBUS_EFFORT", "medium"),
+            ("ACRBUS_TURNS", "1"),
         ]);
         // The key, as the provider's header and as the one a gateway that
         // forwards only x-bf-eh- headers passes on.
@@ -5592,15 +5628,51 @@ console.log(JSON.stringify(out));
         assert_eq!(all["theirs"], serde_json::Value::Null);
         assert_eq!(all["shaped"]["user"], "acr-r1-0a1b2c");
         assert_eq!(all["shapedSystem"], serde_json::Value::Null);
-        // What the cache served, per turn, when the response says.
+        // What the cache served, by a header that says it, where one does.
         assert!(
-            said.contains("acrbus cache: turn 1: 36812 prompt tokens read from the cache"),
+            said.contains(
+                "acrbus cache: response 1: 36812 prompt tokens read from the cache, by its \
+                 fireworks-cached-prompt-tokens header"
+            ),
             "{said}"
         );
         assert!(
-            !said.contains("turn 2"),
-            "a turn with no count says nothing: {said}"
+            !said.contains("response 2:"),
+            "a response with no count says nothing: {said}"
         );
+        // And per turn from pi's own usage, which the provider's body gives
+        // whatever its headers say: an assistant's turns only.
+        assert!(
+            said.contains(
+                "acrbus cache: turn 1: 0 of 13644 prompt tokens read from the cache (13644 \
+                 fresh, 0 written, 200 out)"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "acrbus cache: turn 2: 12288 of 13644 prompt tokens read from the cache (1356 \
+                 fresh, 0 written, 150 out)"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("turn 3"), "{said}");
+        assert_eq!(
+            all["userEnd"],
+            serde_json::Value::Null,
+            "it changes no message"
+        );
+        assert_eq!(all["end"], serde_json::Value::Null);
+        // The effort the provider says it applied, once a call.
+        assert_eq!(
+            said.matches(
+                "acrbus effort: the provider applied reasoning_effort high, thinking_mode enabled"
+            )
+            .count(),
+            1,
+            "{said}"
+        );
+        assert!(!said.contains("reasoning_effort low"), "once: {said}");
         // A level pi rounded, said once.
         assert_eq!(
             said.matches("asked for thinking medium, which glm doesn't have, so pi uses high")
@@ -5618,6 +5690,26 @@ console.log(JSON.stringify(out));
         // A level pi kept says nothing.
         let (_, kept) = run(&[("ACRBUS_EFFORT", "high")]);
         assert!(!kept.contains("acrbus effort"), "{kept}");
+        // Without ACRBUS_TURNS, a call that shares a prefix still says what
+        // a header counts, but nothing per turn and no applied effort.
+        let (_, keyed) = run(&[("ACRBUS_CACHE_KEY", "k")]);
+        assert!(keyed.contains("acrbus cache: response 1: 36812"), "{keyed}");
+        assert!(
+            !keyed.contains("turn 1") && !keyed.contains("applied"),
+            "{keyed}"
+        );
+        // ACRBUS_TURNS alone, as the Orchestrator's and Sizer's calls get
+        // it: each turn and the applied effort, but no key sent.
+        let (alone, counted) = run(&[("ACRBUS_TURNS", "1")]);
+        assert_eq!(alone["header"], serde_json::Value::Null);
+        assert!(
+            counted.contains("acrbus cache: turn 2: 12288 of 13644"),
+            "{counted}"
+        );
+        assert!(
+            counted.contains("applied reasoning_effort high"),
+            "{counted}"
+        );
         // A list it can't read refuses every tool.
         let (bad, _) = run(&[("ACRBUS_ALLOWED_TOOLS", "read;rm -rf")]);
         assert_eq!(bad["read"]["block"], true);
@@ -5738,11 +5830,11 @@ console.log(JSON.stringify(out));
         assert_eq!(on["env"][DROP_DOCS_ENV].as_str(), Some("1"));
         let off = with_defaults(table("[env]\nACRBUS_DROP_PI_DOCS = \"0\"\n")).unwrap();
         assert_eq!(off["env"][DROP_DOCS_ENV].as_str(), Some("0"));
-        // With it on, every review call gets acrbus's extension, and the
-        // variable that has it drop the docs; a call that isn't a review
-        // gets neither the prompt nor the extension.
+        // Every review call gets acrbus's extension, with the variable that
+        // has it drop the docs or keep them; a call that isn't a review gets
+        // neither the prompt nor the extension.
         let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'drop=%s\n' "$ACRBUS_DROP_PI_DOCS""#;
-        for (value, loads) in [("1", true), ("0", false)] {
+        for value in ["1", "0"] {
             let rig = Rig::new();
             let bridge = rig.start(rig.settings(
                 script,
@@ -5754,7 +5846,7 @@ console.log(JSON.stringify(out));
             })));
             let plain = rig.reply_to(&rig.ask("not a review"));
             bridge.stop().unwrap();
-            assert_eq!(review.contains("[-e]\n["), loads, "{value}: {review}");
+            assert!(review.contains("[-e]\n["), "{value}: {review}");
             assert!(review.contains(&format!("drop={value}")), "{review}");
             assert!(!plain.contains("[-e]"), "{plain}");
         }

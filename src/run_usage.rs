@@ -13,7 +13,7 @@ use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::proto::RunUsage;
+use crate::proto::{RunUsage, TurnUsage};
 
 /// The most files a run's usage is read from, so a session full of files
 /// can't hold up its reply.
@@ -130,7 +130,10 @@ impl UsageFrom {
         let mut priced = true;
         // Calls an agent wrote more than once, by name, the latest kept.
         let mut named: Vec<(String, Value)> = Vec::new();
-        for file in files_under(dir, &matcher) {
+        // In name order, so the first call is the main session's first.
+        let mut files = files_under(dir, &matcher);
+        files.sort();
+        for file in files {
             let from = before.get(&file).copied().unwrap_or(0);
             let Ok(mut f) = File::open(&file) else {
                 continue;
@@ -160,9 +163,19 @@ impl UsageFrom {
                         Some(seen) => seen.1 = record,
                         None => named.push((name, record)),
                     },
-                    None => priced &= self.add(&mut usage, &record),
+                    None => {
+                        if usage.first_turn.is_none() {
+                            usage.first_turn = Some(self.turn(&record));
+                        }
+                        priced &= self.add(&mut usage, &record);
+                    }
                 }
             }
+        }
+        if usage.first_turn.is_none()
+            && let Some((_, record)) = named.first()
+        {
+            usage.first_turn = Some(self.turn(record));
         }
         for (_, record) in &named {
             priced &= self.add(&mut usage, record);
@@ -214,6 +227,22 @@ impl UsageFrom {
             if !usage.opened.iter().any(|f| f == file) {
                 usage.opened.push(file.to_string());
             }
+        }
+    }
+
+    /// One call's tokens.
+    fn turn(&self, record: &Value) -> TurnUsage {
+        let tokens = |path: &Option<String>| -> u64 {
+            path.as_deref()
+                .and_then(|p| at(record, p))
+                .and_then(number)
+                .map_or(0, |n| n.max(0.0).round() as u64)
+        };
+        TurnUsage {
+            input_tokens: tokens(&self.input),
+            output_tokens: tokens(&self.output),
+            cache_read_tokens: tokens(&self.cache_read),
+            cache_write_tokens: tokens(&self.cache_write),
         }
     }
 
@@ -468,6 +497,39 @@ mod tests {
     }
 
     #[test]
+    fn the_first_call_is_kept_apart_to_show_what_its_first_turn_read() {
+        // pi's normalized usage through a gateway: the first turn wrote the
+        // prefix, the second read it, in whole blocks.
+        let d = dir();
+        append(
+            &d.join("session.jsonl"),
+            &[call(13644, 200, 0, 0.002), call(1356, 150, 12288, 0.001)],
+        );
+        let u = jsonl().read(&d, &Before::new()).unwrap();
+        assert_eq!(u.calls, 2);
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (15_000, 12_288));
+        let first = u.first_turn.expect("the first call, on its own");
+        assert_eq!(
+            (
+                first.input_tokens,
+                first.cache_read_tokens,
+                first.output_tokens
+            ),
+            (13_644, 0, 200)
+        );
+        assert_eq!(first.prompt(), 13_644);
+        // A later session file doesn't displace the first one's first call:
+        // files are read in name order.
+        let e = dir();
+        append(&e.join("b.jsonl"), &[call(9, 9, 9, 0.1)]);
+        append(&e.join("a.jsonl"), &[call(205, 104, 37_376, 0.001)]);
+        let v = jsonl().read(&e, &Before::new()).unwrap();
+        assert_eq!(v.first_turn.unwrap().cache_read_tokens, 37_376);
+        fs::remove_dir_all(&d).unwrap();
+        fs::remove_dir_all(&e).unwrap();
+    }
+
+    #[test]
     fn a_kept_session_counts_only_what_the_run_added() {
         let d = dir();
         let session = d.join("s.jsonl");
@@ -562,6 +624,8 @@ mod tests {
             "a's last line counts"
         );
         assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (200, 10));
+        // The first message's own figures, as last written.
+        assert_eq!(u.first_turn.map(|f| f.output_tokens), Some(7));
         fs::remove_dir_all(&d).unwrap();
     }
 

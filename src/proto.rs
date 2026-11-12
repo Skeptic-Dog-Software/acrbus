@@ -193,6 +193,29 @@ pub struct RunUsage {
     /// reviewers open, to give the next round's in the facts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opened: Vec<String>,
+    /// The first model call's own figures: what a run's first turn read
+    /// from a prompt cache, which says whether a warm-up worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn: Option<TurnUsage>,
+}
+
+/// One model call's tokens, by the agent's own record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnUsage {
+    /// Input that wasn't read from a cache.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+impl TurnUsage {
+    /// The whole prompt: fresh, read from a cache and written to one.
+    pub fn prompt(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
 }
 
 /// The options a run actually had.
