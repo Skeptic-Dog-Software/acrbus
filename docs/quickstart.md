@@ -208,9 +208,9 @@ feedback for `acr calibrate`.
 
 With a Grayboard team server, the questions also come to your phone, through
 Grayboard's Slack app, and replying in their thread answers them: `acrbus
-grayboard login --server <url>`, then restart the bus. The README's
-[Grayboard section](../README.md#grayboard-answer-from-your-phone) says how
-to reply, and what the server's operator registers first.
+grayboard login --server <url>`, then restart the bus.
+[Grayboard](grayboard.md) says how to reply, and what the server's operator
+registers first.
 
 The gates:
 
@@ -277,7 +277,7 @@ not yet folded in.
 
 ## What runs where
 
-- **The harness** runs the config's test commands, `tests.setup`,
+- **acrbus** runs the config's test commands, `tests.setup`,
   `tests.command` and `tests.coverage`, in copies of the repository. They
   run in the environment of whoever ran `acrbus acr run`: your PATH, your
   HOME, your caches.

@@ -31,7 +31,7 @@ best when they can run things: give the reviewer binding a shell and the
 writing tools, as `acrbus setup acr` does. A reviewer with them works in a
 copy of its own, so nothing it does reaches the checkout. What guides it
 beyond that is ACR's system prompt, which every role gets through its
-bridge: see "The system prompt" in the README. The probes stage,
+bridge: it's in [src/acr/system-prompt.md](../src/acr/system-prompt.md). The probes stage,
 on by default, needs them: without them it's left out, and `acr validate`
 and `acr plan` say so.
 
@@ -251,9 +251,9 @@ Each reviewer gets its own lens's part. The `brief` stage covers any lens
 the builder left out. After a fix, the steelman briefs the next round,
 since by then it holds the change's context.
 
-## 5b. What the harness does, so the config needn't
+## 5b. What acrbus does, so the config needn't
 
-- **Where commands run.** The harness runs `tests.setup`, `tests.command`
+- **Where commands run.** acrbus runs `tests.setup`, `tests.command`
   and `tests.coverage` itself, under `sh -c`, in copies of the repository,
   in the environment of whoever ran the review: their PATH, HOME and
   caches.
@@ -275,7 +275,7 @@ since by then it holds the change's context.
 - **Decided non-issues.** Accepting a proposal puts its non-findings in
   `<name>.not-findings.md`, beside the config, and points `not_findings` at
   it. A proposal needn't name the file.
-- **Shared facts.** Each round, the harness maps the change with tools,
+- **Shared facts.** Each round, acrbus maps the change with tools,
   not models: for each changed file, its definitions the change touches,
   where they're referenced (`git grep`), the tests that name them, and its
   hunks; then the test gate's results. Every reviewer and Judge gets the
@@ -374,7 +374,7 @@ notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
 
 Calibration fits the config to the repository. Whether the reviewers find
 what your most careful review finds is a separate question, for when you
-change the harness, a lens or a model:
+change acrbus, a lens or a model:
 
 1. Take a real change, new work nobody has reviewed. Freeze a key with its
    repository, base, head, a paragraph of what it's for, and the dimensions.
