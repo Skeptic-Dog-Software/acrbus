@@ -119,7 +119,7 @@ the config, for reading a proposal or writing one yourself.
 | `acrbus acr clean` | Clears the copies that finished reviews, checks, the doctor and the configurer left, now rather than at the daemon's cleanup. `--dry-run` lists them, with their size. |
 | `acrbus acr carry` | Carries work that isn't code, such as a document, into git so it can be reviewed. |
 | `acrbus acr check`, `acrbus acr trial` | Checks that a trial can run, then measures a review design on a change whose defects are known. |
-| `acrbus acr judge-check <key>...` | Compares the Judge's rulings with a past review's, as a benchmark. |
+| `acrbus acr judge-check <key>...` | Compares the Judge's rulings with a past review's, as a benchmark. `--first-pass <binding>` also tries a first-pass Judge. |
 | `acrbus grayboard login`, `status`, `logout` | Signs in to a Grayboard team server, so reviews ask you there and claim their changes. See [Grayboard](docs/grayboard.md). |
 
 The method itself is in [the ACR skill](plugin/skills/acr/SKILL.md), and
