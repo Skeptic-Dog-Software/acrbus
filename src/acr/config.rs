@@ -639,7 +639,9 @@ fn framework_defaults() -> Policy {
         human_gate: Some(HumanGate::InTheLoop),
         max_rounds: Some(3),
         review_scope: Some(ReviewScope::WholePr),
-        stages: Some(vec![Stage::Probes]),
+        // Git's word on the changed files costs no call, and saves every
+        // reviewer looking it up; probes, where reviewers can run things.
+        stages: Some(vec![Stage::Context, Stage::Probes]),
         ..Policy::default()
     }
 }
@@ -1391,6 +1393,8 @@ mod tests {
         // Read-only reviewers: off, and saying so, not failing every round.
         let cfg = resolve(&read_only, parse_repo(SMALL).unwrap(), &Flags::default()).unwrap();
         assert!(!probes(&cfg) && cfg.probes_off);
+        // Git's context costs no call, so it's on for both.
+        assert!(cfg.stages.contains(&Stage::Context));
         // A repository that chose stages gets what it chose.
         let cfg = resolve(
             &runs,

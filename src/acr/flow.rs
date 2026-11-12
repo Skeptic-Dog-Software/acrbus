@@ -872,8 +872,13 @@ enum Brief {
 
 /// What attacking a round gives back: each lens's reviewers' findings, and
 /// what its stages noted.
+/// A lens's Judge's answer, if it had findings to judge.
+type Judged = Option<Result<(Usage, Vec<roles::Rating>)>>;
+
+/// Each lens's reviewers' findings, its Judge's answer, and its notes.
 type Attacked = (
     BTreeMap<String, Vec<Result<Vec<Raw>>>>,
+    BTreeMap<String, Judged>,
     BTreeMap<String, Vec<String>>,
 );
 
@@ -1103,85 +1108,145 @@ fn attack(
     let parallel = cfg.tests.parallel.unwrap_or(2) as usize;
     let checkout = source;
     type Done = (Option<Usage>, Vec<Raw>, Option<String>);
-    let answers: Vec<Result<Done>> = thread::scope(|scope| {
-        let handles: Vec<_> = asks
+    // One reviewer's work: its call, and whatever its stage runs after.
+    let review = |lens: &Lens, brief: &Brief, label: &String| -> Result<Done> {
+        let artifact = artifacts.for_lens(lens);
+        let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
+        let binding = cfg.binding(Role::Reviewer, Some(lens))?;
+        let (prompt, repo) = match brief {
+            Brief::Fail(why) => bail!("{why}"),
+            Brief::Review { prompt, repo }
+            | Brief::Probe { prompt, repo, .. }
+            | Brief::Mutate { prompt, repo, .. } => (prompt, repo),
+        };
+        let call = Call {
+            role: Role::Reviewer,
+            binding_name: name,
+            binding,
+            prompt,
+            artifact: Some(artifact),
+            writes: false,
+            repo: repo.as_path(),
+            label: label.clone(),
+        };
+        let answer = caller.call(&call)?;
+        let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
+        match brief {
+            Brief::Mutate { runs, command, .. } => {
+                let mutants = stages::read_mutants(&answer.text)?;
+                let runner = stages::Runner {
+                    repo: checkout,
+                    dir: runs,
+                    command,
+                    parallel,
+                    limit,
+                };
+                let (found, summary) = stages::run_mutants(&runner, &mutants)?;
+                Ok((Some(usage), found, Some(summary)))
+            }
+            Brief::Probe { kept, before, .. } => {
+                // Kept before its answer is read, so a prober
+                // that answers badly still leaves its probes.
+                let note = before
+                    .as_deref()
+                    .and_then(|before| stages::keep_probes(repo, before, kept));
+                let found = findings_of(caller, cfg, &answer.text, &call)?;
+                Ok((Some(usage), found, note))
+            }
+            _ => {
+                let found = findings_of(caller, cfg, &answer.text, &call)?;
+                Ok((Some(usage), found, None))
+            }
+        }
+    };
+    let judge_name = cfg.binding_name(Role::Judge, None)?;
+    let judge = cfg.binding(Role::Judge, None)?;
+    let main = run.repo.clone();
+    // Each lens's Judge starts once its own reviewers are done, not the
+    // slowest lens's: it sees only its own lens.
+    let rule = |lens: &Lens, results: &[Result<Done>]| -> Judged {
+        let lists: Vec<Vec<Raw>> = results
             .iter()
-            .map(|(lens, brief, label)| {
-                scope.spawn(move || -> Result<Done> {
-                    let artifact = artifacts.for_lens(lens);
-                    let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
-                    let binding = cfg.binding(Role::Reviewer, Some(lens))?;
-                    let (prompt, repo) = match brief {
-                        Brief::Fail(why) => bail!("{why}"),
-                        Brief::Review { prompt, repo }
-                        | Brief::Probe { prompt, repo, .. }
-                        | Brief::Mutate { prompt, repo, .. } => (prompt, repo),
-                    };
-                    let call = Call {
-                        role: Role::Reviewer,
-                        binding_name: name,
-                        binding,
-                        prompt,
-                        artifact: Some(artifact),
-                        writes: false,
-                        repo: repo.as_path(),
-                        label: label.clone(),
-                    };
-                    let answer = caller.call(&call)?;
-                    let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
-                    match brief {
-                        Brief::Mutate { runs, command, .. } => {
-                            let mutants = stages::read_mutants(&answer.text)?;
-                            let runner = stages::Runner {
-                                repo: checkout,
-                                dir: runs,
-                                command,
-                                parallel,
-                                limit,
-                            };
-                            let (found, summary) = stages::run_mutants(&runner, &mutants)?;
-                            Ok((Some(usage), found, Some(summary)))
-                        }
-                        Brief::Probe { kept, before, .. } => {
-                            // Kept before its answer is read, so a prober
-                            // that answers badly still leaves its probes.
-                            let note = before
-                                .as_deref()
-                                .and_then(|before| stages::keep_probes(repo, before, kept));
-                            let found = findings_of(caller, cfg, &answer.text, &call)?;
-                            Ok((Some(usage), found, note))
-                        }
-                        _ => {
-                            let found = findings_of(caller, cfg, &answer.text, &call)?;
-                            Ok((Some(usage), found, None))
-                        }
-                    }
+            .filter_map(|r| r.as_ref().ok().map(|(_, found, _)| found.clone()))
+            .collect();
+        lists.iter().any(|l| !l.is_empty()).then(|| {
+            let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)?;
+            let diff = artifacts.for_lens(lens);
+            let call = Call {
+                role: Role::Judge,
+                binding_name: judge_name,
+                binding: judge,
+                prompt: &prompt,
+                artifact: Some(diff),
+                writes: false,
+                repo: &main,
+                label: format!("{}: the Judge", lens.id),
+            };
+            let answer = caller.call(&call)?;
+            let usage = usage(cfg, &call, input_bytes(&prompt, Some(diff)), &answer);
+            Ok((usage, roles::read_ratings(&answer.text)?))
+        })
+    };
+    let mut groups: Vec<(&Lens, Vec<(&Brief, &String)>)> = Vec::new();
+    for (lens, brief, label) in &asks {
+        match groups.iter_mut().find(|(l, _)| l.id == lens.id) {
+            Some((_, slots)) => slots.push((brief, label)),
+            None => groups.push((lens, vec![(brief, label)])),
+        }
+    }
+    let (review, rule) = (&review, &rule);
+    let done: Vec<(Vec<Result<Done>>, Judged)> = thread::scope(|scope| {
+        let handles: Vec<_> = groups
+            .iter()
+            .map(|(lens, slots)| {
+                scope.spawn(move || {
+                    let reviewers: Vec<_> = slots
+                        .iter()
+                        .map(|(brief, label)| scope.spawn(move || review(lens, brief, label)))
+                        .collect();
+                    let results: Vec<Result<Done>> = reviewers
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(anyhow!("a reviewer's thread died")))
+                        })
+                        .collect();
+                    let judged = rule(lens, &results);
+                    (results, judged)
                 })
             })
             .collect();
         handles
             .into_iter()
             .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(anyhow!("a reviewer's thread died")))
+                h.join().unwrap_or_else(|_| {
+                    (
+                        vec![Err(anyhow!("a lens's thread died"))],
+                        Some(Err(anyhow!("a lens's thread died"))),
+                    )
+                })
             })
             .collect()
     });
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
-    for ((lens, _, _), answer) in asks.iter().zip(answers) {
-        let result = answer.map(|(usage, findings, note)| {
-            if let Some(mut usage) = usage {
-                usage.round = run.round;
-                run.usage.push(usage);
-            }
-            if let Some(note) = note {
-                notes.entry(lens.id.clone()).or_default().push(note);
-            }
-            findings
-        });
-        by_lens.entry(lens.id.clone()).or_default().push(result);
+    let mut judgments: BTreeMap<String, Judged> = BTreeMap::new();
+    for ((lens, _), (results, judged)) in groups.iter().zip(done) {
+        for answer in results {
+            let result = answer.map(|(usage, findings, note)| {
+                if let Some(mut usage) = usage {
+                    usage.round = run.round;
+                    run.usage.push(usage);
+                }
+                if let Some(note) = note {
+                    notes.entry(lens.id.clone()).or_default().push(note);
+                }
+                findings
+            });
+            by_lens.entry(lens.id.clone()).or_default().push(result);
+        }
+        judgments.insert(lens.id.clone(), judged);
     }
-    Ok((by_lens, notes))
+    Ok((by_lens, judgments, notes))
 }
 
 /// The round's warm copy: a copy of the change with the repository's setup
@@ -1903,14 +1968,15 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             return Ok(());
         }
     }
-    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change, copying, &gate_text)?;
+    let (reviews, mut judgments, mut notes) =
+        attack(run, s, caller, &artifacts, change, copying, &gate_text)?;
     if let Some(note) = &warm_note {
         for id in reviews.keys() {
             notes.entry(id.clone()).or_default().push(note.clone());
         }
     }
-    // Each lens's reviewers, then its Judge: the Judges all at once, since
-    // each sees only its own lens.
+    // Each lens's reviewers, then its Judge, which `attack` ran as soon as
+    // that lens's reviewers were done.
     let mut lenses: Vec<(String, &Lens, Round, Vec<Vec<Raw>>)> = Vec::new();
     for (id, results) in reviews {
         let lens = lens_of(cfg, &id)?;
@@ -1933,48 +1999,10 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
         }
         lenses.push((id, lens, round, lists));
     }
-    let judge_name = cfg.binding_name(Role::Judge, None)?;
-    let judge = cfg.binding(Role::Judge, None)?;
-    let repo = run.repo.clone();
-    let artifacts = &artifacts;
-    // A lens's Judge's answer, if it had findings to judge.
-    type Judged = Option<Result<(Usage, Vec<roles::Rating>)>>;
-    let judged: Vec<Judged> = thread::scope(|scope| {
-        let handles: Vec<_> = lenses
-            .iter()
-            .map(|(_, lens, _, lists)| {
-                let repo = repo.as_path();
-                lists.iter().any(|l| !l.is_empty()).then(|| {
-                    scope.spawn(move || -> Result<(Usage, Vec<roles::Rating>)> {
-                        let prompt = roles::judge_prompt(lens, lists, &s.not_findings)?;
-                        let diff = artifacts.for_lens(lens);
-                        let call = Call {
-                            role: Role::Judge,
-                            binding_name: judge_name,
-                            binding: judge,
-                            prompt: &prompt,
-                            artifact: Some(diff),
-                            writes: false,
-                            repo,
-                            label: format!("{}: the Judge", lens.id),
-                        };
-                        let answer = caller.call(&call)?;
-                        let usage = usage(cfg, &call, input_bytes(&prompt, Some(diff)), &answer);
-                        Ok((usage, roles::read_ratings(&answer.text)?))
-                    })
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(anyhow!("a Judge's thread died")))
-                })
-            })
-            .collect()
-    });
+    let judged: Vec<Judged> = lenses
+        .iter()
+        .map(|(id, ..)| judgments.remove(id).flatten())
+        .collect();
     let changed = before.is_some() && caller.fingerprint(&run.repo) != before;
     let lines = stages::changed_lines(&change.diff);
     for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
@@ -4946,6 +4974,42 @@ lenses:
         drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
         assert_ne!(run.status, Status::Waiting);
         assert_eq!(fake.count(Role::Reviewer), 0);
+    }
+
+    #[test]
+    fn a_lens_is_judged_as_soon_as_its_own_reviewers_finish() {
+        // beta's reviewer answers only once alpha's Judge has started: with
+        // every Judge waiting for the slowest lens, it would wait in vain.
+        let cfg = plain("exception", 1, 1);
+        let alpha_judged = std::sync::atomic::AtomicBool::new(false);
+        let saw = std::sync::atomic::AtomicBool::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            use std::sync::atomic::Ordering::SeqCst;
+            Ok(match role {
+                Role::Reviewer if prompt.contains("beta criteria") => {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !alpha_judged.load(SeqCst) && std::time::Instant::now() < until {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    saw.store(alpha_judged.load(SeqCst), SeqCst);
+                    CLEAN.to_string()
+                }
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => {
+                    if prompt.contains("alpha criteria") {
+                        alpha_judged.store(true, SeqCst);
+                    }
+                    rating("Low")
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert!(
+            saw.load(std::sync::atomic::Ordering::SeqCst),
+            "alpha's Judge waited for beta's reviewer"
+        );
+        assert_eq!(run.lenses["alpha"].rounds[0].findings.len(), 1);
     }
 
     #[test]

@@ -210,7 +210,10 @@ tests:
 - **`brief`**: before each round, the Orchestrator writes each lens a brief
   for this change. It covers where to attack and how, as questions to
   settle, not conclusions.
-- **`context`**: every role gets what git says about the changed files.
+- **`context`**: every role gets what git says about the changed files:
+  what earlier commits and the docs say of them, and where their tests and
+  callers are. It's built from git, with no model call, and saves every
+  reviewer looking those up, so it's on by default.
 - **`claims`**, **`mutation`** and **`probes`** are lenses the framework
   adds, and `gate` adds one called `tests`, for what it finds. With the
   gate on, the mutation stage runs inside it, so there's no `mutation`
