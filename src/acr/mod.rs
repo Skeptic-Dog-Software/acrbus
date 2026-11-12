@@ -384,11 +384,11 @@ pub enum AcrCmd {
         /// The answers to `acr ask`'s questions, as a JSON object keyed by
         /// each question's text: the JSON itself, `@<file>`, or `-` to read
         /// it from stdin.
-        #[arg(long, value_name = "JSON", conflicts_with_all = ["fold", "waive", "approve", "fixed"])]
+        #[arg(long, value_name = "JSON", conflicts_with_all = ["fold", "waive", "defer", "approve", "fixed"])]
         answers: Option<String>,
         /// What the review waits for is fixed, in the working tree, by
         /// whoever ran it: the next round attacks the change as it is now.
-        #[arg(long, conflicts_with_all = ["fold", "waive", "approve", "stop"])]
+        #[arg(long, conflicts_with_all = ["fold", "waive", "defer", "approve", "stop"])]
         fixed: bool,
         /// With `--fixed`: a builder's brief for the next round's lenses, on
         /// what the fixes changed.
@@ -400,6 +400,10 @@ pub enum AcrCmd {
         /// Blockers to waive, by ID, with commas.
         #[arg(long, value_delimiter = ',')]
         waive: Vec<String>,
+        /// Blockers to defer to a ticket, by ID, with commas: real, left for
+        /// a follow-up, and drafted as tickets in the review's folder.
+        #[arg(long, value_delimiter = ',')]
+        defer: Vec<String>,
         /// Go on past an escalation, or approve the scope or the result.
         #[arg(long)]
         approve: bool,
@@ -409,6 +413,11 @@ pub enum AcrCmd {
         #[arg(long, value_name = "NUMBER")]
         post_pr: Option<u64>,
     },
+    /// Stop a review now, in one step, whether it's running or waiting for
+    /// a person: its process, if one is driving it, is stopped, which
+    /// cancels its calls; the review ends as stopped and lets go of its
+    /// claim; and what it left is listed. Nothing it left is touched.
+    Stop { run_id: String },
     /// Score a binding set against a commit with known blockers.
     Benchmark {
         #[command(flatten)]
@@ -2013,6 +2022,176 @@ fn cancel_left(paths: &Paths, id: &str) {
     let _ = fs::remove_file(&file);
 }
 
+/// How a review's process is stopped: first as Ctrl-C stops it, which
+/// cancels its calls before it exits; then, if it hasn't gone, as a kill;
+/// and last by force. Each signal gets this long to work.
+const STOP_WAITS: [(libc::c_int, std::time::Duration); 3] = [
+    (libc::SIGINT, std::time::Duration::from_secs(30)),
+    (libc::SIGTERM, std::time::Duration::from_secs(10)),
+    (libc::SIGKILL, std::time::Duration::from_secs(5)),
+];
+
+fn signal_name(signal: libc::c_int) -> &'static str {
+    match signal {
+        libc::SIGINT => "an interrupt",
+        libc::SIGTERM => "a kill",
+        libc::SIGKILL => "a forced kill",
+        _ => "a signal",
+    }
+}
+
+/// Stops the process driving review `id`, if one is, and waits for it to
+/// go. Each signal goes only to the process its mark names, and only while
+/// it's still that one: never by a name or a pattern. The process this
+/// stopped, or None if none was driving it.
+fn stop_live(
+    paths: &Paths,
+    id: &str,
+    waits: &[(libc::c_int, std::time::Duration)],
+) -> Result<Option<i32>> {
+    let Some(pid) = keep::live(paths, id) else {
+        return Ok(None);
+    };
+    for (signal, wait) in waits {
+        if keep::live(paths, id) != Some(pid) {
+            break;
+        }
+        eprintln!(
+            "{APP_NAME}: stopping review {id}: {} to process {pid}, which is running it",
+            signal_name(*signal)
+        );
+        // SAFETY: kill only sends a signal, to the process the mark names
+        // and that was just confirmed to be the review's own.
+        unsafe { libc::kill(pid, *signal) };
+        let until = std::time::Instant::now() + *wait;
+        while std::time::Instant::now() < until && keep::live(paths, id) == Some(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    if keep::live(paths, id) == Some(pid) {
+        bail!(
+            "review {id}'s process {pid} hasn't stopped: it may be stuck in the system. Its \
+             calls may still be at work"
+        );
+    }
+    keep::clear_stale(paths, id);
+    Ok(Some(pid))
+}
+
+/// What a stopped review left, for a person to look at or clear: its kept
+/// files, the copies it worked in, and anything uncommitted in its
+/// checkout, which may hold an Orchestrator's fixes. Nothing here touches
+/// any of it.
+fn left_behind(paths: &Paths, run: &Run) -> String {
+    let id = &run.id;
+    let mut out = format!("{APP_NAME}: what review {id} left, untouched:\n");
+    match keep::kept(paths, id) {
+        Some(kept) => out.push_str(&format!(
+            "- its record and files: {}, kept {} days\n",
+            kept.display(),
+            crate::cleanup::KEEP_DAYS
+        )),
+        None => out.push_str(&format!(
+            "- its record and files: {}\n",
+            run_dir(paths, id).display()
+        )),
+    }
+    let copies: Vec<PathBuf> = fs::read_dir(copies_root(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            crate::util::unstamped(&name).starts_with(id.as_str())
+        })
+        .map(|e| e.path())
+        .collect();
+    if copies.is_empty() {
+        out.push_str("- no copies of the repository\n");
+    } else {
+        out.push_str(&format!(
+            "- {} copy or copies of the repository it worked in, under {}: `{APP_NAME} acr \
+             clean` clears them, or the daemon's cleanup does in {} days\n",
+            copies.len(),
+            copies_root(paths).display(),
+            crate::cleanup::KEEP_DAYS
+        ));
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&run.repo)
+        .args(["status", "--porcelain"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let repo = run.repo.display();
+    match status {
+        Some(text) if !text.trim().is_empty() => {
+            let lines: Vec<&str> = text.lines().collect();
+            let fixes = if run.fixed() || !run.steelmans.is_empty() {
+                "; the Orchestrator's fixes are among them, beside any work of your own"
+            } else {
+                ", which may be your own work"
+            };
+            out.push_str(&format!(
+                "- {} uncommitted change(s) in the checkout {repo}{fixes}:\n",
+                lines.len()
+            ));
+            for line in lines.iter().take(20) {
+                out.push_str(&format!("    {line}\n"));
+            }
+            if lines.len() > 20 {
+                out.push_str(&format!("    and {} more\n", lines.len() - 20));
+            }
+            out.push_str(&format!(
+                "  See them with `git -C {repo} diff` and `git -C {repo} status`. To discard \
+                 them, once you're sure none is yours: `git -C {repo} restore --staged \
+                 --worktree .`, then `git -C {repo} clean -n` to list new files, and `-f` to \
+                 remove them.\n"
+            ));
+        }
+        Some(_) => out.push_str(&format!("- nothing uncommitted in the checkout {repo}\n")),
+        None => out.push_str(&format!("- couldn't read the checkout {repo} with git\n")),
+    }
+    out
+}
+
+/// Writes a ticket draft for each blocker deferred to one, in the review's
+/// folder: `tickets/<finding>.md`, title then body, ready to file. Nothing
+/// is filed. The drafts written.
+fn write_tickets(paths: &Paths, run: &Run) -> Vec<PathBuf> {
+    let drafts = report::tickets(run);
+    if drafts.is_empty() {
+        return Vec::new();
+    }
+    let dir = run_dir(paths, &run.id).join("tickets");
+    if fs::create_dir_all(&dir).is_err() {
+        return Vec::new();
+    }
+    drafts
+        .iter()
+        .filter_map(|t| {
+            let name: String = t
+                .finding
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let path = dir.join(format!("{name}.md"));
+            fs::write(&path, format!("# {}\n\n{}", t.title, t.body))
+                .ok()
+                .map(|()| path)
+        })
+        .collect()
+}
+
 /// Starts a review's progress log in its folder, and says where it is, and
 /// what in its bindings could cut its calls off.
 fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: &str) {
@@ -2037,7 +2216,24 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     save(paths, run, cfg)?;
     // Waiting for you, or over: Grayboard hears, if it's set up.
     grayboard::on_finish(paths, run, cfg);
+    let drafts = write_tickets(paths, run);
     keep::finished(paths, run, true)?;
+    if !drafts.is_empty() {
+        let at = keep::kept(paths, &run.id).map_or_else(
+            || {
+                run_dir(paths, &run.id)
+                    .join("tickets")
+                    .display()
+                    .to_string()
+            },
+            |kept| format!("tickets/ in {}", kept.display()),
+        );
+        eprintln!(
+            "{APP_NAME}: {} blocker(s) deferred to a ticket: a draft of each is in {at}, and in \
+             the report's `tickets`. Nothing was filed.",
+            drafts.len()
+        );
+    }
     let summary = report::report(run, cfg);
     for line in summary.by_role.iter().map(report::RoleUsage::line) {
         eprintln!("{APP_NAME}: {line}");
@@ -2699,10 +2895,13 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let run = kept_run(paths, &run_id)?;
             let rows = report::by_role(&run.usage);
             let repairs = report::repairs(&run.usage);
+            let firsts = report::first_turns(&run.usage);
+            let unreported = report::writes_unreported(&run.usage);
             if json {
                 let out = serde_json::json!({
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
                     "prefixes": run.prefixes, "repairs": repairs,
+                    "first_turns": firsts, "cache_writes_unreported": unreported,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -2714,6 +2913,12 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for r in &repairs {
                     println!("{}", r.line());
+                }
+                for f in &firsts {
+                    println!("{}", f.line());
+                }
+                if unreported {
+                    println!("{}", report::WRITES_UNREPORTED);
                 }
                 if run.usage.iter().any(|u| u.label.is_none()) {
                     println!(
@@ -2742,6 +2947,30 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 println!("{}", serde_json::to_string_pretty(&ask)?);
             }
         }
+        AcrCmd::Stop { run_id } => {
+            not_finished(paths, &run_id)?;
+            if !run_dir(paths, &run_id).join("run.json").exists() {
+                bail!("no review {run_id} here");
+            }
+            run(
+                paths,
+                AcrCmd::Resume {
+                    run_id: run_id.clone(),
+                    answers: None,
+                    fixed: false,
+                    brief: None,
+                    fold: Vec::new(),
+                    waive: Vec::new(),
+                    defer: Vec::new(),
+                    approve: false,
+                    stop: true,
+                    post_pr: None,
+                },
+                None,
+            )?;
+            eprintln!("{APP_NAME}: review {run_id} is stopped.");
+            return Ok(ExitCode::SUCCESS);
+        }
         AcrCmd::Resume {
             run_id,
             answers,
@@ -2749,6 +2978,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             brief,
             fold,
             waive,
+            defer,
             approve,
             stop,
             post_pr,
@@ -2757,13 +2987,19 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let dir = run_dir(paths, &run_id);
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
-            let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
-            if keep::active(paths).contains(&run_id) {
-                bail!(
-                    "review {run_id} is still running in another process: stop that first, \
-                     with Ctrl-C or a kill, which cancels its calls"
-                );
+            if keep::live(paths, &run_id).is_some() {
+                if !stop {
+                    bail!(
+                        "review {run_id} is still running in another process: stop it with \
+                         `{APP_NAME} acr stop {run_id}`, or Ctrl-C where it runs, which cancels \
+                         its calls"
+                    );
+                }
+                stop_live(paths, &run_id, &STOP_WAITS)?;
             }
+            keep::clear_stale(paths, &run_id);
+            // Read after any process driving it has stopped, as it left it.
+            let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
             let _active = keep::active_guard(paths, &run_id)?;
             cancel_left(paths, &run_id);
             let cfg: Config = stored_config(&read("config.json")?)?;
@@ -2820,22 +3056,19 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 check_machine(paths, &cfg, &run.repo, true)?;
             }
-            if !answered && !fixed {
+            // Stopping ends it where it stands, waiting for someone or left
+            // running by a process that's gone.
+            if stop {
+                flow::end_here(&mut run);
+            } else if !answered && !fixed {
                 let decision = Decision {
                     fold,
                     waive,
+                    defer,
                     approve,
                     stop,
                 };
                 flow::decide(&mut run, &decision)?;
-            } else if stop {
-                flow::decide(
-                    &mut run,
-                    &Decision {
-                        stop,
-                        ..Decision::default()
-                    },
-                )?;
             }
             let mut s = setting(paths, &cfg, &run_id, None)?;
             s.description = run.description.clone();
@@ -2863,7 +3096,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
             flow::drive(&mut run, &s, &caller, &reloading)?;
             attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
-            return finish(paths, &run, &cfg, post_pr);
+            let code = finish(paths, &run, &cfg, post_pr)?;
+            if stop {
+                eprint!("{}", left_behind(paths, &run));
+            }
+            return Ok(code);
         }
         AcrCmd::Benchmark { target, known } => {
             let known: Vec<Known> = serde_yaml_ng::from_str(
@@ -4565,6 +4802,7 @@ mod tests {
             brief: None,
             fold: Vec::new(),
             waive: Vec::new(),
+            defer: Vec::new(),
             approve: !stop,
             stop,
             post_pr: None,
@@ -4585,6 +4823,273 @@ mod tests {
         assert!(err.contains("has finished"), "{err}");
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A process standing in for a review's, reaped as it ends so its ID
+    /// isn't held by a zombie. Its pid, and a way to know it's gone.
+    fn stand_in(script: &str) -> (i32, std::sync::mpsc::Receiver<()>) {
+        stand_in_named(script, "sh")
+    }
+
+    /// [`stand_in`], with `name` among the words `ps` shows for it.
+    fn stand_in_named(script: &str, name: &str) -> (i32, std::sync::mpsc::Receiver<()>) {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script, name])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let (done, gone) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = done.send(());
+        });
+        // Long enough for ps to see it as it is.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        (pid, gone)
+    }
+
+    #[test]
+    fn a_reviews_process_is_known_by_its_mark_and_never_by_another_with_its_id() {
+        let paths = paths();
+        let (pid, _gone) = stand_in("exec sleep 30");
+        // Its own mark, with when it started: it's the review's.
+        keep::mark_for(&paths, "r-own", pid, None);
+        assert_eq!(keep::live(&paths, "r-own"), Some(pid));
+        assert!(keep::active(&paths).contains(&"r-own".to_string()));
+        // A mark whose process started at another time names another
+        // process now holding the ID: not the review's.
+        keep::mark_for(&paths, "r-reused", pid, Some("Mon Jan  1 00:00:00 2001"));
+        assert_eq!(keep::live(&paths, "r-reused"), None);
+        // An old mark, with no start time, is trusted only for a process
+        // running an acr command, which `sleep` isn't.
+        keep::mark_for(&paths, "r-old", pid, Some(""));
+        assert_eq!(keep::live(&paths, "r-old"), None);
+        // One that is, as a review started before marks said when, is.
+        let (acr, _acr_gone) = stand_in_named("while :; do sleep 0.2; done", "acr");
+        keep::mark_for(&paths, "r-old-acr", acr, Some(""));
+        assert_eq!(keep::live(&paths, "r-old-acr"), Some(acr));
+        assert_eq!(
+            stop_live(
+                &paths,
+                "r-old-acr",
+                &[(libc::SIGTERM, std::time::Duration::from_secs(5))]
+            )
+            .unwrap(),
+            Some(acr)
+        );
+        // Stopping goes only to the process its mark names.
+        assert_eq!(
+            stop_live(
+                &paths,
+                "r-reused",
+                &[(libc::SIGTERM, std::time::Duration::from_secs(1))]
+            )
+            .unwrap(),
+            None
+        );
+        // SAFETY: signal 0 only asks whether the stand-in still runs.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "left alone");
+        assert_eq!(
+            stop_live(
+                &paths,
+                "r-own",
+                &[(libc::SIGTERM, std::time::Duration::from_secs(5))]
+            )
+            .unwrap(),
+            Some(pid)
+        );
+        assert_eq!(keep::live(&paths, "r-own"), None);
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+    }
+
+    #[test]
+    fn a_process_that_ignores_an_interrupt_is_stopped_by_the_next_signal() {
+        let paths = paths();
+        let (pid, gone) = stand_in("trap '' INT; while :; do sleep 0.2; done");
+        keep::mark_for(&paths, "r-stubborn", pid, None);
+        let started = std::time::Instant::now();
+        let stopped = stop_live(
+            &paths,
+            "r-stubborn",
+            &[
+                (libc::SIGINT, std::time::Duration::from_secs(1)),
+                (libc::SIGTERM, std::time::Duration::from_secs(5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stopped, Some(pid));
+        gone.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the stand-in ended");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "it waited first"
+        );
+        // Its mark, which stopping skips removing, is gone too.
+        assert!(!run_dir(&paths, "r-stubborn").join("pid").exists());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+    }
+
+    #[test]
+    fn a_running_review_stops_in_one_step() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // Mid-round in another process: running, and waiting for nobody.
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-live", "repo": repo, "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "review",
+            "status": "running", "waiting": null, "lenses": {},
+            "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        save(&paths, &run, &cfg).unwrap();
+        let (pid, gone) = stand_in("exec sleep 30");
+        keep::mark_for(&paths, "r-live", pid, None);
+        // Resuming it to go on is refused, and says how to stop it.
+        let on = AcrCmd::Resume {
+            run_id: "r-live".into(),
+            answers: None,
+            fixed: false,
+            brief: None,
+            fold: Vec::new(),
+            waive: Vec::new(),
+            defer: Vec::new(),
+            approve: true,
+            stop: false,
+            post_pr: None,
+        };
+        let err = format!("{:#}", super::run(&paths, on, None).unwrap_err());
+        assert!(err.contains("acr stop r-live"), "{err}");
+        // One command: its process stops, and the review ends, stopped.
+        let code = super::run(
+            &paths,
+            AcrCmd::Stop {
+                run_id: "r-live".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        gone.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("its process ended");
+        let kept = keep::kept(&paths, "r-live").expect("ended, and kept");
+        let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+        let saved = crate::util::packed_file(
+            &kept,
+            &format!("{}/run.json", name.trim_end_matches(".tar.gz")),
+        )
+        .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["status"], "stopped");
+        // Stopping what's already over says so.
+        let err = format!(
+            "{:#}",
+            super::run(
+                &paths,
+                AcrCmd::Stop {
+                    run_id: "r-live".into()
+                },
+                None
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("has finished"), "{err}");
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_stopped_review_says_what_it_left_and_touches_none_of_it() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": "01M7900F4B7PYCJKHYY3AYBZNK", "repo": repo, "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "done",
+            "status": "stopped", "waiting": null, "lenses": {},
+            "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        let clean = left_behind(&paths, &run);
+        assert!(clean.contains("nothing uncommitted"), "{clean}");
+        assert!(clean.contains("no copies"), "{clean}");
+        // An Orchestrator's fix, uncommitted, and a copy it worked in.
+        fs::write(repo.join("a.txt"), "fixed\n").unwrap();
+        fs::write(repo.join("new.txt"), "added\n").unwrap();
+        run.steelmans.push(
+            serde_json::from_value(serde_json::json!({
+                "round": 1, "blockers": [], "done": "fixed it", "declined": [], "pins": [],
+                "tests_done": "", "briefs": {}
+            }))
+            .unwrap(),
+        );
+        let copy = copies_root(&paths).join("20261112T230300Z-01M7900F4B7PYCJKHYY3AYBZNK-r1-x");
+        fs::create_dir_all(&copy).unwrap();
+        let said = left_behind(&paths, &run);
+        assert!(said.contains("2 uncommitted change(s)"), "{said}");
+        assert!(
+            said.contains("the Orchestrator's fixes are among them"),
+            "{said}"
+        );
+        assert!(
+            said.contains(" M a.txt") && said.contains("?? new.txt"),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("git -C {} diff", repo.display())),
+            "{said}"
+        );
+        assert!(said.contains("1 copy or copies"), "{said}");
+        // Untouched.
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "fixed\n");
+        assert!(repo.join("new.txt").exists() && copy.exists());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_blocker_deferred_to_a_ticket_gets_a_draft_in_the_reviews_folder() {
+        let paths = paths();
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-ticket", "repo": "/nowhere", "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "done",
+            "status": "confirmed", "waiting": null,
+            "lenses": {"alpha": {"id": "alpha", "criteria": "c", "done": [], "outcome": "waived", "rounds": [{"round": 1,
+                "reviewers": [], "failures": [], "findings": [{"id": "alpha-r1-1", "title": "a defect",
+                "detail": "why", "file": "a.src", "line": 3, "severity": "High",
+                "action": "blocks", "reason": "It's real.", "state": "deferred",
+                "note": "next sprint"}]}]}},
+            "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        let written = write_tickets(&paths, &run);
+        assert_eq!(written.len(), 1);
+        let text = fs::read_to_string(&written[0]).unwrap();
+        assert!(text.starts_with("# a defect\n\n"), "{text}");
+        assert!(
+            text.contains("`a.src:3`") && text.contains("next sprint"),
+            "{text}"
+        );
+        assert!(text.contains("It's real."), "{text}");
+        assert_eq!(
+            written[0],
+            run_dir(&paths, "r-ticket")
+                .join("tickets")
+                .join("alpha-r1-1.md")
+        );
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
     }
 
     #[test]

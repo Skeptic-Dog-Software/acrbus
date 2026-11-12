@@ -218,6 +218,10 @@ pub enum FindingState {
     /// To be fixed, or was.
     Folded,
     Waived,
+    /// Real, and left for a follow-up: a person deferred it to a ticket,
+    /// with their note, and the review drafts the ticket. It doesn't block
+    /// the change, and isn't waived: it's owed.
+    Deferred,
     /// Doesn't block: logged.
     Logged,
     /// Rejected: dropped, with its reason kept.
@@ -410,6 +414,10 @@ pub struct Usage {
     /// of an answer that couldn't be read as it came.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repaired: Option<Repaired>,
+    /// Its first model call alone, by the agent's count: what the call's
+    /// first turn read from the cache, which shows a warm-up worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn: Option<crate::proto::TurnUsage>,
 }
 
 /// Whose answer a repair put in form: its role, binding and model.
@@ -776,6 +784,8 @@ pub struct Setting<'a> {
 pub struct Decision {
     pub fold: Vec<String>,
     pub waive: Vec<String>,
+    /// Blockers deferred to a ticket: any blocker, since a person decides.
+    pub defer: Vec<String>,
     pub approve: bool,
     pub stop: bool,
 }
@@ -804,9 +814,11 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         fan_out: None,
         first: false,
         repaired: None,
+        first_turn: None,
     };
     match &answer.usage {
         Some(counted) => {
+            usage.first_turn = counted.first_turn;
             usage.tokens_in = counted.input_tokens;
             usage.cache_read = counted.cache_read_tokens;
             usage.cache_write = counted.cache_write_tokens;
@@ -3162,7 +3174,10 @@ fn rate(
 /// Keeps this round's rulings that didn't block, for a later round's same
 /// claim: each finding a Judge ruled on just now, at a place in a file, with
 /// its own title and those of the reviewers' findings at that place. A
-/// ruling carried over is already kept.
+/// ruling carried over is already kept. A blocker's ruling never is, whatever
+/// a person then does with it: folded, waived or deferred to a ticket are
+/// decisions, not rulings, so a later round's same claim is judged again and
+/// takes the state the rules give it.
 fn keep_rulings(
     run: &mut Run,
     lens: &Lens,
@@ -4370,17 +4385,23 @@ fn step(
 }
 
 /// Applies a person's answer at a gate.
+/// Ends a review where it stands, waiting or not: what's left undecided
+/// stays as it is, and the next step records it as stopped.
+pub fn end_here(run: &mut Run) {
+    for e in &mut run.escalations {
+        e.seen = true;
+    }
+    run.stage = Stage::Done;
+}
+
 pub fn decide(run: &mut Run, decision: &Decision) -> Result<()> {
+    if decision.stop {
+        end_here(run);
+        return Ok(());
+    }
     let Some(gate) = run.waiting else {
         bail!("run {} isn't waiting for anyone", run.id);
     };
-    if decision.stop {
-        for e in &mut run.escalations {
-            e.seen = true;
-        }
-        run.stage = Stage::Done;
-        return Ok(());
-    }
     match gate {
         Gate::Escalation | Gate::Scope | Gate::Final => {
             if !decision.approve {
@@ -4404,8 +4425,8 @@ pub fn decide(run: &mut Run, decision: &Decision) -> Result<()> {
     Ok(())
 }
 
-/// Every blocker must be folded in or waived, and only what blocks unless
-/// waived can be waived.
+/// Every blocker must be folded in, waived or deferred to a ticket, and
+/// only what blocks unless waived can be waived.
 fn decide_blockers(run: &mut Run, decision: &Decision) -> Result<()> {
     let open: Vec<String> = run
         .lenses
@@ -4413,14 +4434,17 @@ fn decide_blockers(run: &mut Run, decision: &Decision) -> Result<()> {
         .flat_map(|l| l.blockers())
         .map(|f| f.id.clone())
         .collect();
-    let named = |id: &String| decision.fold.contains(id) || decision.waive.contains(id);
+    let named = |id: &String| {
+        decision.fold.contains(id) || decision.waive.contains(id) || decision.defer.contains(id)
+    };
     if let Some(id) = open.iter().find(|id| !named(id)) {
-        bail!("{id} needs --fold or --waive");
+        bail!("{id} needs --fold, --waive or --defer");
     }
     if let Some(id) = decision
         .fold
         .iter()
         .chain(&decision.waive)
+        .chain(&decision.defer)
         .find(|id| !open.contains(id))
     {
         bail!("{id} isn't an open blocker");
@@ -4431,9 +4455,16 @@ fn decide_blockers(run: &mut Run, decision: &Decision) -> Result<()> {
             continue;
         };
         for f in round.findings.iter_mut() {
-            if decision.waive.contains(&f.id) {
+            if decision.defer.contains(&f.id) {
+                f.state = FindingState::Deferred;
+                f.reason.push_str(" A person deferred it to a ticket.");
+            } else if decision.waive.contains(&f.id) {
                 if f.action != Action::BlocksUnlessWaived {
-                    bail!("{} is {:?}, which can't be waived", f.id, f.severity);
+                    bail!(
+                        "{} is {:?}, which can't be waived: fold it in, or defer it to a ticket",
+                        f.id,
+                        f.severity
+                    );
                 }
                 f.state = FindingState::Waived;
             } else if decision.fold.contains(&f.id) {
@@ -6631,7 +6662,10 @@ lenses:
 
         // Every blocker needs an answer, and a real one.
         let err = resume(&mut run.clone(), &cfg, &c, &fake, Decision::default()).unwrap_err();
-        assert!(err.to_string().contains("--fold or --waive"), "{err}");
+        assert!(
+            err.to_string().contains("--fold, --waive or --defer"),
+            "{err}"
+        );
         let wrong = Decision {
             fold: vec![id.clone(), "no-such".into()],
             ..Decision::default()
@@ -6771,6 +6805,33 @@ lenses:
         assert_eq!(run.waiting, Some(Gate::Scope));
         assert_eq!(headers(&run, &cfg), ["Scope", "Fixer"]);
         assert_eq!(fake.count(Role::Reviewer), 0);
+        // The default fixer comes first, marked: an Orchestrator that may
+        // write is it.
+        assert_eq!(run.fixer, Fixer::Orchestrator);
+        let fixer_options = |run: &Run| -> Vec<(String, String)> {
+            super::super::carousel::ask(run, &cfg, "acrbus")
+                .carousels
+                .iter()
+                .flat_map(|c| &c.questions)
+                .find(|q| q.header == "Fixer")
+                .map(|q| {
+                    q.options
+                        .iter()
+                        .map(|o| (o.label.clone(), o.description.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let offered = fixer_options(&run);
+        assert_eq!(offered[0].0, "The Orchestrator", "{offered:?}");
+        assert!(offered[0].1.starts_with("The default."), "{offered:?}");
+        assert!(!offered[1].1.contains("default"), "{offered:?}");
+        // With the session as the default, it comes first instead.
+        let mut theirs = run.clone();
+        theirs.fixer = Fixer::Session;
+        let offered = fixer_options(&theirs);
+        assert_eq!(offered[0].0, "This session", "{offered:?}");
+        assert!(offered[0].1.starts_with("The default."), "{offered:?}");
         let a = answered(
             &run,
             &cfg,
@@ -7061,6 +7122,170 @@ lenses:
             "{brief}"
         );
         let _ = c;
+    }
+
+    #[test]
+    fn a_blocker_deferred_to_a_ticket_neither_blocks_nor_is_waived_and_gets_a_draft() {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (mut run, c) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.waiting, Some(Gate::Fold));
+        // Deferring is a choice, beside fixing; a High blocker can't be
+        // waived, so the question says nothing of waiving.
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Missed"]);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        let q = &ask.carousels[0].questions[0];
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Fix it", "Defer to a ticket", "Not a defect"]);
+        assert!(
+            q.question.contains("\"Defer to a ticket: <your note>\""),
+            "{}",
+            q.question
+        );
+        assert!(!q.question.contains("Waive it"), "{}", q.question);
+        // Typed "Waive it" on what can't be waived is refused, not fixed.
+        let mut tried = run.clone();
+        let waived = answered(&tried, &cfg, &[("Blocker 1", "Waive it".into())]);
+        let err = super::super::carousel::apply(&mut tried, &cfg, &waived, 1).unwrap_err();
+        assert!(format!("{err:#}").contains("can't be waived"), "{err:#}");
+        // Deferred with a note.
+        let a = answered(
+            &run,
+            &cfg,
+            &[(
+                "Blocker 1",
+                "Defer to a ticket: after the release, with the migration".into(),
+            )],
+        );
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        let f = &run.lenses["alpha"].rounds[0].findings[0];
+        assert_eq!(f.state, FindingState::Deferred);
+        assert_eq!(f.note, "after the release, with the migration");
+        assert!(f.reason.ends_with("A person deferred it to a ticket."));
+        assert_eq!(
+            applied.feedback[0].note.as_deref(),
+            Some("Deferred to a ticket: after the release, with the migration")
+        );
+        // It doesn't block: nothing is fixed, and the review ends.
+        let again = c.clone();
+        drive(&mut run, &setting(&cfg), &fake, &|_| Ok(again.clone())).unwrap();
+        assert_eq!(fake.count(Role::Orchestrator), 0, "nothing to fix");
+        assert_ne!(run.status, Status::Waiting);
+        assert_ne!(run.lenses["alpha"].outcome, Outcome::Open);
+        // And a draft says what's owed.
+        let drafts = super::super::report::tickets(&run);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].finding, "alpha-r1-1");
+        assert_eq!(drafts[0].title, "a defect");
+        for want in [
+            "Deferred from review r (round 1, lens alpha)",
+            "`a.src`",
+            "**What was found:**\n\na defect",
+            "after the release, with the migration",
+        ] {
+            assert!(drafts[0].body.contains(want), "{want}: {}", drafts[0].body);
+        }
+        let report = super::super::report::report(&run, &cfg);
+        assert_eq!(report.tickets.len(), 1);
+        assert!(
+            !drafts[0].body.contains("Why it blocked"),
+            "no reason, no section: {}",
+            drafts[0].body
+        );
+    }
+
+    #[test]
+    fn defer_decides_any_blocker_and_waive_still_only_what_can_be() {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let mut waived = run.clone();
+        let err = decide(
+            &mut waived,
+            &Decision {
+                waive: vec!["alpha-r1-1".into()],
+                ..Decision::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("defer it to a ticket"),
+            "{err:#}"
+        );
+        let mut undecided = run.clone();
+        let err = decide(&mut undecided, &Decision::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("--defer"), "{err:#}");
+        let mut deferred = run;
+        decide(
+            &mut deferred,
+            &Decision {
+                defer: vec!["alpha-r1-1".into()],
+                ..Decision::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            deferred.lenses["alpha"].rounds[0].findings[0].state,
+            FindingState::Deferred
+        );
+        assert_eq!(deferred.stage, Stage::Done, "nothing to fix");
+    }
+
+    #[test]
+    fn a_review_ends_where_it_stands_waiting_or_not() {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (mut run, c) = go(&cfg, &["a.src"], &fake);
+        // As a process that was stopped mid-round leaves it: running, and
+        // waiting for nobody.
+        run.status = Status::Running;
+        run.waiting = None;
+        run.stage = Stage::Review;
+        run.escalations.push(Escalation {
+            reason: "unseen".into(),
+            seen: false,
+            about: None,
+        });
+        let err = decide(
+            &mut run.clone(),
+            &Decision {
+                approve: true,
+                ..Decision::default()
+            },
+        );
+        assert!(format!("{:#}", err.unwrap_err()).contains("isn't waiting"));
+        decide(
+            &mut run,
+            &Decision {
+                stop: true,
+                ..Decision::default()
+            },
+        )
+        .unwrap();
+        let again = c.clone();
+        drive(&mut run, &setting(&cfg), &fake, &|_| Ok(again.clone())).unwrap();
+        assert_eq!(run.status, Status::Stopped);
     }
 
     #[test]
@@ -8621,5 +8846,75 @@ lenses:
         });
         assert!(later.skipped_since_attack().is_none());
         assert_eq!(report::outcome_of(&later), "Confirmed");
+    }
+
+    #[test]
+    fn a_blocker_deferred_to_a_ticket_is_never_reused_and_is_judged_again() {
+        let cfg = plain("per-round", 3, 1);
+        let dir = two_files();
+        let fixed = Mutex::new(false);
+        let leak = r#"{"title": "A leak in a", "detail": "d", "file": "a.src", "line": 5}"#;
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => {
+                    if *fixed.lock().unwrap() {
+                        format!(r#"{{"findings": [{leak}]}}"#)
+                    } else {
+                        format!(
+                            r#"{{"findings": [{leak}, {{"title": "Blocker in b", "file": "b.src", "line": 1}}]}}"#
+                        )
+                    }
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => {
+                    let mut out = vec![
+                        r#"{"title": "A leak in a", "file": "a.src", "line": 5, "severity": "High"}"#,
+                    ];
+                    if prompt.contains("Blocker in b") {
+                        out.push(
+                            r#"{"title": "Blocker in b", "file": "b.src", "line": 1, "severity": "High"}"#,
+                        );
+                    }
+                    format!(r#"{{"findings": [{}]}}"#, out.join(", "))
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() = true;
+                    fs::write(dir.join("b.src"), "fixed\n").unwrap();
+                    r#"{"done": "fixed it"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src", "b.src"]);
+        let mut run = start("r", &dir, "main", None, &s, &c, &fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        let first = &run.lenses["alpha"].rounds[0].findings;
+        let id = |title: &str| first.iter().find(|f| f.title == title).unwrap().id.clone();
+        let (leak_id, fix_id) = (id("A leak in a"), id("Blocker in b"));
+        decide(
+            &mut run,
+            &Decision {
+                fold: vec![fix_id],
+                defer: vec![leak_id],
+                ..Decision::default()
+            },
+        )
+        .unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        // The leak was deferred: a decision, not a ruling, so nothing kept it,
+        // and round 2's same claim, on code no fix changed, went to the Judge.
+        assert!(run.rulings.is_empty());
+        assert_eq!(fake.count(Role::Judge), 2);
+        let leak = &run.lenses["alpha"].rounds[1].findings[0];
+        assert_eq!(leak.reused_from, None);
+        // What the rules say: it blocks, open for a person again.
+        assert_eq!(leak.state, FindingState::Open);
+        assert_eq!(
+            run.lenses["alpha"].rounds[0].findings[0].state,
+            FindingState::Deferred
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

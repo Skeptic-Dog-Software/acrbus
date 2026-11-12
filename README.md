@@ -113,7 +113,8 @@ the config, for reading a proposal or writing one yourself.
 | `acrbus acr calibration --accept` | Accepts the proposed config, or your own. That calibrates the repository. |
 | `acrbus acr run` | Reviews a change. |
 | `acrbus acr ask <run id>` | Shows what a review waiting for you asks, as question carousels or `--text`, or, while it runs, where each lens of its round stands. |
-| `acrbus acr resume <run id>` | Answers it (`--answers <json>`), or says your fixes are in (`--fixed`). |
+| `acrbus acr resume <run id>` | Answers it (`--answers <json>`, or `--fold`, `--defer` and `--waive` by blocker), or says your fixes are in (`--fixed`). |
+| `acrbus acr stop <run id>` | Stops a review in one step, running or waiting: its process and calls stop, it ends as stopped, and it says what it left. |
 | `acrbus acr feedback <review id>` | Lists a finished review's findings, for you to say how each did and what it missed. |
 | `acrbus acr calibrate` | Folds your feedback in: the configurer proposes a revised config. |
 | `acrbus acr clean` | Clears the copies that finished reviews, checks, the doctor and the configurer left, now rather than at the daemon's cleanup. `--dry-run` lists them, with their size. |
