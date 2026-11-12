@@ -26,6 +26,7 @@ HOMEBREW_NO_AUTO_UPDATE = "1"
 max_timeout_secs = 14400
 tools = ["Read", "Grep", "Glob", "Bash", "Write", "Edit"]
 tools_args = ["--tools", "{TOOLS}", "--allowedTools", "{TOOLS}"]
+no_tools_args = ["--tools", ""]
 models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
 efforts = ["low", "medium", "high", "xhigh", "max"]
 effort_args = ["--effort", "{EFFORT}"]

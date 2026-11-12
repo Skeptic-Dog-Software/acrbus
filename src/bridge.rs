@@ -59,6 +59,14 @@ const MAX_ATTEMPTS: u32 = 3;
 const TERM_WAIT: Duration = Duration::from_secs(3);
 /// How often a run is checked on.
 const POLL: Duration = Duration::from_millis(50);
+/// How often a running request's tokens so far are read from its session,
+/// for whoever follows it: often enough to see a runaway, seldom enough that
+/// reading a long transcript costs nothing that matters.
+const TOKENS_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(30)
+};
 /// How much of a failed run's stderr goes in its failure reply's text.
 const STDERR_TAIL: usize = 300;
 /// The connection slot of the receiver.
@@ -188,6 +196,11 @@ pub struct Allowed {
     /// An environment variable that gets the same list, for an agent that
     /// enforces it, as a flag can't for every kind of tool.
     pub tools_env: Option<String>,
+    /// Added to the arguments, in place of `tools_args`, when a request asks
+    /// for no tools at all, such as ACR's Sizer deciding from what it's
+    /// given. Left out, a request for no tools is refused.
+    #[serde(default)]
+    pub no_tools_args: Vec<String>,
     /// Session modes a request may choose, besides the agent's own.
     #[serde(default)]
     pub sessions: Vec<SessionMode>,
@@ -624,15 +637,19 @@ impl Settings {
         plan.review = options.review == Some(true);
         if let Some(tools) = &options.tools {
             if tools.is_empty() {
-                return Err("tools can't be empty".into());
-            }
-            if self.options.tools.is_empty() {
+                // Only by flags made for it: an empty list in tools_env could
+                // mean no limit to an agent.
+                if self.options.no_tools_args.is_empty() {
+                    return Err("this agent's config can't run it with no tools".into());
+                }
+                plan.tools = Some(Vec::new());
+            } else if self.options.tools.is_empty() {
                 return Err("this agent's config doesn't let a request choose tools".into());
-            }
-            if let Some(bad) = tools.iter().find(|t| !self.options.tools.contains(t)) {
+            } else if let Some(bad) = tools.iter().find(|t| !self.options.tools.contains(t)) {
                 return Err(format!("tool {bad:?} isn't one this agent's config allows"));
+            } else {
+                plan.tools = Some(tools.clone());
             }
-            plan.tools = Some(tools.clone());
         }
         if let Some(session) = &options.session {
             let mode = [SessionMode::Fresh, SessionMode::PerSender]
@@ -1446,6 +1463,43 @@ struct Running {
     /// milliseconds: what tells a slow run from a stalled one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active: Option<i64>,
+    /// What its agent has recorded it used so far, read from its session
+    /// while it runs, for a bridge that knows where its agent records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens: Option<LiveTokens>,
+}
+
+/// Tokens a running request has used so far, by its agent's own record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveTokens {
+    /// Input that wasn't read from a cache.
+    pub input: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    pub output: u64,
+    /// What its agent says it cost so far, in US dollars, if it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+}
+
+impl LiveTokens {
+    pub fn of(u: &RunUsage) -> LiveTokens {
+        LiveTokens {
+            input: u.input_tokens,
+            cache_read: u.cache_read_tokens,
+            cache_write: u.cache_write_tokens,
+            output: u.output_tokens,
+            usd: u.usd,
+        }
+    }
+
+    /// Those not read from a cache, as a plan estimates: what a run's
+    /// progress counts against it, since cache reads can be many times more.
+    pub fn fresh(&self) -> u64 {
+        self.input + self.cache_write + self.output
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1463,7 +1517,7 @@ impl Report {
 
 /// Where a request stands on a bridge, as its own report says, for a
 /// person following a review.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Standing {
     /// It's running: since when, and when its process tree last used CPU
     /// or changed a file, in Unix milliseconds. The bridge ends it once it
@@ -1472,10 +1526,16 @@ pub enum Standing {
         since: i64,
         active: Option<i64>,
         idle_secs: u64,
+        /// What it has used so far, if its bridge can tell.
+        tokens: Option<LiveTokens>,
     },
     /// The bridge is up but isn't running it: it's waiting for a free
-    /// slot, or has just finished.
-    Waiting { max_concurrent: usize },
+    /// slot, with `running` of `max_concurrent` taken, or has just
+    /// finished.
+    Waiting {
+        max_concurrent: usize,
+        running: usize,
+    },
     /// The bridge isn't running at all.
     Down,
 }
@@ -1490,11 +1550,13 @@ pub fn standing(paths: &Paths, agent: &str, id: &str) -> Standing {
                 since: run.since,
                 active: run.active,
                 idle_secs: settings.as_ref().map_or_else(default_idle, |s| s.idle_secs),
+                tokens: run.tokens,
             },
             None => Standing::Waiting {
                 max_concurrent: settings
                     .as_ref()
                     .map_or_else(default_max_concurrent, |s| s.max_concurrent),
+                running: r.running.len(),
             },
         },
     }
@@ -2637,10 +2699,17 @@ impl Bridge {
                     since: now_ms(),
                     attempt: journal.attempts,
                     active: None,
+                    tokens: None,
                 },
             );
         });
-        let end = self.wait_for(&mut child, msg, plan, &[run_dir, &session_dir])?;
+        let so_far = self
+            .cfg
+            .usage
+            .as_ref()
+            .zip(before.as_ref())
+            .map(|(from, before)| (from, session_dir.as_path(), before));
+        let end = self.wait_for(&mut child, msg, plan, &[run_dir, &session_dir], so_far)?;
 
         // Kept whatever happened, with secrets out, and it's what everything
         // after this reads.
@@ -2818,10 +2887,18 @@ impl Bridge {
                 args.push(expand(arg, &vars)?);
             }
         }
-        if tools.is_some() {
-            for arg in &self.cfg.options.tools_args {
-                args.push(expand(arg, &vars)?);
+        match plan.tools.as_deref() {
+            Some([]) => {
+                for arg in &self.cfg.options.no_tools_args {
+                    args.push(expand(arg, &vars)?);
+                }
             }
+            Some(_) => {
+                for arg in &self.cfg.options.tools_args {
+                    args.push(expand(arg, &vars)?);
+                }
+            }
+            None => {}
         }
         if plan.effort.is_some() {
             for arg in &self.cfg.options.effort_args {
@@ -2879,18 +2956,27 @@ impl Bridge {
     /// Waits for a run to end, and leaves nothing of it running. A run
     /// that goes quiet for `idle_secs` is ended too, but only once a shake
     /// of its process tree shows it's abandoned (see `Quiet`).
+    /// `so_far`: where its agent records what it uses, to report the tokens
+    /// it has used while it runs.
     fn wait_for(
         &self,
         child: &mut Child,
         msg: &Message,
         plan: &Plan,
         dirs: &[&Path],
+        so_far: Option<(
+            &crate::run_usage::UsageFrom,
+            &Path,
+            &crate::run_usage::Before,
+        )>,
     ) -> Result<End> {
         let pid = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(plan.timeout);
         let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
         let mut quiet = Quiet::new(self.cfg.idle_secs, pid, dirs);
         let mut shown = 0;
+        let mut counted: Option<Instant> = None;
+        let mut tokens_shown: Option<LiveTokens> = None;
         let cut_short = loop {
             if exited(pid) {
                 break None;
@@ -2912,6 +2998,20 @@ impl Bridge {
                         run.active = Some(shown);
                     }
                 });
+            }
+            if let Some((from, dir, before)) = so_far
+                && counted.is_none_or(|t| t.elapsed() >= TOKENS_EVERY)
+            {
+                counted = Some(Instant::now());
+                let now = from.read(dir, before).map(|u| LiveTokens::of(&u));
+                if now.is_some() && now != tokens_shown {
+                    tokens_shown = now;
+                    self.report(|r| {
+                        if let Some(run) = r.running.get_mut(&msg.id) {
+                            run.tokens = now;
+                        }
+                    });
+                }
             }
             let stop_at = self.lock_state().stop_at;
             if stop_at.is_some_and(|at| at.elapsed() >= grace) {
@@ -4155,6 +4255,17 @@ mod tests {
             assert!(plan(options.clone()).is_err(), "{options:?}");
         }
 
+        // No tools at all, only where the config says how.
+        let mut bare_tools = generous(&rig, "echo hi");
+        bare_tools.options.no_tools_args = vec!["--no-tools".into()];
+        let none = bare_tools
+            .plan(Some(&RunOptions {
+                tools: Some(Vec::new()),
+                ..RunOptions::default()
+            }))
+            .unwrap();
+        assert_eq!(none.tools, Some(Vec::new()));
+
         // A config that allows nothing refuses all of it, though asking for
         // what the agent has anyway is fine.
         let bare = rig.settings("echo hi", "timeout_secs = 10");
@@ -4435,6 +4546,47 @@ mod tests {
         assert_eq!(applied.tools, None);
         assert_eq!(applied.session, "fresh");
         assert_eq!(applied.timeout, 10);
+    }
+
+    #[test]
+    fn a_running_requests_tokens_so_far_are_in_its_status() {
+        let rig = Rig::new();
+        // Records one call's usage, then works on.
+        let script = r#"echo '{"t":"call","u":{"in":1200,"out":30,"cached":9000,"usd":0.02},"m":"m1"}' > "$1/a.jsonl"; sleep 2; echo done"#;
+        let bridge = rig.start(rig.settings(script, RECORDS_USAGE));
+        let id = rig.ask("work");
+        let live = until("its tokens in status.json", || {
+            let report: Report = read_json(&rig.state().join("status.json"))?;
+            report.running.get(&id)?.tokens
+        });
+        assert_eq!((live.input, live.output, live.cache_read), (1200, 30, 9000));
+        assert_eq!(live.usd, Some(0.02));
+        assert_eq!(live.fresh(), 1230);
+        rig.reply_to(&id);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_request_for_no_tools_runs_with_the_flags_for_none() {
+        let rig = Rig::new();
+        let script = r#"printf '[%s]\n' "$@"; cat"#;
+        let mut cfg = generous(&rig, script);
+        cfg.options.no_tools_args = vec!["--no-tools".into(), "--no-mcp".into()];
+        let bridge = rig.start(cfg);
+        let id = rig.ask_with(with(RunOptions {
+            tools: Some(Vec::new()),
+            ..RunOptions::default()
+        }));
+        let reply = rig.reply_item(&id);
+        bridge.stop().unwrap();
+        let body = &reply.msg.body;
+        assert!(body.contains("[--no-tools]\n[--no-mcp]"), "{body}");
+        assert!(
+            !body.contains("[--tools]"),
+            "the flags for none replace the list: {body}"
+        );
+        let applied = reply.msg.result().unwrap().applied.clone().unwrap();
+        assert_eq!(applied.tools, Some(Vec::new()));
     }
 
     fn call_args(to: &str, timeout: Option<u64>) -> call::Args {
@@ -5488,6 +5640,7 @@ mod tests {
                 since: now_ms() - 600_000,
                 attempt: 1,
                 active: Some(now_ms() - 120_000),
+                tokens: None,
             },
         );
         write_json(&dir.join("status.json"), &report).unwrap();

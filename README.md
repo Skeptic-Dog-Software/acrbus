@@ -78,9 +78,10 @@ estimate before anything runs, and every model call is counted.
 gets an environment of its own, and a watch for going quiet: a run whose
 process tree stops using CPU and writing is woken, and if it can't be,
 ended and tried again in a fresh session. Nothing cuts off a call that's
-working. A review says what each call is doing at least once a minute, and
-stopping a review stops its calls. A failed reviewer or Judge is never
-taken for a clean pass.
+working. A review says what each call is doing at least once a minute,
+with the tokens it has used so far, and the run's total against its plan.
+Stopping a review stops its calls. A failed reviewer or Judge is never
+taken for a clean pass, and a lens with nothing for its Judge says so.
 
 **It keeps reviewers in their lane.** Reviewers read the code under review,
 not your other files, and nothing they do is written back to the
@@ -148,8 +149,9 @@ the config, for reading a proposal or writing one yourself, and
 | `acrbus acr feedback <review id>` | List a finished review's findings, and say how each did and what it missed. |
 | `acrbus acr calibrate` | Fold your feedback into the config: the configurer proposes a revised one. |
 | `acrbus acr run` | Review a change. |
-| `acrbus acr ask <run id>` | What a review waiting for you asks: question carousels, or `--text`. |
+| `acrbus acr ask <run id>` | What a review waiting for you asks: question carousels, or `--text`. Of a review still running, where each lens of its round stands. |
 | `acrbus acr resume <run id>` | Answer it, `--answers <json>`, or say your fixes are in, `--fixed`. |
+| `acrbus acr clean` | Clear the copies finished reviews, checks, the doctor and the configurer left, now rather than at the daemon's cleanup. `--dry-run` lists them, with their size. |
 | `acrbus acr carry` | Carry work that isn't code, such as a document, into git so it can be reviewed. |
 | `acrbus acr check`, `acrbus acr trial` | Check that a trial can run, then measure a review design on a change whose defects are known. |
 | `acrbus acr judge-check <key>...` | Compare the Judge's rulings with a past review's, as a benchmark. |
@@ -252,7 +254,26 @@ ends one that stalls (`idle_secs`). A call asks its bridge for as long as
 the bridge allows, so a binding's `timeout`, if set, is only a cap no call
 should reach. While a review runs, it says on stderr, and in
 `progress.log` in its folder, what each call is doing, at least once a
-minute. A repository's review config can set `allowed_models`, patterns
+minute:
+- how long each call has run, and when its bridge last saw it work;
+- the tokens it has used so far, where its bridge reads its agent's usage:
+  input not read from a cache and output, then cache reads and dollars
+  apart, since an agent's cache reads can be many times the rest;
+- a call waiting for a free slot on a full bridge, how long it has waited,
+  and how many of the bridge's calls are running;
+- the run's total against its plan's estimate, counted the same way, with
+  a warning once a call passes its share of the most the plan allows, or
+  the run passes that most;
+- each round's setup, what each lens's Judge has to rate, and a lens that
+  has none, such as one whose reviewers found nothing.
+
+Where each lens of the round stands is kept in `lenses.json` in the
+review's folder as it moves, and `acr ask` shows it while the review
+runs. The Sizer chooses a tier from the file list, the lines each file
+changes and what the change says it's for, with no tools; it reads the
+change, with its tools, whenever that isn't enough to be sure. Each
+Judge's brief starts with the diff's hunks its findings point at; it
+keeps the whole change and every tool its binding gives. A repository's review config can set `allowed_models`, patterns
 such as `vendor/*`: every binding its reviews would call must name a model
 one matches, or the config is refused. Set in `defaults`, it holds every
 repository that doesn't set its own.
@@ -287,6 +308,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 | `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. Either way, `acrbus bridge status` shows when each running request last used CPU or changed a file, which tells a slow run from a stalled one. |
 | `env`, `secrets` | More environment, and variables read from files only you can read. |
 | `attachments` | `"path"`, the default, tells the agent where each attachment is. `"inline"` puts each one's text in its message, for an agent that can read only its working directory, since attachments are kept outside it. |
+| `options.no_tools_args` | The arguments that run the agent with no tools at all, in place of `tools_args`, when a request asks for none: ACR's Sizer does, for its first look. pi's are `--no-tools --no-mcp`, and Claude Code's `--tools ""`. Left out, a request for no tools is refused. |
 | `log_retention_days` | How long each run's archive is kept. Default 30. See [What's kept](#whats-kept). |
 
 | Placeholder | Is |

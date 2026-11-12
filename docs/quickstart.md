@@ -187,8 +187,14 @@ code says how it ended:
 **Answering a review.** A review that waits for you asks questions.
 `acrbus acr ask <id>` prints them as question carousels, in the JSON shape
 Claude Code's AskUserQuestion takes, and `--text` prints them as a numbered
-list. Answer them all at once, as a JSON object keyed by each question's
-text:
+list. Show every carousel, since a carousel holds four questions at most
+and a review can ask more. Answer them all at once, as a JSON object keyed
+by each question's text, or by `[header] text`, as a refusal names a
+question. No two questions share their text. A question that needs an
+answer and has none, or an answer that's for no question, is refused,
+so nothing is lost. Every logged finding is offered; one that several
+lenses found is offered once, naming the others, and the rejected are
+counted.
 
 ```sh
 acrbus acr ask <id>                                  # or --text
@@ -222,6 +228,10 @@ The gates:
 - **`per-round`** asks at every fold only.
 - **`exception`** asks only for escalations, as for a review nobody
   watches. Trials always run this way.
+
+Approving the result while saying logged findings should block: the
+choice to block wins. They become blockers, and the review goes on to fix
+them rather than end.
 
 The old answers still work: `--approve`, `--stop`, `--fold <ids>` and
 `--waive <ids>`.
@@ -357,7 +367,9 @@ Things that matter for an agent other than Claude Code:
 | exit 3 or 4 | The review is waiting for you: `acrbus acr ask <id>` says what it asks; see the gates in step 8. |
 | exit 1 | Its last line says what's left: fix it and review again. |
 | a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
-| a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, and when it last did anything. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
+| a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, when it last did anything, and its tokens so far; a call waiting for a free slot on its bridge, and for how long; and a lens with nothing for its Judge. `acrbus acr ask <id>` shows where each lens stands. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
+| a round's setup didn't seem to run | Its `warm.log`, in the round's copies, says the command, how it ended and how long it took; progress says `setup: ok`, `failed` or `none configured`, and every reviewer hears of a failed one. |
+| copies take a lot of space | `acrbus acr doctor` counts them; `acrbus acr clean` clears those of finished work now. On macOS they're clones that share blocks with the repository, so they use less disk than their apparent size. |
 | the doctor says a bridge doesn't give its agent ACR's system prompt | If its agent is Claude Code, omp or pi, set `kind` in its table. Otherwise put the placeholder the doctor names in the argument its agent takes a system prompt in. Then restart the bridge. See "The system prompt" in the README. |
 | a call "timed out" | It ran as long as its bridge allows. Raise the bridge's `timeout_secs` and `max_timeout_secs`, and restart it. |
 

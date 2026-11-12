@@ -31,6 +31,9 @@ pub struct Call<'a> {
     pub artifact: Option<&'a Path>,
     /// It may change the working tree: only an Orchestrator fixing.
     pub writes: bool,
+    /// It runs with no tools at all, to answer from what it's given: the
+    /// Sizer's first look. Its bridge refuses it if its agent can't.
+    pub no_tools: bool,
     /// The repository, which every role works in: reviewers read it, and an
     /// Orchestrator fixes it.
     pub repo: &'a Path,
@@ -44,6 +47,9 @@ pub struct Answer {
     pub run_id: String,
     /// What the call used, if its agent said.
     pub usage: Option<RunUsage>,
+    /// How long it took, from sending it to its answer, when the caller
+    /// timed it.
+    pub secs: Option<u64>,
 }
 
 /// How a role reaches its model.
@@ -53,6 +59,10 @@ pub trait Caller: Sync {
     /// Tells a person following the review what it's doing now, such as a
     /// round starting. Calls are reported by the caller itself.
     fn note(&self, _what: &str) {}
+
+    /// Tells a person something that happened, without changing what it
+    /// says it's doing: a lens with nothing for its Judge, say.
+    fn say(&self, _what: &str) {}
 
     /// What the checkout is now, to tell whether a role that may only read
     /// changed it. None if this caller can't say.
@@ -299,6 +309,9 @@ pub struct Usage {
     /// The round it was spent in.
     #[serde(default)]
     pub round: u32,
+    /// How long the call took, from sending it to its answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secs: Option<u64>,
 }
 
 impl Usage {
@@ -472,6 +485,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         agent_usd: None,
         subscription: call.binding.subscription,
         round: 0,
+        secs: answer.secs,
     };
     match &answer.usage {
         Some(counted) => {
@@ -562,11 +576,40 @@ fn ask(
         prompt,
         artifact,
         writes: false,
+        no_tools: false,
         repo: &repo,
         label: what.to_string(),
     };
     let answer = caller.call(&call)?;
     record(run, s.cfg, &call, input_bytes(prompt, artifact), &answer);
+    Ok(answer.text)
+}
+
+/// [`ask`], of a call with no tools and no attachment: it answers from its
+/// prompt alone.
+fn ask_bare(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    role: Role,
+    what: &str,
+    prompt: &str,
+) -> Result<String> {
+    let name = s.cfg.binding_name(role, None)?;
+    let repo = run.repo.clone();
+    let call = Call {
+        role,
+        binding_name: name,
+        binding: s.cfg.binding(role, None)?,
+        prompt,
+        artifact: None,
+        writes: false,
+        no_tools: true,
+        repo: &repo,
+        label: what.to_string(),
+    };
+    let answer = caller.call(&call)?;
+    record(run, s.cfg, &call, input_bytes(prompt, None), &answer);
     Ok(answer.text)
 }
 
@@ -648,21 +691,60 @@ fn choose_tier(
         tier
     } else {
         let described = plan::described_tiers(cfg);
-        let prompt = roles::sizer_prompt(&described, &change.files);
-        let answer = ask(
+        // First from the file list, the size of each change and what the
+        // change says it's for, with no tools: most changes are sized from
+        // that alone, in a fraction of the time.
+        let light = roles::sizer_light_prompt(
+            &described,
+            &change::diffstat(change),
+            s.description.as_deref(),
+            &change.commits,
+        );
+        let quick = ask_bare(
             run,
             s,
             caller,
             Role::Sizer,
-            "the Sizer, choosing a tier",
-            &prompt,
-            Some(artifact),
+            "the Sizer, choosing a tier from the file list",
+            &light,
         )
         .and_then(|text| roles::read_sized(&text));
+        let (answer, how) = match quick {
+            // Only a sure answer: otherwise it reads the change, with its
+            // tools, as it always could.
+            Ok(sized) if sized.sure && sized.tier != roles::UNKNOWN_TIER => {
+                (Ok(sized), "from the file list")
+            }
+            quick => {
+                let why = match quick {
+                    Ok(sized) if sized.tier == roles::UNKNOWN_TIER => {
+                        format!("couldn't tell from the file list ({})", sized.reason)
+                    }
+                    Ok(sized) => format!(
+                        "wasn't sure of {} from the file list ({})",
+                        sized.tier, sized.reason
+                    ),
+                    Err(e) => format!("couldn't answer from the file list ({e:#})"),
+                };
+                caller.say(&format!("the Sizer {why}, so it reads the change"));
+                let prompt = roles::sizer_prompt(&described, &change.files);
+                let full = ask(
+                    run,
+                    s,
+                    caller,
+                    Role::Sizer,
+                    "the Sizer, choosing a tier",
+                    &prompt,
+                    Some(artifact),
+                )
+                .and_then(|text| roles::read_sized(&text));
+                (full, "having read the change")
+            }
+        };
         match answer {
             Ok(sized) => match cfg.tiers.iter().position(|t| t.id == sized.tier) {
                 Some(at) if sized.sure => {
-                    run.tier_why = format!("the Sizer: {}", sized.reason);
+                    run.tier_why = format!("the Sizer, {how}: {}", sized.reason);
                     &cfg.tiers[at]
                 }
                 Some(at) => {
@@ -895,6 +977,96 @@ struct Copying<'a> {
     source: &'a Path,
 }
 
+/// The file in a review's folder that says where each lens of the round
+/// under way stands, written as each moves: for `acr ask` and a person to
+/// see mid-round, when `run.json` is saved only between stages.
+pub const LENS_STATES: &str = "lenses.json";
+
+/// Where each lens of a round stands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LensStates {
+    pub round: u32,
+    pub lenses: BTreeMap<String, LensNow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LensNow {
+    /// `reviewing`, `no findings`, `no usable answer`, `judging`, `judged`
+    /// or `judge failed`.
+    pub state: String,
+    pub reviewers: usize,
+    pub answered: usize,
+    /// When it last moved, in Unix milliseconds.
+    pub at: i64,
+}
+
+/// [`LensStates`], kept in its file as each lens moves.
+struct Board {
+    path: PathBuf,
+    states: std::sync::Mutex<LensStates>,
+}
+
+impl Board {
+    fn new(dir: &Path, round: u32, lenses: &[(&Lens, usize)]) -> Board {
+        let now = crate::util::now_ms();
+        let states = LensStates {
+            round,
+            lenses: lenses
+                .iter()
+                .map(|(l, reviewers)| {
+                    let now = LensNow {
+                        state: "reviewing".into(),
+                        reviewers: *reviewers,
+                        answered: 0,
+                        at: now,
+                    };
+                    (l.id.clone(), now)
+                })
+                .collect(),
+        };
+        let board = Board {
+            path: dir.join(LENS_STATES),
+            states: std::sync::Mutex::new(states),
+        };
+        board.write();
+        board
+    }
+
+    fn change(&self, lens: &str, f: impl FnOnce(&mut LensNow)) {
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(now) = states.lenses.get_mut(lens) {
+                f(now);
+                now.at = crate::util::now_ms();
+            }
+        }
+        self.write();
+    }
+
+    fn answered(&self, lens: &str) {
+        self.change(lens, |l| l.answered += 1);
+    }
+
+    fn set(&self, lens: &str, state: &str) {
+        self.change(lens, |l| l.state = state.to_string());
+    }
+
+    /// Written whole and moved into place, so a reader never sees half.
+    fn write(&self) {
+        let text = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::to_vec_pretty(&*states)
+        };
+        let Ok(text) = text else { return };
+        let part = self
+            .path
+            .with_extension(format!("json.{}", crate::util::new_id()));
+        if fs::write(&part, text).is_ok() && fs::rename(&part, &self.path).is_err() {
+            let _ = fs::remove_file(&part);
+        }
+    }
+}
+
 fn attack(
     run: &mut Run,
     s: &Setting,
@@ -1113,6 +1285,16 @@ fn attack(
     let parallel = cfg.tests.parallel.unwrap_or(2) as usize;
     let checkout = source;
     type Done = (Option<Usage>, Vec<Raw>, Option<String>);
+    // A reviewer's findings, said at once when its answer can't be read,
+    // rather than only when the round ends.
+    let read = |text: &str, call: &Call| -> Result<Vec<Raw>> {
+        findings_of(caller, cfg, text, call).inspect_err(|e| {
+            caller.say(&format!(
+                "{}: its answer couldn't be read: {e:#}",
+                call.label
+            ));
+        })
+    };
     // One reviewer's work: its call, and whatever its stage runs after.
     let review = |lens: &Lens, brief: &Brief, label: &String| -> Result<Done> {
         let artifact = artifacts.for_lens(lens);
@@ -1131,6 +1313,7 @@ fn attack(
             prompt,
             artifact: Some(artifact),
             writes: false,
+            no_tools: false,
             repo: repo.as_path(),
             label: label.clone(),
         };
@@ -1155,11 +1338,11 @@ fn attack(
                 let note = before
                     .as_deref()
                     .and_then(|before| stages::keep_probes(repo, before, kept));
-                let found = findings_of(caller, cfg, &answer.text, &call)?;
+                let found = read(&answer.text, &call)?;
                 Ok((Some(usage), found, note))
             }
             _ => {
-                let found = findings_of(caller, cfg, &answer.text, &call)?;
+                let found = read(&answer.text, &call)?;
                 Ok((Some(usage), found, None))
             }
         }
@@ -1175,8 +1358,15 @@ fn attack(
             .filter_map(|r| r.as_ref().ok().map(|(_, found, _)| found.clone()))
             .collect();
         lists.iter().any(|l| !l.is_empty()).then(|| {
-            let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)?;
             let diff = artifacts.for_lens(lens);
+            // The hunks its findings point at, up front: a start, with the
+            // whole change attached and every tool its binding gives.
+            let hunks = fs::read_to_string(diff)
+                .ok()
+                .and_then(|text| change::hunks_for(&text, lists.iter().flatten()))
+                .map(|h| roles::judge_hunks(&h))
+                .unwrap_or_default();
+            let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)? + &hunks;
             let call = Call {
                 role: Role::Judge,
                 binding_name: judge_name,
@@ -1184,6 +1374,7 @@ fn attack(
                 prompt: &prompt,
                 artifact: Some(diff),
                 writes: false,
+                no_tools: false,
                 repo: &main,
                 label: format!("{}: the Judge", lens.id),
             };
@@ -1199,7 +1390,18 @@ fn attack(
             None => groups.push((lens, vec![(brief, label)])),
         }
     }
-    let (review, rule) = (&review, &rule);
+    let board = Board::new(
+        &s.work_dir,
+        run.round,
+        &groups
+            .iter()
+            .map(|(lens, slots)| (*lens, slots.len()))
+            .collect::<Vec<_>>(),
+    );
+    let (review, rule, board) = (&review, &rule, &board);
+    // Every lens and every reviewer at once, and each lens's Judge as soon as
+    // its own reviewers are done: nothing here limits how many run, so only
+    // a bridge's max_concurrent does, and progress shows a call waiting on it.
     let done: Vec<(Vec<Result<Done>>, Judged)> = thread::scope(|scope| {
         let handles: Vec<_> = groups
             .iter()
@@ -1207,7 +1409,13 @@ fn attack(
                 scope.spawn(move || {
                     let reviewers: Vec<_> = slots
                         .iter()
-                        .map(|(brief, label)| scope.spawn(move || review(lens, brief, label)))
+                        .map(|(brief, label)| {
+                            scope.spawn(move || {
+                                let result = review(lens, brief, label);
+                                board.answered(&lens.id);
+                                result
+                            })
+                        })
                         .collect();
                     let results: Vec<Result<Done>> = reviewers
                         .into_iter()
@@ -1216,7 +1424,29 @@ fn attack(
                                 .unwrap_or_else(|_| Err(anyhow!("a reviewer's thread died")))
                         })
                         .collect();
+                    // A lens with nothing to rate has no Judge: said, so it
+                    // doesn't look like one that never started.
+                    let found = results
+                        .iter()
+                        .any(|r| r.as_ref().is_ok_and(|(_, found, _)| !found.is_empty()));
+                    if found {
+                        board.set(&lens.id, "judging");
+                    } else if results.iter().any(Result::is_ok) {
+                        board.set(&lens.id, "no findings");
+                        caller.say(&format!("{}: no findings, nothing for the Judge", lens.id));
+                    } else {
+                        board.set(&lens.id, "no usable answer");
+                        caller.say(&format!(
+                            "{}: no reviewer's answer could be used, so nothing for the Judge",
+                            lens.id
+                        ));
+                    }
                     let judged = rule(lens, &results);
+                    match &judged {
+                        Some(Ok(_)) => board.set(&lens.id, "judged"),
+                        Some(Err(_)) => board.set(&lens.id, "judge failed"),
+                        None => {}
+                    }
                     (results, judged)
                 })
             })
@@ -1254,35 +1484,102 @@ fn attack(
     Ok((by_lens, judgments, notes))
 }
 
+/// The round's warm copy, and how its setup went.
+struct Warm {
+    /// The copy every other copy this round is made from. None if there's
+    /// no setup, or it failed, so copies start cold.
+    copy: Option<PathBuf>,
+    /// For the round's record: why copies started cold.
+    note: Option<String>,
+    /// For progress: how the setup went.
+    said: String,
+    /// For every reviewer's brief, when the setup failed.
+    brief: Option<String>,
+}
+
 /// The round's warm copy: a copy of the change with the repository's setup
-/// run in it once, for every other copy this round to be made from. None,
-/// with why, if there's no setup or it failed, so copies start cold.
-fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> (Option<PathBuf>, Option<String>) {
-    let (Some(setup), Some(dir)) = (s.cfg.tests.setup.as_deref(), dir) else {
-        return (None, None);
+/// run in it once, for every other copy this round to be made from. Its
+/// `warm.log` says what ran, how it ended and how long it took.
+fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> Warm {
+    let cold = |note: Option<String>, said: String, brief: Option<String>| Warm {
+        copy: None,
+        note,
+        said,
+        brief,
+    };
+    let Some(setup) = s.cfg.tests.setup.as_deref() else {
+        return cold(None, "setup: none configured".into(), None);
+    };
+    let Some(dir) = dir else {
+        return cold(
+            None,
+            "setup: not run, since there's no place for copies".into(),
+            None,
+        );
     };
     let copy = dir
         .join("warm")
         .join(run.repo.file_name().unwrap_or_default());
     let limit = std::time::Duration::from_secs(s.cfg.tests.timeout.unwrap_or(900));
-    let ready = super::change::copy_of(&run.repo, &copy)
-        .and_then(|_| stages::tests_pass(&copy, setup, &[], limit, &dir.join("warm.log")));
-    match ready {
-        Ok(Some(true)) => (Some(copy), None),
-        Ok(Some(false)) => (
-            None,
-            Some("the setup command failed, so copies started cold".into()),
-        ),
-        Ok(None) => (
-            None,
+    let log = dir.join("warm.log");
+    let failed_brief = |how: &str, tail: &str| {
+        let tail = if tail.trim().is_empty() {
+            "It printed nothing.".to_string()
+        } else {
+            format!("Its output ended:\n\n```\n{}\n```", tail.trim_end())
+        };
+        format!(
+            "# The repository's setup failed\n\nBefore your copy was made, its setup command \
+             (`{setup}`) {how}, so what it installs or builds may be missing from your copy. \
+             Install or build what you need yourself, and say so in your answer if you can't \
+             run the tests. {tail}\n\n"
+        )
+    };
+    let ran = super::change::copy_of(&run.repo, &copy)
+        .and_then(|_| stages::run_setup(&copy, setup, limit, &log));
+    match ran {
+        Ok(r) if r.passed == Some(true) => Warm {
+            copy: Some(copy),
+            note: None,
+            said: format!("setup: ok in {}s", r.secs),
+            brief: None,
+        },
+        Ok(r) if r.passed == Some(false) => {
+            let exit = r
+                .code
+                .map_or("killed by a signal".to_string(), |c| format!("exit {c}"));
+            cold(
+                Some("the setup command failed, so copies started cold".into()),
+                format!(
+                    "setup: failed, {exit}, in {}s: see {}",
+                    r.secs,
+                    log.display()
+                ),
+                Some(failed_brief(&format!("failed ({exit})"), &r.tail)),
+            )
+        }
+        Ok(r) => cold(
             Some(format!(
                 "the setup command ran past {} s, so copies started cold",
                 limit.as_secs()
             )),
+            format!(
+                "setup: stopped after {}s, its limit: see {}",
+                r.secs,
+                log.display()
+            ),
+            Some(failed_brief(
+                &format!(
+                    "ran past its limit of {} s and was stopped",
+                    limit.as_secs()
+                ),
+                &r.tail,
+            )),
         ),
-        Err(e) => (
-            None,
+        Err(e) => cold(
             Some(format!("no warm copy, so copies started cold: {e:#}")),
+            format!("setup: not run: {e:#}"),
+            Some(failed_brief(&format!("couldn't run ({e:#})"), "")),
         ),
     }
 }
@@ -1472,6 +1769,7 @@ fn write_tests(
             prompt: &prompt,
             artifact: None,
             writes: true,
+            no_tools: false,
             repo: &repo,
             label: "the test writer".to_string(),
         };
@@ -1674,6 +1972,7 @@ fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> R
         prompt: &prompt,
         artifact: None,
         writes: false,
+        no_tools: false,
         repo: asked.repo,
         label: format!("{}, put in form by the Sizer", asked.label),
     })?;
@@ -1917,14 +2216,17 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             run.round
         ));
     }
-    let (warm, warm_note) = warm_copy(run, s, round_dir.0.as_deref());
-    let source = warm.clone().unwrap_or_else(|| run.repo.clone());
+    let warm = warm_copy(run, s, round_dir.0.as_deref());
+    caller.say(&format!("round {}: {}", run.round, warm.said));
+    let warm_note = warm.note.clone();
+    let source = warm.copy.clone().unwrap_or_else(|| run.repo.clone());
     let copying = Copying {
         dir: round_dir.0.as_deref(),
         source: &source,
     };
-    // What the gate found, for every reviewer this round.
-    let mut gate_text = String::new();
+    // What the gate found, for every reviewer this round, after a failed
+    // setup, which every reviewer is told of too.
+    let mut gate_text = warm.brief.clone().unwrap_or_default();
     // The test gate first. A gap that blocks ends the round before any
     // reviewer runs only if `tests.gate` is `stop`.
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
@@ -1956,7 +2258,7 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
                 }),
             );
         }
-        gate_text = gate_report(&round);
+        gate_text.push_str(&gate_report(&round));
         let lens = run.lenses.get_mut(id).expect("open");
         if round.failures.is_empty() && !blocks {
             lens.outcome = Outcome::Confirmed;
@@ -2285,6 +2587,7 @@ fn fix(
         prompt: &prompt,
         artifact: None,
         writes: true,
+        no_tools: false,
         repo: &repo,
         label: if run.converge {
             format!("the steelman, folding in {} finding(s)", folded.len())
@@ -2837,6 +3140,7 @@ mod tests {
     use super::super::report;
     use super::*;
     use crate::util::new_id;
+    use std::time::{Duration, Instant};
 
     const USER: &str = include_str!("../../examples/acr/user.yaml");
     const NOTHING: &str = r#"{"lenses": [], "escalate": []}"#;
@@ -2909,6 +3213,8 @@ lenses:
         slow: Option<String>,
         /// Each call's label, and each note, in order.
         told: Mutex<Vec<String>>,
+        /// The roles of the calls made with no tools.
+        bare: Mutex<Vec<Role>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -2928,6 +3234,7 @@ lenses:
                 probed: Mutex::new(Vec::new()),
                 slow: None,
                 told: Mutex::new(Vec::new()),
+                bare: Mutex::new(Vec::new()),
             }
         }
 
@@ -2949,6 +3256,9 @@ lenses:
                 .lock()
                 .unwrap()
                 .push(format!("call: {}", call.label));
+            if call.no_tools {
+                self.bare.lock().unwrap().push(call.role);
+            }
             if let Some(path) = call.artifact {
                 self.with_diff.lock().unwrap().push(call.role);
                 let text = fs::read_to_string(path).unwrap_or_default();
@@ -2984,11 +3294,16 @@ lenses:
                 text,
                 run_id: new_id(),
                 usage: self.usage.clone(),
+                secs: None,
             })
         }
 
         fn note(&self, what: &str) {
             self.told.lock().unwrap().push(format!("note: {what}"));
+        }
+
+        fn say(&self, what: &str) {
+            self.told.lock().unwrap().push(format!("say: {what}"));
         }
 
         fn snapshot(&self, _repo: &Path) -> Option<String> {
@@ -5434,5 +5749,575 @@ lenses:
         assert_eq!(score.false_findings.len(), 2, "one phantom in each lens");
         assert!(score.false_findings.iter().all(|f| f.contains("phantom")));
         assert!(score.tokens > 0);
+    }
+
+    fn diffed(files: &[&str]) -> Change {
+        let diff: String = files
+            .iter()
+            .map(|f| {
+                format!("diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n@@ -1,1 +1,2 @@\n+one\n+two\n-old\n")
+            })
+            .collect();
+        Change {
+            files: files.iter().map(|f| f.to_string()).collect(),
+            diff,
+            ..Change::default()
+        }
+    }
+
+    #[test]
+    fn the_sizer_decides_from_the_file_list_with_no_tools() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Sizer if prompt.contains("you have no tools and no diff") => {
+                    r#"{"tier": "small", "sure": true, "reason": "notes only"}"#.into()
+                }
+                Role::Sizer => r#"{"tier": "big", "sure": true, "reason": "read it"}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = diffed(&["notes.txt", "more.txt"]);
+        let run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        assert_eq!(run.tier, "small");
+        assert!(
+            run.tier_why.contains("from the file list"),
+            "{}",
+            run.tier_why
+        );
+        assert_eq!(fake.count(Role::Sizer), 1, "one quick call is enough");
+        assert_eq!(*fake.bare.lock().unwrap(), [Role::Sizer], "with no tools");
+        assert!(
+            !fake.with_diff.lock().unwrap().contains(&Role::Sizer),
+            "and no diff"
+        );
+        let calls = fake.calls.lock().unwrap();
+        let prompt = &calls.iter().find(|c| c.0 == Role::Sizer).unwrap().3;
+        assert!(
+            prompt.contains("- notes.txt (+2 -1)") && prompt.contains("- more.txt (+2 -1)"),
+            "{prompt}"
+        );
+        assert!(run.usage.iter().any(|u| u.role == Role::Sizer));
+    }
+
+    #[test]
+    fn the_sizer_reads_the_change_only_when_the_file_list_cant_tell() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Sizer if prompt.contains("you have no tools and no diff") => {
+                    r#"{"tier": "unknown", "sure": false, "reason": "need the code"}"#.into()
+                }
+                Role::Sizer => r#"{"tier": "big", "sure": true, "reason": "read it"}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = diffed(&["notes.txt"]);
+        let run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        assert_eq!(run.tier, "big");
+        assert!(
+            run.tier_why.contains("having read the change"),
+            "{}",
+            run.tier_why
+        );
+        assert_eq!(fake.count(Role::Sizer), 2);
+        assert!(fake.with_diff.lock().unwrap().contains(&Role::Sizer));
+        let told = fake.told.lock().unwrap();
+        assert!(
+            told.iter().any(|t| t
+                .starts_with("say: the Sizer couldn't tell from the file list (need the code)")),
+            "{told:?}"
+        );
+    }
+
+    /// Calls answered after a wait set by lens, timed: reviewers of later
+    /// lenses take longer, and one lens's reviewer finds nothing.
+    struct Staggered {
+        times: Mutex<Vec<(String, Instant, Instant)>>,
+        said: Mutex<Vec<String>>,
+    }
+
+    impl Caller for Staggered {
+        fn call(&self, call: &Call) -> Result<Answer> {
+            let began = Instant::now();
+            let lens = call.label.split(':').next().unwrap_or_default().to_string();
+            let wait = ["alpha", "beta", "gamma", "delta", "epsilon"]
+                .iter()
+                .position(|l| *l == lens)
+                .unwrap_or(0) as u64
+                * 120;
+            let text = match call.role {
+                Role::Reviewer => {
+                    std::thread::sleep(Duration::from_millis(wait));
+                    if lens == "delta" { CLEAN } else { ONE }.to_string()
+                }
+                Role::Judge => rating("Low"),
+                _ => NOTHING.to_string(),
+            };
+            self.times
+                .lock()
+                .unwrap()
+                .push((call.label.clone(), began, Instant::now()));
+            Ok(Answer {
+                text,
+                run_id: new_id(),
+                usage: None,
+                secs: None,
+            })
+        }
+
+        fn say(&self, what: &str) {
+            self.said.lock().unwrap().push(what.to_string());
+        }
+    }
+
+    #[test]
+    fn each_lens_judge_starts_as_its_own_reviewers_answer_and_one_with_nothing_says_so() {
+        let extra = "  - {id: gamma, criteria: \"gamma criteria\", triggers: {paths: [\"**/*.src\"]}}\n  - {id: delta, criteria: \"delta criteria\", triggers: {paths: [\"**/*.src\"]}}\n  - {id: epsilon, criteria: \"epsilon criteria\", triggers: {paths: [\"**/*.src\"]}}";
+        let cfg = config("exception", 1, 1, extra, "");
+        let caller = Staggered {
+            times: Mutex::new(Vec::new()),
+            said: Mutex::new(Vec::new()),
+        };
+        let s = setting(&cfg);
+        fs::create_dir_all(&s.work_dir).unwrap();
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &caller).unwrap();
+        drive(&mut run, &s, &caller, &|_| Ok(c.clone())).unwrap();
+        let times = caller.times.lock().unwrap().clone();
+        let at = |label: &str| times.iter().find(|t| t.0 == label).cloned();
+        for lens in ["alpha", "beta", "gamma", "epsilon"] {
+            let reviewed = at(&format!("{lens}: reviewer")).unwrap();
+            let judged = at(&format!("{lens}: the Judge"))
+                .unwrap_or_else(|| panic!("{lens}'s Judge never started: {times:?}"));
+            let gap = judged.1.duration_since(reviewed.2);
+            assert!(gap < Duration::from_millis(100), "{lens} waited {gap:?}");
+        }
+        // The first lens's Judge started before the last lens's reviewer
+        // answered: nothing waits on the slowest lens.
+        let first = at("alpha: the Judge").unwrap();
+        let last = at("epsilon: reviewer").unwrap();
+        assert!(first.1 < last.2, "{times:?}");
+        assert!(at("delta: the Judge").is_none());
+        let said = caller.said.lock().unwrap().clone();
+        assert!(
+            said.contains(&"delta: no findings, nothing for the Judge".to_string()),
+            "{said:?}"
+        );
+        // Each lens's state was kept as it moved.
+        let states: LensStates =
+            serde_json::from_str(&fs::read_to_string(s.work_dir.join(LENS_STATES)).unwrap())
+                .unwrap();
+        assert_eq!(states.round, 1);
+        assert_eq!(states.lenses["delta"].state, "no findings");
+        assert_eq!(states.lenses["alpha"].state, "judged");
+        assert!(states.lenses.values().all(|l| l.answered == l.reviewers));
+        let _ = fs::remove_dir_all(&s.work_dir);
+    }
+
+    fn warm_run(setup: &str) -> (Run, PathBuf, Vec<String>, Vec<String>) {
+        use super::super::change::tests::repo_with;
+        let top = if setup.is_empty() {
+            String::new()
+        } else {
+            format!("tests: {{setup: '{setup}'}}")
+        };
+        let cfg = config("exception", 1, 1, "", &top);
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-setup-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let fake = Fake::new(defect_in("nothing", 0));
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let told = fake.told.lock().unwrap().clone();
+        let prompts = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == Role::Reviewer)
+            .map(|c| c.3.clone())
+            .collect();
+        let _ = fs::remove_dir_all(&repo);
+        (run, root, told, prompts)
+    }
+
+    fn warm_log(root: &Path) -> String {
+        let round = fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().contains("-r-r1-"))
+            .expect("the round's copies are kept");
+        fs::read_to_string(round.path().join("warm.log")).unwrap()
+    }
+
+    #[test]
+    fn the_warm_setup_says_how_it_went_in_its_log_and_progress() {
+        let (_, root, told, prompts) = warm_run("true");
+        let log = warm_log(&root);
+        assert!(
+            log.starts_with("$ true\n(it printed nothing)\n# exit 0, in "),
+            "{log}"
+        );
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with("say: round 1: setup: ok in ")),
+            "{told:?}"
+        );
+        assert!(prompts.iter().all(|p| !p.contains("setup failed")));
+        let _ = fs::remove_dir_all(&root);
+        let (_, root, told, _) = warm_run("");
+        assert!(
+            told.contains(&"say: round 1: setup: none configured".to_string()),
+            "{told:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_warm_setup_is_logged_and_told_to_every_reviewer() {
+        let (_, root, told, prompts) = warm_run("echo the cache is gone; exit 3");
+        let log = warm_log(&root);
+        assert!(
+            log.contains("$ echo the cache is gone; exit 3\nthe cache is gone\n# exit 3, in "),
+            "{log}"
+        );
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with("say: round 1: setup: failed, exit 3, in ")),
+            "{told:?}"
+        );
+        assert!(!prompts.is_empty());
+        for p in &prompts {
+            assert!(
+                p.contains("# The repository's setup failed")
+                    && p.contains("failed (exit 3)")
+                    && p.contains("the cache is gone"),
+                "{p}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A run waiting at its final gate, every lens's latest findings set as
+    /// given: (lens, id, state, same_as).
+    fn at_final(findings: &[(&str, &str, FindingState, Option<&str>)]) -> (Config, Run) {
+        let extra =
+            "  - {id: gamma, criteria: \"gamma criteria\", triggers: {paths: [\"**/*.src\"]}}";
+        let cfg = config("in-the-loop", 3, 1, extra, "");
+        let fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.into(),
+                Role::Judge => rating("Low"),
+                _ => NOTHING.into(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        // Past the scope gate, if it asked.
+        while run.waiting == Some(Gate::Scope) {
+            let a = answered(
+                &run,
+                &cfg,
+                &[
+                    ("Scope", "Approve".into()),
+                    ("Fixer", "This session".into()),
+                ],
+            );
+            super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+            drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        }
+        assert_eq!(run.waiting, Some(Gate::Final), "{:?}", run.stage);
+        let template = run.lenses["alpha"].rounds.last().unwrap().findings[0].clone();
+        for l in run.lenses.values_mut() {
+            l.rounds.last_mut().unwrap().findings.clear();
+        }
+        for (lens, id, state, same) in findings {
+            let mut f = template.clone();
+            f.id = id.to_string();
+            f.title = format!("{id} title");
+            f.state = *state;
+            f.same_as = same.map(str::to_string);
+            run.lenses
+                .get_mut(*lens)
+                .unwrap()
+                .rounds
+                .last_mut()
+                .unwrap()
+                .findings
+                .push(f);
+        }
+        (cfg, run)
+    }
+
+    fn logged_questions(run: &Run, cfg: &Config) -> Vec<super::super::carousel::Question> {
+        super::super::carousel::ask(run, cfg, "acrbus")
+            .carousels
+            .iter()
+            .flat_map(|c| c.questions.clone())
+            .filter(|q| q.header.starts_with("Logged"))
+            .collect()
+    }
+
+    #[test]
+    fn logged_questions_never_share_text_and_take_either_key_form() {
+        use FindingState::Logged;
+        let (cfg, mut run) = at_final(&[
+            ("alpha", "a1", Logged, None),
+            ("alpha", "a2", Logged, None),
+            ("beta", "b1", Logged, None),
+            ("beta", "b2", Logged, None),
+            ("gamma", "g1", Logged, None),
+            ("gamma", "g2", Logged, None),
+        ]);
+        let qs = logged_questions(&run, &cfg);
+        assert_eq!(qs.len(), 2);
+        assert_ne!(qs[0].question, qs[1].question);
+        assert!(
+            qs[0].question.starts_with("Logged findings 1-3 of 6"),
+            "{}",
+            qs[0].question
+        );
+        assert!(
+            qs[1].question.starts_with("Logged findings 4-6 of 6"),
+            "{}",
+            qs[1].question
+        );
+        // The first by its text, the second by "[header] text".
+        let mut a = answered(&run, &cfg, &[("Result", "Approve".into())]);
+        a.insert(qs[0].question.clone(), serde_json::json!(["None of them"]));
+        a.insert(
+            format!("[{}] {}", qs[1].header, qs[1].question),
+            serde_json::json!(["b2"]),
+        );
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        let blocked = run.lenses["beta"].rounds.last().unwrap().findings[1].clone();
+        assert!(
+            blocked.blocks() && blocked.state == FindingState::Folded,
+            "{blocked:?}"
+        );
+        assert_eq!(
+            applied
+                .feedback
+                .iter()
+                .filter(|f| f.verdict == Some(super::super::configure::Verdict::ShouldBlock))
+                .count(),
+            1
+        );
+        // Approve and "should block" together: the choice to block wins.
+        assert_eq!(run.stage, Stage::Fix);
+        assert!(
+            applied.notes.iter().any(|n| n.contains("doesn't end yet")),
+            "{:?}",
+            applied.notes
+        );
+    }
+
+    #[test]
+    fn approve_never_ends_a_review_while_a_should_block_is_lost() {
+        use FindingState::Logged;
+        let (cfg, mut run) = at_final(&[
+            ("alpha", "a1", Logged, None),
+            ("beta", "b1", Logged, None),
+            ("beta", "b2", Logged, None),
+            ("gamma", "g1", Logged, None),
+            ("gamma", "g2", Logged, Some("b1")),
+        ]);
+        let qs = logged_questions(&run, &cfg);
+        // Every should-block, picked across both questions.
+        let mut a = answered(&run, &cfg, &[("Result", "Approve".into())]);
+        a.insert(
+            qs[0].question.clone(),
+            serde_json::json!(["a1", "b1", "b2"]),
+        );
+        a.insert(qs[1].question.clone(), serde_json::json!(["g1"]));
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert_eq!(run.stage, Stage::Fix, "it doesn't end confirmed");
+        let blocks: Vec<String> = run
+            .lenses
+            .values()
+            .flat_map(|l| l.rounds.last().unwrap().findings.clone())
+            .filter(|f| f.blocks())
+            .map(|f| f.id)
+            .collect();
+        // g2 is b1 found by gamma too: it blocks with it.
+        assert_eq!(blocks.len(), 5, "{blocks:?}");
+        assert_eq!(applied.feedback.len(), 5);
+        // A question left out, or an answer for no question, is refused.
+        let (cfg, mut run) = at_final(&[("alpha", "a1", Logged, None)]);
+        let only = answered(&run, &cfg, &[("Result", "Approve".into())]);
+        let err = format!(
+            "{:#}",
+            super::super::carousel::apply(&mut run, &cfg, &only, 1).unwrap_err()
+        );
+        assert!(
+            err.contains("need an answer") && err.contains("[Logged]"),
+            "{err}"
+        );
+        let mut stray = only.clone();
+        stray.insert(
+            "Should any of these block?".into(),
+            serde_json::json!(["a1"]),
+        );
+        let err = format!(
+            "{:#}",
+            super::super::carousel::apply(&mut run, &cfg, &stray, 1).unwrap_err()
+        );
+        assert!(err.contains("for no question"), "{err}");
+        assert_eq!(run.waiting, Some(Gate::Final), "nothing was applied");
+    }
+
+    #[test]
+    fn every_upheld_finding_reaches_the_person_however_many() {
+        use FindingState::{Dropped, Logged};
+        let mut found = Vec::new();
+        let ids: Vec<String> = (1..=12).map(|n| format!("f{n}")).collect();
+        for (n, id) in ids.iter().enumerate() {
+            let lens = ["alpha", "beta", "gamma"][n % 3];
+            let same = match n {
+                10 => Some("f1"),
+                11 => Some("f2"),
+                _ => None,
+            };
+            found.push((lens, id.as_str(), Logged, same));
+        }
+        found.push(("beta", "rejected", Dropped, None));
+        let (cfg, run) = at_final(&found);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        for c in &ask.carousels {
+            assert!((1..=4).contains(&c.questions.len()));
+            for q in &c.questions {
+                assert!((2..=4).contains(&q.options.len()), "{q:?}");
+            }
+        }
+        let qs = logged_questions(&run, &cfg);
+        let offered: Vec<String> = qs
+            .iter()
+            .flat_map(|q| q.options.iter().map(|o| o.label.clone()))
+            .filter(|l| l != "None of them")
+            .collect();
+        // Ten shown, f11 and f12 with the findings they repeat.
+        assert_eq!(offered.len(), 10, "{offered:?}");
+        assert!(ids[..10].iter().all(|id| offered.contains(id)));
+        let f1 = qs
+            .iter()
+            .flat_map(|q| &q.options)
+            .find(|o| o.label == "f1")
+            .unwrap();
+        assert!(
+            f1.description.contains("also found by"),
+            "{}",
+            f1.description
+        );
+        assert!(
+            qs[0]
+                .question
+                .contains("2 more are the same defect another lens found")
+                && qs[0].question.contains("1 rejected, not shown"),
+            "{}",
+            qs[0].question
+        );
+        let texts: std::collections::BTreeSet<&String> = ask
+            .carousels
+            .iter()
+            .flat_map(|c| c.questions.iter().map(|q| &q.question))
+            .collect();
+        assert_eq!(
+            texts.len(),
+            ask.carousels
+                .iter()
+                .map(|c| c.questions.len())
+                .sum::<usize>(),
+            "no two share their text"
+        );
+        assert!(ask.carousels.len() > 1);
+        assert!(
+            ask.then
+                .contains(&format!("Show all {} carousel(s)", ask.carousels.len()))
+        );
+    }
+
+    #[test]
+    fn a_judge_starts_from_its_findings_hunks_and_keeps_everything_it_had() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(defect_in("alpha", 99));
+        let s = setting(&cfg);
+        let c = diffed(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let calls = fake.calls.lock().unwrap().clone();
+        let judge = calls
+            .iter()
+            .find(|c| c.0 == Role::Judge)
+            .expect("alpha's Judge");
+        let prompt = &judge.3;
+        assert!(
+            prompt.contains("# Where the findings point, to start from"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("--- a.src\n@@ -1,1 +1,2 @@\n+one\n+two"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("a starting point, not a limit"), "{prompt}");
+        // Its brief is as it was, with the hunks after; the change is still
+        // attached; and it runs with its binding's tools.
+        assert!(prompt.starts_with("Judge these findings"), "{prompt}");
+        assert!(fake.with_diff.lock().unwrap().contains(&Role::Judge));
+        assert!(!fake.bare.lock().unwrap().contains(&Role::Judge));
+    }
+
+    #[test]
+    fn a_slack_reply_answers_each_logged_question_on_its_own_and_none_is_skipped() {
+        use FindingState::Logged;
+        let found = [
+            ("alpha", "a1", Logged, None),
+            ("alpha", "a2", Logged, None),
+            ("beta", "b1", Logged, None),
+            ("beta", "b2", Logged, None),
+            ("gamma", "g1", Logged, None),
+            ("gamma", "g2", Logged, None),
+        ];
+        let (cfg, mut run) = at_final(&found);
+        let qs: Vec<super::super::carousel::Question> =
+            super::super::carousel::ask(&run, &cfg, "acrbus")
+                .carousels
+                .iter()
+                .flat_map(|c| c.questions.clone())
+                .collect();
+        let n = |h: &str| qs.iter().position(|q| q.header == h).unwrap() + 1;
+        let reply = format!(
+            "{}: Approve\n{}: None of them\n{}: b2\n{}: Nothing missed",
+            n("Result"),
+            n("Logged 1"),
+            n("Logged 2"),
+            n("Missed")
+        );
+        let answers = super::super::grayboard::parse(&qs, &reply).unwrap();
+        assert_eq!(answers.len(), 4, "no two answers share a key");
+        super::super::carousel::apply(&mut run, &cfg, &answers, 1).unwrap();
+        assert!(run.lenses["beta"].rounds.last().unwrap().findings[1].blocks());
+        assert_eq!(run.stage, Stage::Fix);
+        // A reply that leaves a Logged question out is refused, not taken as
+        // "none of them".
+        let (cfg, mut run) = at_final(&found);
+        let short =
+            super::super::grayboard::parse(&qs, &format!("{}: Approve", n("Result"))).unwrap();
+        let err = format!(
+            "{:#}",
+            super::super::carousel::apply(&mut run, &cfg, &short, 1).unwrap_err()
+        );
+        assert!(
+            err.contains("need an answer") && err.contains("[Logged 1]"),
+            "{err}"
+        );
     }
 }

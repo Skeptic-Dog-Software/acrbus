@@ -168,6 +168,60 @@ pub fn sizer_prompt(tiers: &[&Tier], files: &[String]) -> String {
     )
 }
 
+/// What the Sizer answers when the file list isn't enough to tell, so the
+/// fuller call follows.
+pub const UNKNOWN_TIER: &str = "unknown";
+
+/// The Sizer's first look: from the changed files, the lines each adds and
+/// removes, and what the change says it's for, with no diff and no tools.
+pub fn sizer_light_prompt(
+    tiers: &[&Tier],
+    stat: &[(String, u64, u64)],
+    description: Option<&str>,
+    commits: &[super::change::Commit],
+) -> String {
+    let rules: String = tiers
+        .iter()
+        .filter_map(|t| {
+            let description = t.rule.description.as_ref()?;
+            Some(format!("- {}: {description}\n", t.id))
+        })
+        .collect();
+    let said: String = match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.chars().take(4000).collect(),
+        None => commits
+            .iter()
+            .map(|c| format!("- {}\n", c.message.lines().next().unwrap_or("(no message)")))
+            .collect::<String>(),
+    };
+    let said = if said.trim().is_empty() {
+        "(nothing given)".to_string()
+    } else {
+        said
+    };
+    let files: String = stat
+        .iter()
+        .take(400)
+        .map(|(path, added, removed)| format!("- {path} (+{added} -{removed})\n"))
+        .collect();
+    let more = stat.len().saturating_sub(400);
+    let more = if more > 0 {
+        format!("- and {more} more\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "Classify a change into one tier, from what's below alone: you have no tools and no \
+         diff, so don't try to read anything. The tiers run from lowest to highest:\n\n\
+         {rules}\n# What the change says it's for\n\n{said}\n\n\
+         # The changed files, with the lines each adds and removes\n\n{files}{more}\n\
+         Answer with only JSON: {{\"tier\": \"<id>\", \"sure\": true or false, \
+         \"reason\": \"<one line>\"}}. If this isn't enough to tell, answer \
+         {{\"tier\": \"{UNKNOWN_TIER}\", \"sure\": false, \"reason\": \"<what you'd need to see>\"}}, \
+         and the diff follows."
+    )
+}
+
 pub fn read_sized(text: &str) -> Result<Sized> {
     json_in(text)
 }
@@ -448,6 +502,19 @@ fn yes() -> bool {
 #[derive(Debug, Deserialize)]
 struct Judged {
     findings: Vec<Rating>,
+}
+
+/// The hunks a Judge's findings point at, added to its brief to start from:
+/// fewer reads to find them, and nothing it can't still do.
+pub fn judge_hunks(hunks: &str) -> String {
+    format!(
+        "\n# Where the findings point, to start from\n\nThe diff's hunks the findings above \
+         name, or the files they mention, with the diff's own lines around them. They're a \
+         starting point, not a limit: the whole change is still attached, and you have every \
+         tool you had. Read callers, tests or other files whenever a finding depends on them.\n\n\
+         ```diff\n{}```\n",
+        hunks
+    )
 }
 
 pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {

@@ -201,6 +201,7 @@ pub fn propose(
             // It fixes nothing: what it writes, running the tests, stays in
             // its own clone, which goes when it's done.
             writes: false,
+            no_tools: false,
             repo: clone,
             label: "the configurer".to_string(),
         })
@@ -721,6 +722,7 @@ mod tests {
                 text,
                 run_id: "r".into(),
                 usage: None,
+                secs: None,
             })
         }
     }

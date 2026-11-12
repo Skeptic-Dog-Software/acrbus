@@ -111,13 +111,22 @@ impl RoleCost {
     pub fn tokens(&self) -> u64 {
         self.tokens_in + self.cache_read + self.tokens_out
     }
+
+    /// Those not read from a cache.
+    pub fn fresh(&self) -> u64 {
+        self.tokens_in + self.tokens_out
+    }
 }
 
 /// What a review could take: always its tokens, and its dollars when they
 /// mean something.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Estimate {
+    /// Every token, cache reads included.
     pub tokens: u64,
+    /// Those not read from a cache: what a run's progress counts against,
+    /// since an agent's cache reads can be many times the rest.
+    pub fresh: u64,
     /// For the calls billed in dollars. None if one of those has no price.
     pub usd: Option<f64>,
 }
@@ -127,18 +136,22 @@ pub struct Estimate {
 #[derive(Debug, Clone, Copy)]
 struct Amount {
     tokens: f64,
+    /// Not read from a cache.
+    fresh: f64,
     usd: Option<f64>,
 }
 
 impl Amount {
     const ZERO: Amount = Amount {
         tokens: 0.0,
+        fresh: 0.0,
         usd: Some(0.0),
     };
 
     fn of(c: &RoleCost) -> Amount {
         Amount {
             tokens: c.tokens() as f64,
+            fresh: c.fresh() as f64,
             usd: if c.subscription { Some(0.0) } else { c.usd },
         }
     }
@@ -146,6 +159,7 @@ impl Amount {
     fn times(self, n: f64) -> Amount {
         Amount {
             tokens: self.tokens * n,
+            fresh: self.fresh * n,
             usd: self.usd.map(|u| u * n),
         }
     }
@@ -153,6 +167,7 @@ impl Amount {
     fn plus(self, other: Amount) -> Amount {
         Amount {
             tokens: self.tokens + other.tokens,
+            fresh: self.fresh + other.fresh,
             usd: all([self.usd, other.usd]),
         }
     }
@@ -160,6 +175,7 @@ impl Amount {
     fn estimate(self) -> Estimate {
         Estimate {
             tokens: self.tokens.round() as u64,
+            fresh: self.fresh.round() as u64,
             usd: self.usd,
         }
     }

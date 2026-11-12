@@ -1240,6 +1240,64 @@ fn run_tests_in(
     log: &Path,
     env: Option<&[(String, String)]>,
 ) -> Result<(Ran, String)> {
+    run_command(dir, command, tests, limit, log, env).map(|(ran, _, tail)| (ran, tail))
+}
+
+/// How a repository's setup command went, for a round's warm copy.
+pub struct SetupRun {
+    /// None: it ran past its limit and was stopped.
+    pub passed: Option<bool>,
+    pub code: Option<i32>,
+    pub secs: u64,
+    /// The last lines of what it printed.
+    pub tail: String,
+}
+
+/// Runs a repository's setup command in `dir`, and leaves its log saying
+/// what ran, how it ended and how long it took, around what it printed,
+/// which for a setup that succeeds quietly is nothing.
+pub fn run_setup(dir: &Path, command: &str, limit: Duration, log: &Path) -> Result<SetupRun> {
+    let started = Instant::now();
+    let (ran, code, tail) = run_command(dir, command, &[], limit, log, None)?;
+    let secs = started.elapsed().as_secs();
+    let printed = fs::read_to_string(log).unwrap_or_default();
+    let ended = match ran {
+        Ran::Passed => "exit 0".to_string(),
+        Ran::Failed => code.map_or("failed, killed by a signal".into(), |c| format!("exit {c}")),
+        Ran::TimedOut => format!("stopped after {} s, its limit", limit.as_secs()),
+    };
+    let printed = match printed.as_str() {
+        "" => "(it printed nothing)\n".to_string(),
+        p if p.ends_with('\n') => printed,
+        _ => format!("{printed}\n"),
+    };
+    fs::write(
+        log,
+        format!("$ {command}\n{printed}# {ended}, in {secs}s\n"),
+    )?;
+    let tail: Vec<&str> = tail.lines().collect();
+    let tail = tail[tail.len().saturating_sub(20)..].join("\n");
+    Ok(SetupRun {
+        passed: match ran {
+            Ran::Passed => Some(true),
+            Ran::Failed => Some(false),
+            Ran::TimedOut => None,
+        },
+        code,
+        secs,
+        tail,
+    })
+}
+
+/// [`run_tests_in`], with the exit code, if it exited.
+fn run_command(
+    dir: &Path,
+    command: &str,
+    tests: &[String],
+    limit: Duration,
+    log: &Path,
+    env: Option<&[(String, String)]>,
+) -> Result<(Ran, Option<i32>, String)> {
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1282,7 +1340,7 @@ fn run_tests_in(
         Some(s) if s.success() => Ran::Passed,
         Some(_) => Ran::Failed,
     };
-    Ok((ran, tail))
+    Ok((ran, status.and_then(|s| s.code()), tail))
 }
 
 /// Changed lines no test runs, from an lcov report, one finding for each
