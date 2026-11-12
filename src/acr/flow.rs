@@ -249,6 +249,12 @@ pub struct Finding {
     /// and fixed with that one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub same_as: Option<String>,
+    /// Its ruling was carried over from this round's, not judged again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<u32>,
+    /// The binding whose Judge ruled it, when a first pass is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruled_by: Option<String>,
 }
 
 impl Finding {
@@ -283,11 +289,30 @@ pub struct LensResult {
     /// and what of it did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub joined: String,
+    /// Rounds it didn't attack because the blast-radius check found the fix
+    /// before them couldn't touch its concern. See `savings.blast_radius`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Skipped>,
+}
+
+/// A round a lens didn't attack, and why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Skipped {
+    pub round: u32,
+    pub reason: String,
 }
 
 impl LensResult {
     fn latest(&self) -> Option<&Round> {
         self.rounds.last()
+    }
+
+    /// The skip since its last attack, if the change as it is now hasn't
+    /// been attacked by it: it hasn't passed this version, whatever its
+    /// outcome says.
+    pub fn skipped_since_attack(&self) -> Option<&Skipped> {
+        let attacked = self.rounds.last().map_or(0, |r| r.round);
+        self.skipped.last().filter(|s| s.round > attacked)
     }
 
     pub fn blockers(&self) -> Vec<&Finding> {
@@ -513,6 +538,156 @@ pub struct Run {
     /// The change's pull request, whose words each round's facts carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
+    /// Rulings that didn't block, kept for a later round's same claim. See
+    /// `savings.reuse_rulings`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<PastRuling>,
+}
+
+/// A Judge's ruling that didn't block, kept so a later round's finding that
+/// makes the same claim, in the same lens, at the same place in a file no
+/// fix has changed, takes it instead of a Judge's call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PastRuling {
+    pub lens: String,
+    pub round: u32,
+    pub file: String,
+    pub line: u64,
+    /// The claim, as its titles normalized: the Judge's own, and those of
+    /// the reviewers' findings it rated at that place.
+    pub claims: Vec<String>,
+    /// The file's content when it was ruled on, by hash.
+    pub file_hash: String,
+    /// What else the ruling rested on, by hash: the lens's text, the decided
+    /// non-issues, the Judge's bindings and the rules.
+    pub context: String,
+    pub rating: roles::Rating,
+}
+
+/// How far, in lines, a later finding may sit from a kept ruling's and
+/// still be the same place, in a file nothing has changed.
+const SAME_PLACE: u64 = 3;
+
+/// A claim's title, for matching: its letters and digits, lowercased and
+/// single-spaced.
+pub(super) fn claim_key(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A file's content, by hash, in the tree a round reads. None when it can't
+/// be read, which never matches.
+fn file_hash(tree: &Path, file: &str) -> Option<String> {
+    let bytes = fs::read(tree.join(file)).ok()?;
+    Some(super::calibration::hash(&[&String::from_utf8_lossy(
+        &bytes,
+    )]))
+}
+
+/// What a lens's rulings rest on besides the finding and its file: a
+/// change to any of it means judging again.
+fn ruling_context(cfg: &Config, lens: &Lens, not_findings: &str, rules: &str) -> String {
+    let judge = cfg.binding_name(Role::Judge, None).unwrap_or_default();
+    let model = cfg
+        .binding(Role::Judge, None)
+        .ok()
+        .and_then(|b| b.model.clone())
+        .unwrap_or_default();
+    let first = cfg.savings.first_pass_judge.as_deref().unwrap_or_default();
+    super::calibration::hash(&[
+        &lens.id,
+        &lens.criteria,
+        lens.blocker.as_deref().unwrap_or_default(),
+        lens.attack.as_deref().unwrap_or_default(),
+        &format!("{:?}", lens.severity),
+        not_findings,
+        judge,
+        &model,
+        first,
+        rules,
+    ])
+}
+
+/// The kept ruling a reviewer's finding can take, if any: the same lens,
+/// the same claim, at the same place, in a file no fix has changed, with
+/// nothing else it rested on changed, and still not blocking under the
+/// rules as they apply now. Anything short of that goes to a Judge.
+#[allow(clippy::too_many_arguments)]
+fn reusable<'a>(
+    past: &'a [PastRuling],
+    cfg: &Config,
+    lens: &Lens,
+    context: &str,
+    tree: &Path,
+    raw: &Raw,
+    changed: &stages::ChangedLines,
+) -> Option<(usize, &'a PastRuling)> {
+    let (file, line) = (raw.file.as_deref()?, raw.line?);
+    let claim = claim_key(&raw.title);
+    if claim.is_empty() {
+        return None;
+    }
+    let (i, p) = past.iter().enumerate().find(|(_, p)| {
+        p.lens == lens.id
+            && p.file == file
+            && p.line.abs_diff(line) <= SAME_PLACE
+            && p.context == context
+            && p.claims.contains(&claim)
+    })?;
+    if file_hash(tree, file).as_deref() != Some(p.file_hash.as_str()) {
+        return None;
+    }
+    let now = ruling(
+        cfg,
+        lens,
+        &grounded(p.rating.clone(), changed, lens.blocker.as_deref()),
+    );
+    let blocks = matches!(now.action, Action::Blocks | Action::BlocksUnlessWaived);
+    (!blocks && !now.escalate).then_some((i, p))
+}
+
+/// Whether a first-pass Judge's rating goes on to the Judge's binding:
+/// anything that could block, rates Medium or above, is split or a values
+/// call, states a fact the rules raise, or that it isn't sure of. What's
+/// left, it settles: Low findings and rejections it's sure of.
+pub(super) fn first_pass_escalates(
+    cfg: &Config,
+    lens: &Lens,
+    r: &roles::Rating,
+    changed: &stages::ChangedLines,
+) -> bool {
+    let ruled = ruling(
+        cfg,
+        lens,
+        &grounded(r.clone(), changed, lens.blocker.as_deref()),
+    );
+    // The facts as the first pass states them, before the diff settles
+    // them: a claim it can't quote still goes on, for the Judge to settle.
+    matches!(ruled.action, Action::Blocks | Action::BlocksUnlessWaived)
+        || ruled.escalate
+        || r.unsure
+        || r.split
+        || r.values_call
+        || matches!(
+            r.severity,
+            Severity::Critical | Severity::High | Severity::Medium
+        )
+        || r.weak_pin
+        || r.misleads
+        || r.meets_blocker
+        || r.claims_fix
+        || r.worsens
 }
 
 impl Run {
@@ -835,6 +1010,18 @@ fn raw_key(f: &Raw) -> (String, Option<String>, Option<u64>) {
     (f.title.clone(), f.file.clone(), f.line)
 }
 
+/// A Judge's ratings from every session its call took, each once.
+fn ratings_of(legs: &Legs) -> Result<Vec<roles::Rating>> {
+    let mut lists = Vec::new();
+    for text in &legs.handed {
+        lists.push(roles::read_ratings(text)?);
+    }
+    lists.push(roles::read_ratings(&legs.last)?);
+    Ok(merged(lists, |r: &roles::Rating| {
+        (r.title.clone(), r.file.clone(), r.line)
+    }))
+}
+
 /// One call to a role, on the record.
 #[allow(clippy::too_many_arguments)]
 fn ask(
@@ -1141,6 +1328,7 @@ fn choose_lenses(
                 done: Vec::new(),
                 outcome: Outcome::Open,
                 joined,
+                skipped: Vec::new(),
             },
         );
     }
@@ -1201,6 +1389,7 @@ pub fn start(
         fixing: None,
         head_copy: s.head_copy.clone(),
         pr: s.pr,
+        rulings: Vec::new(),
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -1465,6 +1654,18 @@ fn attack(
         .command
         .clone()
         .or_else(|| stages::test_command(run.reading()));
+    // After a fix, where to look first, said last in each reviewer's brief.
+    let focus = if cfg.savings.focus_after_fix {
+        focus_note(run, s)
+    } else {
+        None
+    };
+    if focus.is_some() {
+        caller.say(&format!(
+            "round {}: the reviewers are told what the last fix changed, as where to look first",
+            run.round
+        ));
+    }
     let mut asks: Vec<(&Lens, Brief, String)> = Vec::new();
     for id in &open {
         let lens = lens_of(cfg, id)?;
@@ -1576,6 +1777,12 @@ fn attack(
                     ),
                 },
             };
+            let mut brief = brief;
+            if let (Some(focus), Brief::Review { prompt, .. } | Brief::Probe { prompt, .. }) =
+                (&focus, &mut brief)
+            {
+                prompt.push_str(focus);
+            }
             let who = match &brief {
                 Brief::Probe { .. } => "prober",
                 Brief::Mutate { .. } => "mutant proposer",
@@ -1892,17 +2099,108 @@ fn attack(
         warm_judges.done(&label);
         let legs = legs?;
         lock_vec(judge_prompts).push(prompt.to_string());
-        let mut lists = Vec::new();
-        for text in &legs.handed {
-            lists.push(roles::read_ratings(text)?);
-        }
-        lists.push(roles::read_ratings(&legs.last)?);
-        let ratings = merged(lists, |r: &roles::Rating| {
-            (r.title.clone(), r.file.clone(), r.line)
-        });
+        let ratings = ratings_of(&legs)?;
         Ok((legs.usage, ratings))
     };
     let judge_call = &judge_call;
+    // The savings: kept rulings a later round's same claim takes, and a
+    // first-pass Judge. Neither takes anything from the Judge: what either
+    // can't settle gets the Judge's call it would have had.
+    let changed_now = stages::changed_lines(&change.diff);
+    let past: Vec<PastRuling> = if cfg.savings.reuse_rulings {
+        run.rulings.clone()
+    } else {
+        Vec::new()
+    };
+    let rules = if past.is_empty() {
+        String::new()
+    } else {
+        rules_source()
+    };
+    let contexts: BTreeMap<String, String> = open
+        .iter()
+        .filter_map(|id| lens_of(cfg, id).ok())
+        .map(|l| {
+            (
+                l.id.clone(),
+                ruling_context(cfg, l, &s.not_findings, &rules),
+            )
+        })
+        .collect();
+    let first_pass = cfg.first_pass_judge()?;
+    let (past, contexts, changed_now) = (&past, &contexts, &changed_now);
+    // A first pass, if one is set, then the Judge's binding for whatever it
+    // sends on. The Judge rules from the very prompt it would have had,
+    // never seeing the first pass's ruling, so it isn't anchored by it.
+    let judge_fully = |lens: &Lens,
+                       prompt: &str,
+                       artifact: &Path,
+                       label: String|
+     -> Result<(Vec<Usage>, Vec<roles::Rating>)> {
+        let mut usages = Vec::new();
+        if let Some((name, binding)) = first_pass {
+            let first_prompt = format!("{prompt}{}", roles::FIRST_PASS_NOTE);
+            // Relayed, as the Judge's own calls are: a first pass that
+            // can't hand off cleanly fails, and the Judge rules.
+            let call = Call {
+                role: Role::Judge,
+                binding_name: name,
+                binding,
+                prompt: &first_prompt,
+                artifact: Some(artifact),
+                writes: false,
+                no_tools: false,
+                relay_tokens: cfg.sessions.relay(Role::Judge),
+                repo: main,
+                label: format!("{label}, first pass"),
+            };
+            let used = |c: &Call, a: &Answer| -> Usage {
+                let mut spent = usage(cfg, c, input_bytes(c.prompt, Some(artifact)), a);
+                spent.fan_out = Some("first-pass Judges".into());
+                spent
+            };
+            match relayed(caller, &call, &used) {
+                Ok(legs) => {
+                    usages.extend(legs.usage.iter().cloned());
+                    match ratings_of(&legs) {
+                        Ok(mut ratings)
+                            if !ratings
+                                .iter()
+                                .any(|r| first_pass_escalates(cfg, lens, r, changed_now)) =>
+                        {
+                            for r in &mut ratings {
+                                r.ruled_by = Some(name.to_string());
+                            }
+                            caller.say(&format!(
+                                "{label}: the first pass ({name}) settled it, so no Judge call"
+                            ));
+                            return Ok((usages, ratings));
+                        }
+                        Ok(_) => caller.say(&format!(
+                            "{label}: the first pass sends it on to the Judge, which rules on \
+                             it fresh"
+                        )),
+                        Err(e) => caller.say(&format!(
+                            "{label}: the first pass's answer couldn't be read ({e:#}), so the \
+                             Judge rules"
+                        )),
+                    }
+                }
+                Err(e) => caller.say(&format!(
+                    "{label}: the first pass failed ({e:#}), so the Judge rules"
+                )),
+            }
+        }
+        let (mut spent, mut ratings) = judge_call(prompt, artifact, label)?;
+        usages.append(&mut spent);
+        if first_pass.is_some() {
+            for r in &mut ratings {
+                r.ruled_by = Some(judge_name.to_string());
+            }
+        }
+        Ok((usages, ratings))
+    };
+    let judge_fully = &judge_fully;
     // Each lens's Judge starts once its own reviewers are done, not the
     // slowest lens's: it sees only its own lens. Per finding, each finding
     // gets a Judge of its own, given only its claim and the lines it cites.
@@ -1911,7 +2209,52 @@ fn attack(
             .iter()
             .filter_map(|r| r.as_ref().ok().map(|(_, found, _)| found.clone()))
             .collect();
-        lists.iter().any(|l| !l.is_empty()).then(|| {
+        if !lists.iter().any(|l| !l.is_empty()) {
+            return None;
+        }
+        // A finding that makes a kept ruling's claim, at its place, in a
+        // file no fix has changed, takes that ruling: one for each.
+        let context = contexts.get(&lens.id).map_or("", String::as_str);
+        let mut reused: BTreeMap<usize, roles::Rating> = BTreeMap::new();
+        let lists: Vec<Vec<Raw>> = lists
+            .into_iter()
+            .map(|list| {
+                list.into_iter()
+                    .filter(|raw| {
+                        match reusable(past, cfg, lens, context, main, raw, changed_now) {
+                            Some((i, p)) => {
+                                reused.entry(i).or_insert_with(|| {
+                                    let mut r = p.rating.clone();
+                                    r.reused_from = Some(p.round);
+                                    r
+                                });
+                                false
+                            }
+                            None => true,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let reused: Vec<roles::Rating> = reused.into_values().collect();
+        if !reused.is_empty() {
+            let rounds: BTreeSet<u32> = reused.iter().filter_map(|r| r.reused_from).collect();
+            caller.say(&format!(
+                "{}: {} finding(s) took round {}'s ruling, on code no fix has changed, so no \
+                 Judge call for them",
+                lens.id,
+                reused.len(),
+                rounds
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+        }
+        if !lists.iter().any(|l| !l.is_empty()) {
+            return Some(Ok((Vec::new(), reused)));
+        }
+        let judged = (|| -> Result<(Vec<Usage>, Vec<roles::Rating>)> {
             let diff = artifacts.for_lens(lens);
             let text = fs::read_to_string(diff).ok();
             match cfg.facts.judges {
@@ -1925,7 +2268,7 @@ fn attack(
                         .map(|h| roles::judge_hunks(&h))
                         .unwrap_or_default();
                     let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)? + &hunks;
-                    judge_call(&prompt, diff, format!("{}: the Judge", lens.id))
+                    judge_fully(lens, &prompt, diff, format!("{}: the Judge", lens.id))
                 }
                 JudgeMode::PerFinding => {
                     let all: Vec<&Raw> = lists.iter().flatten().collect();
@@ -1944,7 +2287,8 @@ fn attack(
                                             &cited,
                                             &s.not_findings,
                                         ));
-                                        judge_call(
+                                        judge_fully(
+                                            lens,
                                             &prompt,
                                             diff,
                                             format!("{}: the Judge, finding {}", lens.id, i + 1),
@@ -1963,14 +2307,18 @@ fn attack(
                     let mut usages = Vec::new();
                     let mut ratings = Vec::new();
                     for r in out {
-                        let (mut u, mut rs) = r?;
-                        usages.append(&mut u);
+                        let (mut us, mut rs) = r?;
+                        usages.append(&mut us);
                         ratings.append(&mut rs);
                     }
                     Ok((usages, ratings))
                 }
             }
-        })
+        })();
+        Some(judged.map(|(usages, mut ratings)| {
+            ratings.extend(reused);
+            (usages, ratings)
+        }))
     };
     let mut groups: Vec<(&Lens, Vec<(&Brief, &String)>)> = Vec::new();
     for (lens, brief, label) in &asks {
@@ -3120,9 +3468,70 @@ fn rate(
             state,
             note: String::new(),
             same_as: None,
+            reused_from: rating.reused_from,
+            ruled_by: rating.ruled_by,
         });
     }
     findings
+}
+
+/// Keeps this round's rulings that didn't block, for a later round's same
+/// claim: each finding a Judge ruled on just now, at a place in a file, with
+/// its own title and those of the reviewers' findings at that place. A
+/// ruling carried over is already kept. A blocker's ruling never is, whatever
+/// a person then does with it: folded, waived or deferred to a ticket are
+/// decisions, not rulings, so a later round's same claim is judged again and
+/// takes the state the rules give it.
+fn keep_rulings(
+    run: &mut Run,
+    lens: &Lens,
+    context: &str,
+    ratings: &[roles::Rating],
+    findings: &[Finding],
+    lists: &[Vec<Raw>],
+) {
+    let tree = run.reading().to_path_buf();
+    for (rating, f) in ratings.iter().zip(findings) {
+        if rating.reused_from.is_some()
+            || !matches!(f.state, FindingState::Logged | FindingState::Dropped)
+        {
+            continue;
+        }
+        let (Some(file), Some(line)) = (rating.file.as_deref(), rating.line) else {
+            continue;
+        };
+        let Some(file_hash) = file_hash(&tree, file) else {
+            continue;
+        };
+        let mut claims: Vec<String> = std::iter::once(claim_key(&rating.title))
+            .chain(
+                lists
+                    .iter()
+                    .flatten()
+                    .filter(|r| {
+                        r.file.as_deref() == Some(file)
+                            && r.line.is_some_and(|l| l.abs_diff(line) <= SAME_PLACE)
+                    })
+                    .map(|r| claim_key(&r.title)),
+            )
+            .filter(|c| !c.is_empty())
+            .collect();
+        claims.sort();
+        claims.dedup();
+        if claims.is_empty() {
+            continue;
+        }
+        run.rulings.push(PastRuling {
+            lens: lens.id.clone(),
+            round: run.round,
+            file: file.to_string(),
+            line,
+            claims,
+            file_hash,
+            context: context.to_string(),
+            rating: rating.clone(),
+        });
+    }
 }
 
 /// One round: attack every open lens, judge what comes back, and settle
@@ -3411,14 +3820,24 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
         .collect();
     let changed = before.is_some() && caller.fingerprint(run.reading()) != before;
     let lines = stages::changed_lines(&change.diff);
-    for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
+    let rules = if cfg.savings.reuse_rulings {
+        rules_source()
+    } else {
+        String::new()
+    };
+    for ((id, lens, mut round, lists), judged) in lenses.into_iter().zip(judged) {
         match judged {
             Some(Ok((usages, ratings))) => {
                 for mut usage in usages {
                     usage.round = run.round;
                     run.usage.push(usage);
                 }
+                let kept = cfg.savings.reuse_rulings.then(|| ratings.clone());
                 round.findings = rate(run, cfg, lens, ratings, &lines);
+                if let Some(kept) = kept {
+                    let context = ruling_context(cfg, lens, &s.not_findings, &rules);
+                    keep_rulings(run, lens, &context, &kept, &round.findings, &lists);
+                }
             }
             Some(Err(e)) => round.failures.push(format!("the Judge: {e:#}")),
             None => {}
@@ -3731,8 +4150,12 @@ fn fix(
             format!("the Orchestrator, fixing {} blocker(s)", folded.len())
         },
     };
-    // The checkout before the fixes, to see what they changed.
-    let before_fix = run.converge.then(|| caller.snapshot(&run.repo)).flatten();
+    // The checkout before the fixes, to see what they changed: for the next
+    // round's focus and the blast-radius check too, when they're on.
+    let saving = s.cfg.savings.focus_after_fix || s.cfg.savings.blast_radius;
+    let before_fix = (run.converge || saving)
+        .then(|| caller.snapshot(&run.repo))
+        .flatten();
     let fixed = caller.call(&call).and_then(|answer| {
         record(run, cfg, &call, prompt.len(), &answer);
         roles::read_fixed(&answer.text)
@@ -3786,8 +4209,11 @@ fn fix(
                     }
                 }
                 refocus(run, s, caller, before_fix.as_deref());
+            } else if saving {
+                note_fix(run, s, caller, before_fix.as_deref());
             }
             run.round += 1;
+            blast_radius(run, s, caller);
             run.stage = Stage::Review;
         }
         Err(e) => {
@@ -3854,6 +4280,148 @@ pub(super) fn reopen_all(run: &mut Run) {
 /// lens attacks it again if the fixes touched what it covers, with the
 /// fixes as its focus; the rest wait for the sweep before it can end.
 /// Without the checkout from before the fixes, every lens attacks again.
+/// After a fix, where the next round's reviewers should look first: what
+/// it changed, and what could feel it, from the round's change map. None
+/// when the last round had no fix, or what it changed wasn't kept.
+fn focus_note(run: &Run, s: &Setting) -> Option<String> {
+    let fix = run.fix.as_ref().filter(|f| f.round + 1 == run.round)?;
+    let diff = fs::read_to_string(s.work_dir.join(format!("round-{}.fix.diff", fix.round))).ok()?;
+    let mut affects: BTreeSet<String> = BTreeSet::new();
+    if let Some((facts, _)) = super::facts::kept(&s.work_dir, run.round) {
+        for f in facts.files.iter().filter(|f| fix.files.contains(&f.path)) {
+            affects.extend(f.references.iter().cloned());
+            affects.extend(f.tests.iter().cloned());
+        }
+    }
+    const MOST: usize = 60;
+    let more = affects.len().saturating_sub(MOST);
+    let mut affects: Vec<String> = affects.into_iter().take(MOST).collect();
+    if more > 0 {
+        affects.push(format!("and {more} more in the change's map"));
+    }
+    Some(roles::focus_after_fix(
+        fix.round, &fix.files, &diff, &affects,
+    ))
+}
+
+/// What a fix changed, kept beside the round's diff for the next round's
+/// focus and the blast-radius check, outside a review to convergence, where
+/// `refocus` keeps it.
+fn note_fix(run: &mut Run, s: &Setting, caller: &dyn Caller, before: Option<&str>) {
+    let delta = before.and_then(|from| {
+        let to = caller.snapshot(&run.repo)?;
+        caller.delta(&run.repo, from, &to)
+    });
+    run.fix = delta.map(|(files, diff)| {
+        let _ = fs::write(
+            s.work_dir.join(format!("round-{}.fix.diff", run.round)),
+            &diff,
+        );
+        FixDelta {
+            round: run.round,
+            files,
+        }
+    });
+}
+
+/// After a fix, before the next round: one small call, with no tools, on the
+/// Sizer's binding, says whether each lens that passed before the fix must
+/// attack again. A lens it says the fix can't touch, with a reason, skips
+/// the round, and is reported as skipped, never as passing. A lens with
+/// blockers of its own, one that failed, and anything the call can't settle
+/// attacks as before.
+fn blast_radius(run: &mut Run, s: &Setting, caller: &dyn Caller) {
+    if !s.cfg.savings.blast_radius {
+        return;
+    }
+    let Some(fix) = run.fix.clone().filter(|f| f.round + 1 == run.round) else {
+        return;
+    };
+    let candidates: Vec<String> = run
+        .lenses
+        .values()
+        .filter(|l| {
+            l.outcome == Outcome::Open
+                && l.latest().is_some_and(|r| {
+                    r.round <= fix.round
+                        && r.failures.is_empty()
+                        && !r.findings.iter().any(Finding::blocks)
+                })
+        })
+        .map(|l| l.id.clone())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let diff = fs::read_to_string(s.work_dir.join(format!("round-{}.fix.diff", fix.round)))
+        .unwrap_or_default();
+    let lenses: Vec<roles::Candidate> = candidates
+        .iter()
+        .filter_map(|id| s.cfg.lenses.iter().find(|l| &l.id == id))
+        .map(|l| roles::Candidate {
+            id: &l.id,
+            criteria: &l.criteria,
+        })
+        .collect();
+    let prompt = roles::blast_radius_prompt(&fix.files, &diff, &lenses);
+    let (Ok(name), Ok(binding)) = (
+        s.cfg.binding_name(Role::Sizer, None),
+        s.cfg.binding(Role::Sizer, None),
+    ) else {
+        caller.say("the blast-radius check has no Sizer binding, so every lens attacks");
+        return;
+    };
+    let repo = run.reading().to_path_buf();
+    let call = Call {
+        role: Role::Sizer,
+        binding_name: name,
+        binding,
+        prompt: &prompt,
+        artifact: None,
+        writes: false,
+        no_tools: true,
+        relay_tokens: None,
+        repo: &repo,
+        label: "the blast-radius check".into(),
+    };
+    let answer = match caller.call(&call) {
+        Ok(answer) => answer,
+        Err(e) => {
+            caller.say(&format!(
+                "the blast-radius check failed ({e:#}), so every lens attacks"
+            ));
+            return;
+        }
+    };
+    record(run, s.cfg, &call, prompt.len(), &answer);
+    let said = match roles::read_blast(&answer.text) {
+        Ok(said) => said,
+        Err(e) => {
+            caller.say(&format!(
+                "the blast-radius check's answer couldn't be read ({e:#}), so every lens attacks"
+            ));
+            return;
+        }
+    };
+    for b in said {
+        let reason = b.reason.trim();
+        if b.attack || reason.is_empty() || !candidates.contains(&b.lens) {
+            continue;
+        }
+        if let Some(l) = run.lenses.get_mut(&b.lens) {
+            l.outcome = Outcome::Confirmed;
+            l.skipped.push(Skipped {
+                round: run.round,
+                reason: reason.to_string(),
+            });
+            caller.say(&format!(
+                "{}: skips round {}, by the blast-radius check: {reason}",
+                b.lens, run.round
+            ));
+        }
+    }
+}
+
 fn refocus(run: &mut Run, s: &Setting, caller: &dyn Caller, before: Option<&str>) {
     let delta = before.and_then(|from| {
         let to = caller.snapshot(&run.repo)?;
@@ -3966,10 +4534,16 @@ pub fn fixed_by_session(
             briefs,
         });
         refocus(run, s, caller, from.as_deref());
-    } else if reported {
-        reopen_all(run);
+    } else {
+        if s.cfg.savings.focus_after_fix || s.cfg.savings.blast_radius {
+            note_fix(run, s, caller, from.as_deref());
+        }
+        if reported {
+            reopen_all(run);
+        }
     }
     run.round += 1;
+    blast_radius(run, s, caller);
     run.stage = Stage::Review;
     run.status = Status::Running;
     run.waiting = None;
@@ -8230,6 +8804,432 @@ lenses:
         let _ = fs::remove_dir_all(&s.work_dir);
     }
 
+    /// A repository of two files, for tests that read what's in them.
+    fn two_files() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tb-acr-reuse-{}", new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.src"), "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+        fs::write(dir.join("b.src"), "x\n").unwrap();
+        dir
+    }
+
+    const BLOCKER_AND_NIT: &str = r#"{"findings": [{"title": "Blocker in b", "detail": "d", "file": "b.src", "line": 1}, {"title": "A nit in a", "detail": "d", "file": "a.src", "line": 5}]}"#;
+    // The same claim, a line away, in another reviewer's words' order.
+    const JUST_THE_NIT: &str =
+        r#"{"findings": [{"title": "a nit, in a", "detail": "d", "file": "a.src", "line": 6}]}"#;
+
+    /// The Judge's ratings of whichever of those two it's given.
+    fn rate_two(prompt: &str) -> String {
+        let mut out = Vec::new();
+        if prompt.contains("Blocker in b") {
+            out.push(
+                r#"{"title": "Blocker in b", "file": "b.src", "line": 1, "severity": "High"}"#,
+            );
+        }
+        if prompt.contains("nit") {
+            out.push(r#"{"title": "A nit in a", "file": "a.src", "line": 5, "severity": "Low"}"#);
+        }
+        format!(r#"{{"findings": [{}]}}"#, out.join(", "))
+    }
+
+    /// alpha's reviewers find a blocker in b.src and a nit in a.src until
+    /// the blocker's fixed, then the nit alone. The fix writes into `writes`.
+    fn nit_after_fix(
+        dir: PathBuf,
+        writes: &'static [&'static str],
+    ) -> impl Fn(Role, &str) -> Result<String> + Sync {
+        let fixed = Mutex::new(false);
+        move |role, prompt| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => if *fixed.lock().unwrap() {
+                    JUST_THE_NIT
+                } else {
+                    BLOCKER_AND_NIT
+                }
+                .to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rate_two(prompt),
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() = true;
+                    for f in writes {
+                        fs::write(dir.join(f), "fixed\n").unwrap();
+                    }
+                    r#"{"done": "fixed it"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        }
+    }
+
+    fn go_in<F: Fn(Role, &str) -> Result<String> + Sync>(
+        cfg: &Config,
+        dir: &Path,
+        fake: &Fake<F>,
+    ) -> Run {
+        let s = setting(cfg);
+        let c = change(&["a.src", "b.src"]);
+        let mut run = start("r", dir, "main", None, &s, &c, fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, fake, &|_| Ok(again.clone())).unwrap();
+        run
+    }
+
+    #[test]
+    fn a_ruling_that_didnt_block_is_reused_on_unchanged_code_without_a_judge() {
+        let cfg = plain("exception", 3, 1);
+        let dir = two_files();
+        let fake = Fake::new(nit_after_fix(dir.clone(), &["b.src"]));
+        let run = go_in(&cfg, &dir, &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        // Round 1's Judge only: round 2's nit took its ruling.
+        assert_eq!(fake.count(Role::Judge), 1);
+        let nit = &run.lenses["alpha"].rounds[1].findings[0];
+        assert_eq!(nit.reused_from, Some(1));
+        assert_eq!(nit.state, FindingState::Logged);
+        // Only what didn't block is kept: the blocker never is.
+        assert_eq!(run.rulings.len(), 1);
+        assert_eq!(run.rulings[0].file, "a.src");
+        let told = fake.told.lock().unwrap().join("\n");
+        assert!(told.contains("took round 1's ruling"), "{told}");
+        let comment = report::finding_line(nit);
+        assert!(comment.contains("carried over from round 1"), "{comment}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_ruling_on_code_a_fix_changed_goes_to_the_judge_again() {
+        let cfg = plain("exception", 3, 1);
+        let dir = two_files();
+        let fake = Fake::new(nit_after_fix(dir.clone(), &["a.src", "b.src"]));
+        let run = go_in(&cfg, &dir, &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        assert_eq!(fake.count(Role::Judge), 2);
+        assert_eq!(run.lenses["alpha"].rounds[1].findings[0].reused_from, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reusing_rulings_can_be_switched_off() {
+        let cfg = config("exception", 3, 1, "", "savings: {reuse_rulings: false}");
+        let dir = two_files();
+        let fake = Fake::new(nit_after_fix(dir.clone(), &["b.src"]));
+        let run = go_in(&cfg, &dir, &fake);
+        assert_eq!(fake.count(Role::Judge), 2);
+        assert!(run.rulings.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_different_claim_at_the_same_place_isnt_given_the_ruling() {
+        let cfg = plain("exception", 3, 1);
+        let dir = two_files();
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => {
+                    if *fixed.lock().unwrap() {
+                        r#"{"findings": [{"title": "A crash in a", "file": "a.src", "line": 5}]}"#
+                            .to_string()
+                    } else {
+                        BLOCKER_AND_NIT.to_string()
+                    }
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge if prompt.contains("A crash in a") => {
+                    r#"{"findings": [{"title": "A crash in a", "file": "a.src", "line": 5, "severity": "Low"}]}"#
+                        .to_string()
+                }
+                Role::Judge => rate_two(prompt),
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "fixed it"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let run = go_in(&cfg, &dir, &fake);
+        assert_eq!(fake.count(Role::Judge), 2);
+        assert_eq!(run.lenses["alpha"].rounds[1].findings[0].reused_from, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_first_pass_escalates_whatever_could_block_or_it_isnt_sure_of() {
+        let cfg = plain("exception", 1, 1);
+        let lens = cfg.lenses.iter().find(|l| l.id == "alpha").unwrap();
+        let changed = stages::changed_lines("");
+        let r = |json: &str| {
+            roles::read_ratings(&format!(r#"{{"findings": [{json}]}}"#))
+                .unwrap()
+                .remove(0)
+        };
+        let goes = |json: &str| first_pass_escalates(&cfg, lens, &r(json), &changed);
+        assert!(!goes(r#"{"title": "t", "severity": "Low"}"#));
+        assert!(!goes(r#"{"title": "t", "severity": "Rejected"}"#));
+        assert!(!goes(
+            r#"{"title": "t", "severity": "Low", "real_defect": false}"#
+        ));
+        assert!(goes(r#"{"title": "t", "severity": "Low", "unsure": true}"#));
+        assert!(goes(r#"{"title": "t", "severity": "Medium"}"#));
+        assert!(goes(r#"{"title": "t", "severity": "High"}"#));
+        assert!(goes(
+            r#"{"title": "t", "severity": "Low", "values_call": true}"#
+        ));
+        assert!(goes(r#"{"title": "t", "severity": "Low", "split": true}"#));
+        assert!(goes(
+            r#"{"title": "t", "severity": "Low", "misleads": true}"#
+        ));
+    }
+
+    /// alpha's reviewers find one defect; the first pass and the Judge rate
+    /// it as told.
+    fn first_and_full(
+        first: &'static str,
+        full: &'static str,
+    ) -> impl Fn(Role, &str) -> Result<String> + Sync {
+        move |role, prompt| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge if prompt.contains("You're the first pass") => {
+                    format!(r#"{{"findings": [{first}]}}"#)
+                }
+                Role::Judge => format!(r#"{{"findings": [{full}]}}"#),
+                _ => NOTHING.to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_first_pass_that_settles_a_lens_saves_its_judge_call() {
+        let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
+        let fake = Fake::new(first_and_full(
+            r#"{"title": "a defect", "file": "a.src", "severity": "Low"}"#,
+            r#"{"title": "a defect", "file": "a.src", "severity": "High"}"#,
+        ));
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let calls = fake.calls.lock().unwrap();
+        let on = |name: &str| {
+            calls
+                .iter()
+                .filter(|c| c.0 == Role::Judge && c.1 == name)
+                .count()
+        };
+        assert_eq!((on("small"), on("large")), (1, 0));
+        let f = &run.lenses["alpha"].rounds[0].findings[0];
+        assert_eq!(f.ruled_by.as_deref(), Some("small"));
+        assert_eq!(f.state, FindingState::Logged);
+    }
+
+    #[test]
+    fn what_the_first_pass_sends_on_the_judge_rules_fresh_from_its_own_prompt() {
+        let found = r#"{"title": "a defect", "file": "a.src", "severity": "High"}"#;
+        // Without a first pass: the Judge's prompt as it would be.
+        let plain_cfg = plain("exception", 1, 1);
+        let fake = Fake::new(first_and_full(found, found));
+        go(&plain_cfg, &["a.src"], &fake);
+        let alone: Vec<String> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == Role::Judge)
+            .map(|c| c.3.clone())
+            .collect();
+        for first in [
+            r#"{"title": "a defect", "file": "a.src", "severity": "High"}"#,
+            r#"{"title": "a defect", "file": "a.src", "severity": "Low", "unsure": true}"#,
+        ] {
+            let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
+            let fake = Fake::new(first_and_full(first, found));
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            let calls = fake.calls.lock().unwrap();
+            let full: Vec<&String> = calls
+                .iter()
+                .filter(|c| c.0 == Role::Judge && c.1 == "large")
+                .map(|c| &c.3)
+                .collect();
+            assert_eq!(full.len(), 1, "sent on: {first}");
+            // Not anchored: the very prompt it gets without a first pass.
+            assert_eq!(full[0], &alone[0]);
+            assert!(!full[0].contains("first pass"));
+            let f = &run.lenses["alpha"].rounds[0].findings[0];
+            assert_eq!(f.ruled_by.as_deref(), Some("large"));
+            assert!(f.blocks());
+        }
+    }
+
+    #[test]
+    fn after_a_fix_reviewers_are_told_where_to_look_first_when_its_on() {
+        for (top, told) in [("savings: {focus_after_fix: true}", true), ("", false)] {
+            let cfg = config("exception", 3, 1, "", top);
+            let mut fake = Fake::new(defect_in("alpha", 1));
+            fake.fixes = Some(vec!["b.src".into()]);
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert_eq!(run.status, Status::Confirmed);
+            let calls = fake.calls.lock().unwrap();
+            let alpha: Vec<&String> = calls
+                .iter()
+                .filter(|c| c.0 == Role::Reviewer && c.3.contains("alpha criteria"))
+                .map(|c| &c.3)
+                .collect();
+            assert_eq!(alpha.len(), 2);
+            assert!(!alpha[0].contains("## Since round"), "round 1 has no fix");
+            assert_eq!(alpha[1].contains("## Since round 1"), told, "{top}");
+            if told {
+                assert!(alpha[1].contains("b.src") && alpha[1].contains("+the fix"));
+                // Focus, never less: the whole change is still its brief.
+                assert!(alpha[1].contains("review the whole change"));
+                assert!(alpha[1].starts_with(alpha[0].as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_lens_the_blast_radius_check_skips_is_reported_skipped_and_swept_later() {
+        let cfg = config("exception", 20, 1, "", "savings: {blast_radius: true}");
+        let fixes = Mutex::new(0);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && *fixes.lock().unwrap() < 2 => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    *fixes.lock().unwrap() += 1;
+                    r#"{"done": "made it stronger"}"#.to_string()
+                }
+                // It would skip alpha too, which has blockers of its own: it
+                // isn't asked about it, and couldn't skip it.
+                Role::Sizer if prompt.contains("must attack") || prompt.contains("passed the change before a fix") => {
+                    r#"{"lenses": [{"lens": "beta", "attack": false, "reason": "the fix only touches alpha's parsing"}, {"lens": "alpha", "attack": false, "reason": "no"}]}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        fake.fixes = Some(vec!["a.src".into()]);
+        let run = converging(&cfg, &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        let beta = &run.lenses["beta"];
+        assert_eq!(
+            beta.skipped.iter().map(|s| s.round).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        // Attacked in round 1, then in the full sweep on the final version.
+        assert_eq!(
+            beta.rounds.iter().map(|r| r.round).collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert!(beta.skipped_since_attack().is_none());
+        assert!(run.lenses["alpha"].skipped.is_empty());
+        // Five reviewers, where attacking beta every round took six.
+        assert_eq!(fake.count(Role::Reviewer), 5);
+        assert!(fake.bare.lock().unwrap().contains(&Role::Sizer));
+        let told = fake.told.lock().unwrap().join("\n");
+        assert!(told.contains("beta: skips round 2"), "{told}");
+    }
+
+    #[test]
+    fn a_skipped_lens_never_reads_as_passing_the_version_it_skipped() {
+        let lens = LensResult {
+            id: "beta".into(),
+            criteria: "c".into(),
+            rounds: vec![Round {
+                round: 1,
+                ..Round::default()
+            }],
+            done: Vec::new(),
+            outcome: Outcome::Confirmed,
+            joined: String::new(),
+            skipped: vec![Skipped {
+                round: 2,
+                reason: "the fix can't touch it".into(),
+            }],
+        };
+        assert!(lens.skipped_since_attack().is_some());
+        let said = report::outcome_of(&lens);
+        assert!(said.starts_with("Skipped in round 2"), "{said}");
+        assert!(!said.contains("Confirmed"));
+        // Attacked since: then its outcome stands.
+        let mut later = lens.clone();
+        later.rounds.push(Round {
+            round: 3,
+            ..Round::default()
+        });
+        assert!(later.skipped_since_attack().is_none());
+        assert_eq!(report::outcome_of(&later), "Confirmed");
+    }
+
+    #[test]
+    fn a_blocker_deferred_to_a_ticket_is_never_reused_and_is_judged_again() {
+        let cfg = plain("per-round", 3, 1);
+        let dir = two_files();
+        let fixed = Mutex::new(false);
+        let leak = r#"{"title": "A leak in a", "detail": "d", "file": "a.src", "line": 5}"#;
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => {
+                    if *fixed.lock().unwrap() {
+                        format!(r#"{{"findings": [{leak}]}}"#)
+                    } else {
+                        format!(
+                            r#"{{"findings": [{leak}, {{"title": "Blocker in b", "file": "b.src", "line": 1}}]}}"#
+                        )
+                    }
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => {
+                    let mut out = vec![
+                        r#"{"title": "A leak in a", "file": "a.src", "line": 5, "severity": "High"}"#,
+                    ];
+                    if prompt.contains("Blocker in b") {
+                        out.push(
+                            r#"{"title": "Blocker in b", "file": "b.src", "line": 1, "severity": "High"}"#,
+                        );
+                    }
+                    format!(r#"{{"findings": [{}]}}"#, out.join(", "))
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() = true;
+                    fs::write(dir.join("b.src"), "fixed\n").unwrap();
+                    r#"{"done": "fixed it"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src", "b.src"]);
+        let mut run = start("r", &dir, "main", None, &s, &c, &fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        let first = &run.lenses["alpha"].rounds[0].findings;
+        let id = |title: &str| first.iter().find(|f| f.title == title).unwrap().id.clone();
+        let (leak_id, fix_id) = (id("A leak in a"), id("Blocker in b"));
+        decide(
+            &mut run,
+            &Decision {
+                fold: vec![fix_id],
+                defer: vec![leak_id],
+                ..Decision::default()
+            },
+        )
+        .unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        // The leak was deferred: a decision, not a ruling, so nothing kept it,
+        // and round 2's same claim, on code no fix changed, went to the Judge.
+        assert!(run.rulings.is_empty());
+        assert_eq!(fake.count(Role::Judge), 2);
+        let leak = &run.lenses["alpha"].rounds[1].findings[0];
+        assert_eq!(leak.reused_from, None);
+        // What the rules say: it blocks, open for a person again.
+        assert_eq!(leak.state, FindingState::Open);
+        assert_eq!(
+            run.lenses["alpha"].rounds[0].findings[0].state,
+            FindingState::Deferred
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
     /// A first session out of room: what it found, checked and left.
     const HANDED: &str = "ACRBUS-HANDOFF\n{\"findings\": [{\"title\": \"first half\", \"detail\": \
         \"why\", \"file\": \"a.src\", \"line\": 3}], \"handoff\": {\"checked\": \"the parser\", \
@@ -8506,5 +9506,64 @@ lenses:
             assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
             assert!(run.escalations[0].reason.contains("wasn't fully reviewed"));
         }
+    }
+
+    #[test]
+    fn a_first_pass_relays_like_the_judge_and_a_reused_ruling_takes_no_session() {
+        // Judges relay: the first pass hands off once, and its sessions'
+        // ratings settle the lens together, with no Judge call.
+        let cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "savings: {first_pass_judge: small}\nsessions: {relay_tokens: {judge: 40000}}",
+        );
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => r#"{"findings": [{"title": "A", "file": "a.src", "line": 1}, {"title": "B", "file": "a.src", "line": 2}]}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge if prompt.contains("You're the first pass") && prompt.contains("# Carrying on") => {
+                    r#"{"findings": [{"title": "B", "file": "a.src", "line": 2, "severity": "Low"}]}"#.into()
+                }
+                Role::Judge if prompt.contains("You're the first pass") => "ACRBUS-HANDOFF\n{\"findings\": [{\"title\": \"A\", \"file\": \"a.src\", \"line\": 1, \"severity\": \"Low\"}], \"handoff\": {\"checked\": \"A\", \"left\": \"B\"}}".into(),
+                Role::Judge => r#"{"findings": [{"title": "A", "file": "a.src", "line": 1, "severity": "High"}]}"#.into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let calls = fake.calls.lock().unwrap();
+        let on = |name: &str| {
+            calls
+                .iter()
+                .filter(|c| c.0 == Role::Judge && c.1 == name)
+                .count()
+        };
+        assert_eq!(
+            (on("small"), on("large")),
+            (2, 0),
+            "two first-pass sessions, no Judge"
+        );
+        drop(calls);
+        let found = &run.lenses["alpha"].rounds[0].findings;
+        let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
+        assert!(titles.contains(&"A") && titles.contains(&"B"), "{titles:?}");
+        assert!(found.iter().all(|f| f.ruled_by.as_deref() == Some("small")));
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.fan_out.as_deref() == Some("first-pass Judges"))
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("leg 1".into()), Some("leg 2".into())]);
+        // Every Judge call it made carried the relay size.
+        assert!(
+            fake.relays
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == Role::Judge)
+                .all(|r| r.1 == Some(40_000))
+        );
     }
 }

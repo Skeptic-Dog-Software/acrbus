@@ -728,7 +728,7 @@ pub fn read_findings(text: &str) -> Result<Vec<Raw>> {
 }
 
 /// A judged finding, merged across a lens's reviewers.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rating {
     pub title: String,
     #[serde(default)]
@@ -801,6 +801,18 @@ pub struct Rating {
         deserialize_with = "lenient::flag"
     )]
     pub equivalent: bool,
+    /// The Judge can't rate it with confidence from what it can see. Only a
+    /// first-pass Judge is asked to say so: it sends the finding on to the
+    /// Judge's binding.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub unsure: bool,
+    /// Carried over from this round's ruling instead of judged again: see
+    /// `savings.reuse_rulings`. Never read from a Judge's answer.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<u32>,
+    /// The binding whose Judge ruled it. Never read from a Judge's answer.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub ruled_by: Option<String>,
 }
 
 fn yes() -> bool {
@@ -814,6 +826,15 @@ struct Judged {
 
 /// The hunks a Judge's findings point at, added to its brief to start from:
 /// fewer reads to find them, and nothing it can't still do.
+/// What a first-pass Judge adds to the Judge's own brief: to say which
+/// findings it can't rate with confidence, so they go on to the Judge's
+/// binding. It's asked of the first pass only, so the Judge's own brief, and
+/// the calibration made against it, stay as they are.
+pub const FIRST_PASS_NOTE: &str = "\n\nYou're the first pass: a fuller Judge rules after you on \
+     whatever you can't settle. For any finding you can't rate with confidence from what you can \
+     see, set \"unsure\": true on it, and rate it as best you can. Don't guess to avoid saying \
+     so.";
+
 pub fn judge_hunks(hunks: &str) -> String {
     format!(
         "\n# Where the findings point, to start from\n\nThe diff's hunks the findings above \
@@ -970,6 +991,102 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
 
 pub fn read_ratings(text: &str) -> Result<Vec<Rating>> {
     Ok(one_json_in::<Judged>(text)?.findings)
+}
+
+/// The most of a fix's diff a focus note or the blast-radius check quotes:
+/// past it, the rest is said to be cut, and the whole change stays attached.
+pub const FIX_DIFF_MAX: usize = 24 * 1024;
+
+fn capped(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[... cut at {} KB; the rest of the fix is in the change itself]\n",
+        &text[..end],
+        max / 1024
+    )
+}
+
+/// Where to look first, after a fix: what it changed, and what could feel
+/// it. Said last in a reviewer's brief, after everything every reviewer
+/// shares, and as focus only: the whole change stays the reviewer's.
+pub fn focus_after_fix(round: u32, files: &[String], diff: &str, affects: &[String]) -> String {
+    let mut out = format!(
+        "\n\n## Since round {round}\n\nA fix changed {} since round {round}'s review. Look first \
+         at what it changed and at what it could affect, then review the whole change as \
+         usual: a fix for one defect can break something anywhere, and this note limits \
+         nothing you may read or check.\n\nFiles the fix changed: {}.\n",
+        if files.len() == 1 {
+            "1 file"
+        } else {
+            "these files"
+        },
+        files.join(", ")
+    );
+    if !affects.is_empty() {
+        out.push_str(&format!(
+            "\nWhat could feel it, from the change's map (references to what those files \
+             define, and the tests that name it): {}.\n",
+            affects.join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "\n```diff\n{}\n```\n",
+        capped(diff, FIX_DIFF_MAX).trim_end()
+    ));
+    out
+}
+
+/// One lens the blast-radius check is asked about.
+pub struct Candidate<'a> {
+    pub id: &'a str,
+    pub criteria: &'a str,
+}
+
+/// After a fix: for each lens that passed before it, could the fix affect
+/// what it reviews? Asked with no tools, and anything it can't tell is an
+/// attack.
+pub fn blast_radius_prompt(files: &[String], diff: &str, lenses: &[Candidate]) -> String {
+    let list: String = lenses
+        .iter()
+        .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
+        .collect();
+    format!(
+        "A review's lenses each attack a code change for one kind of defect. The lenses below \
+         all passed the change before a fix, and a fix has since changed it. For each lens, say \
+         whether the fix could affect what that lens looks for, so that it must attack the \
+         change again. Say false only when you can see that the fix can't touch that lens's \
+         concern, and give the reason in a sentence. If you can't tell, say true.\n\n\
+         Files the fix changed: {}.\n\n## Lenses\n\n{list}\n## The fix\n\n```diff\n{}\n```\n\n\
+         Answer with only JSON: {{\"lenses\": [{{\"lens\": \"<id>\", \"attack\": true, \
+         \"reason\": \"<why>\"}}]}}, one entry for each lens.",
+        files.join(", "),
+        capped(diff, FIX_DIFF_MAX).trim_end()
+    )
+}
+
+/// One lens's answer from the blast-radius check.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Blast {
+    pub lens: String,
+    #[serde(default = "yes", deserialize_with = "lenient::flag")]
+    pub attack: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlastAnswer {
+    lenses: Vec<Blast>,
+}
+
+pub fn read_blast(text: &str) -> Result<Vec<Blast>> {
+    Ok(json_in::<BlastAnswer>(text)?.lenses)
 }
 
 pub fn fix_prompt(blockers: &str) -> String {

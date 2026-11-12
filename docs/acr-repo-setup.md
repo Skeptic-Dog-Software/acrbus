@@ -346,7 +346,65 @@ since by then it holds the change's context.
   role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to
   bring the estimate nearer the real use.
 
-## 5c. Long calls in shorter sessions
+## 5c. Savings: Judges and later rounds
+
+`savings` cuts what a review spends on its Judges and its later rounds.
+None of it takes anything from a reviewer or a Judge: every role keeps its
+tools and what it may read, and whatever a saving can't settle goes the way
+it would have gone without it.
+
+```yaml
+savings:
+  reuse_rulings: true        # the default
+  first_pass_judge: small    # off unless set; check it first, below
+  focus_after_fix: true      # off by default
+  blast_radius: true         # off by default
+```
+
+- **`reuse_rulings`** (default on). A Judge's ruling that didn't block (a
+  finding logged, or rejected) is kept. In a later round, a finding takes
+  it, with no Judge call, only when all of these hold: the same lens; the
+  same claim, by its title's words, as the Judge's or a reviewer's at that
+  place; within 3 lines of the same place; a file whose content no fix has
+  changed since; nothing else the ruling rested on changed (the lens's
+  text, the decided non-issues, the Judge's bindings, the rules); and the
+  rules as they stand still don't make it block. Anything short of that
+  goes to a Judge. A blocker's ruling is never kept: what a fix was meant
+  to settle is always judged again. The report marks each carried-over
+  ruling with the round it came from, and progress says so.
+- **`first_pass_judge`**: a binding, such as a cheaper model, that rules
+  first, with a note asking it to mark anything it isn't sure of. What it
+  would have block, rates Medium or above, calls a split or a values call,
+  states a fact the rules raise (a weak pin, a misleading claim, a blocker
+  by the lens's definition, a claimed fix, made worse), or marks unsure
+  goes on to the Judge's binding. The Judge rules fresh, from the very
+  prompt it would have had, never seeing the first pass's ruling. In
+  `per-lens` mode a lens goes on whole when any of its findings does; in
+  `per-finding` mode, each finding goes on alone. The report says which
+  binding ruled each finding.
+- **`focus_after_fix`**: after a fix, each lens's reviewers are told, last
+  in their brief, what the fix changed (its files and diff, cut at 24 KB)
+  and what could feel it (references to what those files define, and the
+  tests that name it, from the round's change map), as where to look
+  first. Their brief and the whole change are otherwise as before.
+- **`blast_radius`**: after a fix, one small call on the Sizer's binding,
+  with no tools, is asked whether each lens that passed before the fix
+  must attack again. A lens it says the fix can't touch, with a reason,
+  skips that round; one with blockers of its own, one that failed, and any
+  answer it can't give attack as before. A skipped lens is reported as
+  skipped, with the round and reason, never as passing the version it
+  skipped, and gets no lens label. In a review to convergence, the final
+  sweep still attacks it on the last version, so a skip saves the rounds
+  in between.
+
+**Check a first pass before you turn it on.** `acrbus acr judge-check
+<key>... --first-pass <binding>` rates each key's findings with the Judge
+alone and with the first pass in front of it, and prints both against the
+key: blockers agreed, missed and overrated, how many dimensions the first
+pass settled, and which findings it rated differently from the Judge. Turn
+it on only if it misses no blocker the Judge alone catches.
+
+## 5d. Long calls in shorter sessions
 
 A reviewer works in turns, and every turn rereads everything the session has
 read so far, most of it from the prompt cache. So a long session's cost grows

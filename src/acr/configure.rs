@@ -888,6 +888,8 @@ mod tests {
             state,
             note: String::new(),
             same_as: None,
+            reused_from: None,
+            ruled_by: None,
         }
     }
 
@@ -912,6 +914,7 @@ mod tests {
                 done: Vec::new(),
                 outcome: Outcome::Confirmed,
                 joined: String::new(),
+                skipped: Vec::new(),
             },
         );
         lenses.insert(
@@ -926,6 +929,7 @@ mod tests {
                 done: Vec::new(),
                 outcome: Outcome::Confirmed,
                 joined: String::new(),
+                skipped: Vec::new(),
             },
         );
         keep(&state, "R1", "shop", &lenses, 9).unwrap();

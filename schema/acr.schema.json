@@ -195,6 +195,17 @@
         "match_tools": {"type": "boolean", "description": "Give the reviewers and the Judge on one bridge and model the same tool definitions, the union of theirs, so their prompts share a cached prefix, and refuse a call to a tool outside a role's own. Only for an agent acrbus can hold to a list; others keep their own tools. Default true."}
       }
     },
+    "savings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a review saves on its Judges and later rounds, without taking anything a reviewer or Judge may read or use. Each field left out takes the default.",
+      "properties": {
+        "reuse_rulings": {"type": "boolean", "description": "Carry a Judge's ruling over to a later round's finding that makes the same claim, in the same lens, at the same place in a file no fix has changed since, when that ruling didn't block. Anything else goes to a Judge. Default true."},
+        "first_pass_judge": {"type": "string", "description": "A binding that rules on findings first, such as a cheaper model. What it would have block, rates Medium or above, calls a split or a values call, or marks unsure goes to the Judge's binding, which rules on it fresh, without the first pass's ruling. Left out, none. Check it with acr judge-check --first-pass before turning it on."},
+        "focus_after_fix": {"type": "boolean", "description": "After a fix, tell each lens's reviewers what it changed and what it could affect (its references and tests) as where to look first. The whole change stays theirs. Default false."},
+        "blast_radius": {"type": "boolean", "description": "After a fix, ask one small call on the Sizer's binding whether each lens that passed before the fix needs to attack again. A lens it skips is reported as skipped, with the reason, never as passing the new version. A lens with blockers of its own always attacks again. Default false."}
+      }
+    },
     "sessions": {
       "type": "object",
       "additionalProperties": false,

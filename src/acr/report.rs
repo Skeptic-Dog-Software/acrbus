@@ -573,6 +573,11 @@ pub fn labels(run: &Run, cfg: &Config) -> Vec<String> {
     let overall = if done { &names.ready } else { &names.not_ready };
     out.extend(overall.clone());
     for lens in run.lenses.values() {
+        // A lens that skipped the change as it is now hasn't passed it: it
+        // gets neither label.
+        if lens.skipped_since_attack().is_some() {
+            continue;
+        }
         let name = match lens.outcome {
             Outcome::Open => &names.waiting,
             Outcome::Confirmed | Outcome::Waived => &names.confirmed,
@@ -580,6 +585,18 @@ pub fn labels(run: &Run, cfg: &Config) -> Vec<String> {
         out.extend(name.as_ref().map(|n| n.replace("{lens}", &lens.id)));
     }
     out
+}
+
+/// A lens's outcome as said to a person: one that skipped the change as it
+/// is now says so, and why, rather than that it passed.
+pub fn outcome_of(lens: &LensResult) -> String {
+    match lens.skipped_since_attack() {
+        Some(s) => format!(
+            "Skipped in round {}, not attacked on the change as it is now: {}",
+            s.round, s.reason
+        ),
+        None => format!("{:?}", lens.outcome),
+    }
 }
 
 /// Every label this config could put on a change, so old ones can come off.
@@ -601,7 +618,7 @@ pub fn all_labels(run: &Run, cfg: &Config) -> Vec<String> {
     out
 }
 
-fn finding_line(f: &Finding) -> String {
+pub fn finding_line(f: &Finding) -> String {
     let at = f
         .file
         .as_deref()
@@ -619,8 +636,13 @@ fn finding_line(f: &Finding) -> String {
         Severity::Rejected => format!(" Reason: {}", f.reason),
         _ => String::new(),
     };
+    let ruled = match (f.reused_from, &f.ruled_by) {
+        (Some(round), _) => format!(" Ruling carried over from round {round}."),
+        (None, Some(binding)) => format!(" Ruled by {binding}."),
+        (None, None) => String::new(),
+    };
     format!(
-        "- **{:?}**{at}: {} ({state}).{reason}\n",
+        "- **{:?}**{at}: {} ({state}).{reason}{ruled}\n",
         f.severity, f.title
     )
 }
@@ -635,8 +657,10 @@ pub fn comment(run: &Run, cfg: &Config) -> Option<String> {
     );
     for lens in run.lenses.values() {
         out.push_str(&format!(
-            "### {} ({:?})\n\n{}\n\n",
-            lens.id, lens.outcome, lens.criteria
+            "### {} ({})\n\n{}\n\n",
+            lens.id,
+            outcome_of(lens),
+            lens.criteria
         ));
         if format == CommentFormat::Full {
             for round in &lens.rounds {
