@@ -33,6 +33,13 @@ const CLAIM_MINUTES: i64 = 60;
 const RENEW_WITHIN_MS: i64 = 20 * 60_000;
 /// Set on a resume the daemon starts, so the pause it ends at says so.
 const RESUMED: &str = "GRAYBOARD_RESUMED";
+/// How long a claimed review may show as running with no process driving
+/// it before its claim is released: it crashed, or was killed.
+const ORPHAN_GRACE_MS: i64 = 10 * 60_000;
+/// A note that fails waits this long before its next try, doubling each
+/// time up to `NOTE_RETRY_MAX_MS`.
+const NOTE_RETRY_MS: i64 = 60_000;
+const NOTE_RETRY_MAX_MS: i64 = 30 * 60_000;
 
 fn outbox(paths: &Paths) -> PathBuf {
     gb::dir(paths).join("outbox")
@@ -48,6 +55,10 @@ fn pending_dir(paths: &Paths) -> PathBuf {
 
 fn claims_path(paths: &Paths) -> PathBuf {
     gb::dir(paths).join("claims.json")
+}
+
+fn retries_path(paths: &Paths) -> PathBuf {
+    gb::dir(paths).join("outbox-retries.json")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -267,12 +278,25 @@ fn note(paths: &Paths, run: &Run, cfg: &Config) -> Result<()> {
 
 // The daemon's side.
 
-/// One pass: send what's waiting, read your replies, keep the claims.
+type Step = fn(&Paths, &mut Session, &dyn Fn(String)) -> Result<()>;
+
+/// One pass: send what's waiting, read your replies, keep the claims. Each
+/// step runs whatever the one before it met, so a note that can't be sent
+/// never keeps your replies from being read or a claim from being renewed.
+/// The first failure is what the pass returns.
 pub fn tick(paths: &Paths, s: &mut Session, log: &dyn Fn(String)) -> Result<()> {
-    send_notes(paths, s, log)?;
-    read_replies(paths, s, log)?;
-    keep_claims(paths, s, log)?;
-    Ok(())
+    let steps: [(&str, Step); 3] = [
+        ("sending notes", send_notes),
+        ("reading replies", read_replies),
+        ("keeping claims", keep_claims),
+    ];
+    let mut first: Option<anyhow::Error> = None;
+    for (what, step) in steps {
+        if let Err(e) = step(paths, s, log) {
+            first.get_or_insert(e.context(what));
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -324,55 +348,129 @@ fn tell(paths: &Paths, to: &str, body: String) -> Result<()> {
     Ok(())
 }
 
+/// A note's failed tries, so it waits before the next.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Retry {
+    attempts: u32,
+    next_at: i64,
+    last: String,
+}
+
+/// Sends each note waiting in the outbox. A note that fails is said, and
+/// waits longer before each try, while the rest go on: say a DM to your
+/// human handle before you've linked Slack. Only a server that's away, or a
+/// sign-in it won't take, stops the pass, since every note would fail alike.
 fn send_notes(paths: &Paths, s: &mut Session, log: &dyn Fn(String)) -> Result<()> {
-    for path in files(&outbox(paths)) {
+    let mut retries: BTreeMap<String, Retry> = read_json(&retries_path(paths)).unwrap_or_default();
+    let before = retries.len();
+    let mut changed = false;
+    let now = now_ms();
+    let mut stop: Option<anyhow::Error> = None;
+    let waiting = files(&outbox(paths));
+    retries.retain(|k, _| {
+        waiting
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == *k))
+    });
+    for path in waiting {
+        let key = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if retries.get(&key).is_some_and(|r| r.next_at > now) {
+            continue;
+        }
         let Some(note) = read_json::<Note>(&path) else {
             continue;
         };
-        let id = dm(s, &note.text, None)?;
-        match note.kind {
-            Kind::Gate => {
-                let pending = Pending {
-                    note: note.clone(),
-                    message_id: id,
-                    sent_at: now_ms(),
-                    answered: None,
-                };
-                save_json(
-                    &pending_dir(paths).join(format!("{}.json", note.run)),
-                    &pending,
-                )?;
-            }
-            Kind::Fix => {
-                if note.resumed
-                    && let Some(starter) = &note.starter
-                    && let Err(e) = tell(
-                        paths,
-                        starter,
-                        format!(
-                            "Review {} waits for you: your user's answers chose fixes for you to \
-                             fold in. `{APP_NAME} acr ask {}` says what, then `{APP_NAME} acr \
-                             resume {} --fixed`.",
-                            note.run, note.run, note.run
-                        ),
-                    )
-                {
-                    log(format!(
-                        "grayboard: couldn't tell {starter} about review {}: {e:#}",
-                        note.run
-                    ));
+        match send_note(paths, s, log, &path, &note) {
+            Ok(()) => changed |= retries.remove(&key).is_some(),
+            Err(e) => {
+                let everywhere = matches!(
+                    gb::trouble(&e),
+                    Some(Trouble::SignedOut(_) | Trouble::Unreachable(_))
+                );
+                if everywhere {
+                    stop = Some(e);
+                    break;
                 }
-                answered_out(paths, &note.run);
+                let r = retries.entry(key).or_default();
+                r.attempts += 1;
+                let wait = NOTE_RETRY_MS
+                    .saturating_mul(1 << r.attempts.min(10).saturating_sub(1))
+                    .min(NOTE_RETRY_MAX_MS);
+                r.next_at = now + wait;
+                let why = format!("{e:#}");
+                if r.last != why {
+                    log(format!(
+                        "grayboard: couldn't send review {}'s note ({why}); trying again in {} min, \
+                         while the other notes, your replies and the claims go on",
+                        note.run,
+                        wait / 60_000
+                    ));
+                    r.last = why;
+                }
+                changed = true;
             }
-            Kind::End => answered_out(paths, &note.run),
         }
-        // Kept, to be looked at, until the daemon's cleanup.
-        let to = sent(paths).join(path.file_name().unwrap_or_default());
-        fs::create_dir_all(sent(paths))?;
-        fs::rename(&path, &to)?;
-        let kind = format!("{:?}", note.kind).to_lowercase();
-        log(format!("grayboard: sent review {}'s {kind} note", note.run));
     }
+    if changed || retries.len() != before {
+        save_json(&retries_path(paths), &retries)?;
+    }
+    stop.map_or(Ok(()), Err)
+}
+
+fn send_note(
+    paths: &Paths,
+    s: &mut Session,
+    log: &dyn Fn(String),
+    path: &Path,
+    note: &Note,
+) -> Result<()> {
+    let id = dm(s, &note.text, None)?;
+    match note.kind {
+        Kind::Gate => {
+            let pending = Pending {
+                note: note.clone(),
+                message_id: id,
+                sent_at: now_ms(),
+                answered: None,
+            };
+            save_json(
+                &pending_dir(paths).join(format!("{}.json", note.run)),
+                &pending,
+            )?;
+        }
+        Kind::Fix => {
+            if note.resumed
+                && let Some(starter) = &note.starter
+                && let Err(e) = tell(
+                    paths,
+                    starter,
+                    format!(
+                        "Review {} waits for you: your user's answers chose fixes for you to \
+                         fold in. `{APP_NAME} acr ask {}` says what, then `{APP_NAME} acr \
+                         resume {} --fixed`.",
+                        note.run, note.run, note.run
+                    ),
+                )
+            {
+                log(format!(
+                    "grayboard: couldn't tell {starter} about review {}: {e:#}",
+                    note.run
+                ));
+            }
+            answered_out(paths, &note.run);
+        }
+        Kind::End => answered_out(paths, &note.run),
+    }
+    // Kept, to be looked at, until the daemon's cleanup.
+    let to = sent(paths).join(path.file_name().unwrap_or_default());
+    fs::create_dir_all(sent(paths))?;
+    fs::rename(path, &to)?;
+    let kind = format!("{:?}", note.kind).to_lowercase();
+    log(format!("grayboard: sent review {}'s {kind} note", note.run));
     Ok(())
 }
 
@@ -386,7 +484,8 @@ fn answered_out(paths: &Paths, run: &str) {
     }
 }
 
-/// One message in `dm_inbox`'s `unanswered`.
+/// One message in `dm_inbox`'s `unanswered`, with its whole body and its
+/// thread's root once `dm_thread` has said.
 #[derive(Debug, Deserialize)]
 struct Incoming {
     id: i64,
@@ -395,6 +494,34 @@ struct Incoming {
     parent_id: Option<i64>,
     #[serde(default)]
     body: String,
+    /// The thread's first message: a gate note's, for a reply to one.
+    #[serde(default)]
+    root: Option<i64>,
+}
+
+/// Message `id`'s whole body and its thread's root. The inbox gives only
+/// the first 300 characters of a long message, and a reply in a Slack thread
+/// names the thread's latest message as its parent, so neither is read from
+/// the inbox.
+fn whole(s: &mut Session, id: i64) -> Result<(String, Option<i64>)> {
+    let t = s.call("dm_thread", json!({ "thread": id }))?;
+    let messages = t
+        .as_array()
+        .or_else(|| t["messages"].as_array())
+        .context("dm_thread's answer isn't a list of messages")?;
+    let me = messages
+        .iter()
+        .find(|m| m["id"].as_i64() == Some(id))
+        .context("the message isn't in its own thread")?;
+    let body = me["body"]
+        .as_str()
+        .context("the message has no body")?
+        .to_string();
+    let root = messages
+        .iter()
+        .find(|m| m["parent_id"].is_null())
+        .and_then(|m| m["id"].as_i64());
+    Ok((body, root))
 }
 
 fn read_replies(paths: &Paths, s: &mut Session, log: &dyn Fn(String)) -> Result<()> {
@@ -405,24 +532,48 @@ fn read_replies(paths: &Paths, s: &mut Session, log: &dyn Fn(String)) -> Result<
         return Ok(());
     };
     let human = format!("{principal}/human");
-    for m in unanswered {
-        if m.from == human {
-            let said = answer(paths, &m);
-            let parent = m.parent_id.unwrap_or(m.id);
-            dm(s, &said, Some(parent))?;
-            log(format!(
-                "grayboard: answered message {} from your human handle",
-                m.id
-            ));
-        } else {
+    let mut first: Option<anyhow::Error> = None;
+    for mut m in unanswered {
+        if m.from != human {
             log(format!(
                 "grayboard: ignored a message from {}: only your own human handle answers reviews",
                 m.from
             ));
+            if let Err(e) = s.call("dm_ack", json!({ "message_id": m.id })) {
+                first.get_or_insert(e);
+            }
+            continue;
         }
-        s.call("dm_ack", json!({ "message_id": m.id }))?;
+        // Never read from the inbox's snippet: left unacknowledged, it's
+        // read whole on a later pass.
+        match whole(s, m.id) {
+            Ok((body, root)) => {
+                m.body = body;
+                m.root = root;
+            }
+            Err(e) => {
+                log(format!(
+                    "grayboard: couldn't read message {} whole ({e:#}); trying again next pass",
+                    m.id
+                ));
+                first.get_or_insert(e);
+                continue;
+            }
+        }
+        let said = answer(paths, &m);
+        let replied = dm(s, &said, Some(m.id))
+            .and_then(|_| s.call("dm_ack", json!({ "message_id": m.id })).map(|_| ()));
+        match replied {
+            Ok(()) => log(format!(
+                "grayboard: answered message {} from your human handle",
+                m.id
+            )),
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 /// The review a reply is about: the one whose note it replies to, the one it
@@ -432,10 +583,24 @@ fn which(paths: &Paths, m: &Incoming) -> Result<Pending, String> {
         .iter()
         .filter_map(|p| read_json(p))
         .collect();
-    if let Some(p) = m.parent_id
-        && let Some(found) = all.iter().find(|x| x.message_id == p)
-    {
-        return Ok(found.clone());
+    for at in [m.root, m.parent_id].into_iter().flatten() {
+        if let Some(found) = all.iter().find(|x| x.message_id == at) {
+            return Ok(found.clone());
+        }
+    }
+    // A reply in the thread of a review that has moved past its questions.
+    if let Some(root) = m.root {
+        let done: Vec<Pending> = files(&pending_dir(paths).join("done"))
+            .iter()
+            .filter_map(|p| read_json(p))
+            .collect();
+        if let Some(old) = done.iter().find(|x| x.message_id == root) {
+            return Err(format!(
+                "Review {} has moved past the questions in this thread, so I can't take these \
+                 answers. I'll send its new questions if it waits again.",
+                old.note.run
+            ));
+        }
     }
     let first = m
         .body
@@ -736,6 +901,10 @@ pub struct ClaimAnswer {
 struct Held {
     run: String,
     expires_at: i64,
+    /// When its review was first seen showing as running with no process
+    /// driving it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orphaned_at: Option<i64>,
 }
 
 fn read_claims(paths: &Paths) -> BTreeMap<String, Held> {
@@ -765,7 +934,10 @@ pub fn take_claim(
     let mut held = read_claims(paths);
     if let Some(h) = held.get(key)
         && h.run != run
-        && !done(paths, &h.run)
+        && matches!(
+            standing(paths, &h.run, &super::keep::active(paths)),
+            Standing::Waiting | Standing::Live
+        )
     {
         return Ok(ClaimAnswer {
             taken: false,
@@ -786,6 +958,7 @@ pub fn take_claim(
                 expires_at: r["claim"]["expires_at"]
                     .as_i64()
                     .unwrap_or(now_ms() + CLAIM_MINUTES * 60_000),
+                orphaned_at: None,
             },
         );
         save_json(&claims_path(paths), &held)?;
@@ -817,67 +990,145 @@ pub fn take_claim(
 fn name(paths: &Paths) -> String {
     gb::settings(paths)
         .map(|c| c.name)
-        .unwrap_or_else(|| "acr".into())
+        .unwrap_or_else(crate::config::default_grayboard_name)
 }
 
-/// Whether review `run` is over: confirmed, stopped, or gone.
-fn done(paths: &Paths, run: &str) -> bool {
+/// How a claimed review stands, for its claim.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Standing {
+    /// Confirmed or stopped.
+    Over,
+    /// At a gate, waiting for a person: its claim stays.
+    Waiting,
+    /// A process is driving it, or starting it.
+    Live,
+    /// It shows as running, or never got a record, and no process drives
+    /// it: it crashed, or was killed.
+    Orphaned,
+}
+
+fn standing(paths: &Paths, run: &str, active: &[String]) -> Standing {
     if super::keep::is_finished(paths, run) {
-        return true;
+        return Standing::Over;
     }
-    let path = super::run_dir(paths, run).join("run.json");
-    match fs::read(&path)
+    let live = active.iter().any(|a| a == run);
+    let record = fs::read(super::run_dir(paths, run).join("run.json"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<Run>(&b).ok())
-    {
-        Some(r) => matches!(r.status, Status::Confirmed | Status::Stopped),
-        None => true,
+        .and_then(|b| serde_json::from_slice::<Run>(&b).ok());
+    match record.map(|r| r.status) {
+        Some(Status::Confirmed | Status::Stopped) => Standing::Over,
+        Some(Status::Waiting) => Standing::Waiting,
+        _ if live => Standing::Live,
+        _ => Standing::Orphaned,
     }
 }
 
-/// Renews the claims of reviews still running or waiting, and releases the
-/// claims of reviews that ended.
+/// Renews the claims of reviews running or waiting, and releases the claims
+/// of reviews that ended. A review that shows as running with no process
+/// driving it gets `ORPHAN_GRACE_MS` to come back, unrenewed, and then its
+/// claim goes. One claim that fails doesn't keep the others from their turn.
 fn keep_claims(paths: &Paths, s: &mut Session, log: &dyn Fn(String)) -> Result<()> {
     let mut held = read_claims(paths);
     if held.is_empty() {
         return Ok(());
     }
+    let active = super::keep::active(paths);
+    let now = now_ms();
     let mut changed = false;
+    let mut first: Option<anyhow::Error> = None;
+    let release = |s: &mut Session, key: &str, why: String| -> Result<()> {
+        s.call("claim_release", json!({ "key": key, "note": why }))?;
+        Ok(())
+    };
     for (key, h) in held.clone() {
-        if done(paths, &h.run) {
-            s.call(
-                "claim_release",
-                json!({ "key": key, "note": format!("review {} ended", h.run) }),
-            )?;
-            held.remove(&key);
-            changed = true;
-            log(format!("grayboard: released {key}"));
-        } else if h.expires_at - now_ms() < RENEW_WITHIN_MS {
-            let r = s.call(
-                "claim_take",
-                json!({ "key": key, "ttl_minutes": CLAIM_MINUTES }),
-            )?;
-            if let Some(until) = r["claim"]["expires_at"].as_i64() {
-                held.insert(
-                    key.clone(),
-                    Held {
-                        run: h.run.clone(),
-                        expires_at: until,
-                    },
-                );
-                changed = true;
-            } else {
-                log(format!(
-                    "grayboard: couldn't renew {key}: {}",
-                    r["held_by"].as_str().unwrap_or("refused")
-                ));
+        let result = match standing(paths, &h.run, &active) {
+            Standing::Over => release(s, &key, format!("review {} ended", h.run)).map(|()| {
+                held.remove(&key);
+                log(format!("grayboard: released {key}"));
+                true
+            }),
+            Standing::Orphaned => match h.orphaned_at {
+                None => {
+                    held.insert(
+                        key.clone(),
+                        Held {
+                            orphaned_at: Some(now),
+                            ..h.clone()
+                        },
+                    );
+                    log(format!(
+                        "grayboard: review {} shows as running, but no process drives it; \
+                         {key} is released in {} min unless it comes back",
+                        h.run,
+                        ORPHAN_GRACE_MS / 60_000
+                    ));
+                    Ok(true)
+                }
+                Some(since) if now - since >= ORPHAN_GRACE_MS => release(
+                    s,
+                    &key,
+                    format!("review {} stopped without finishing", h.run),
+                )
+                .map(|()| {
+                    held.remove(&key);
+                    log(format!(
+                        "grayboard: released {key}: review {} stopped without finishing, so it \
+                         crashed or was killed. `{APP_NAME} acr resume {}` goes on with it, \
+                         without its claim",
+                        h.run, h.run
+                    ));
+                    true
+                }),
+                Some(_) => Ok(false),
+            },
+            Standing::Waiting | Standing::Live => {
+                let mut now_held = h.clone();
+                let mut touched = false;
+                if h.orphaned_at.is_some() {
+                    now_held.orphaned_at = None;
+                    touched = true;
+                    log(format!(
+                        "grayboard: review {} is back; keeping {key}",
+                        h.run
+                    ));
+                }
+                if h.expires_at - now < RENEW_WITHIN_MS {
+                    match s.call(
+                        "claim_take",
+                        json!({ "key": key, "ttl_minutes": CLAIM_MINUTES }),
+                    ) {
+                        Ok(r) => match r["claim"]["expires_at"].as_i64() {
+                            Some(until) => {
+                                now_held.expires_at = until;
+                                touched = true;
+                            }
+                            None => log(format!(
+                                "grayboard: couldn't renew {key}: {}",
+                                r["held_by"].as_str().unwrap_or("refused")
+                            )),
+                        },
+                        Err(e) => {
+                            first.get_or_insert(e);
+                        }
+                    }
+                }
+                if touched {
+                    held.insert(key.clone(), now_held);
+                }
+                Ok(touched)
+            }
+        };
+        match result {
+            Ok(c) => changed |= c,
+            Err(e) => {
+                first.get_or_insert(e);
             }
         }
     }
     if changed {
         save_json(&claims_path(paths), &held)?;
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 /// The daemon's answer to a claim request, said plainly when it can't ask.
@@ -935,6 +1186,17 @@ pub(super) mod tests {
         from_human: Vec<(i64, String, Option<i64>, bool)>,
         claims: BTreeMap<String, (String, String, i64)>,
         released: Vec<String>,
+        /// Refresh requests received.
+        refreshes: u32,
+        /// The next refresh is spent, then answered with this status, as a
+        /// refresh whose answer is lost.
+        lose_refresh: Option<u16>,
+        /// Refresh tokens revoked.
+        revoked: Vec<String>,
+        /// A DM whose body holds this is refused, as before Slack is linked.
+        refuse_dm_with: Option<String>,
+        /// DM sends refused.
+        refused_dms: u32,
     }
 
     const ME: &str = "you@example.com";
@@ -972,14 +1234,22 @@ pub(super) mod tests {
                     let p: BTreeMap<String, String> = gb::query(q).into_iter().collect();
                     assert_eq!(p["client_id"], "acrbus");
                     assert_eq!(p["code_challenge_method"], "S256");
-                    assert_eq!(p["scope"], "grayboard:tools grayboard:delivery");
+                    assert_eq!(p["scope"], "grayboard:tools");
                     f.challenge = Some(p["code_challenge"].clone());
                     f.redirect = Some(p["redirect_uri"].clone());
                     let to = format!("{}?code=c1&state={}", p["redirect_uri"], gb::enc(&p["state"]));
                     respond(req, 302, String::new(), &[("Location", &to)]);
                 }
+                "/oauth/revoke" => {
+                    let p: BTreeMap<String, String> = gb::query(&body).into_iter().collect();
+                    f.revoked.push(p["token"].clone());
+                    respond(req, 200, String::new(), &[]);
+                }
                 "/oauth/token" => {
                     let p: BTreeMap<String, String> = gb::query(&body).into_iter().collect();
+                    if p["grant_type"] == "refresh_token" {
+                        f.refreshes += 1;
+                    }
                     let ok = match p["grant_type"].as_str() {
                         "authorization_code" => {
                             f.challenge.as_deref() == Some(&gb::challenge(&p["code_verifier"]))
@@ -995,7 +1265,14 @@ pub(super) mod tests {
                     f.next_id += 1;
                     f.access = format!("a{}", f.next_id);
                     f.refresh = format!("r{}", f.next_id);
-                    respond(req, 200, json!({ "access_token": f.access, "token_type": "Bearer", "expires_in": 3600, "refresh_token": f.refresh, "scope": "grayboard:tools grayboard:delivery" }).to_string(), &[]);
+                    if p["grant_type"] == "refresh_token"
+                        && let Some(status) = f.lose_refresh.take()
+                    {
+                        // Spent and rotated, but the answer never arrives whole.
+                        respond(req, status, "{}".into(), &[]);
+                        continue;
+                    }
+                    respond(req, 200, json!({ "access_token": f.access, "token_type": "Bearer", "expires_in": 3600, "refresh_token": f.refresh, "scope": "grayboard:tools" }).to_string(), &[]);
                 }
                 "/mcp" => {
                     if f.expire_next || auth.as_deref() != Some(&format!("Bearer {}", f.access)) {
@@ -1020,8 +1297,8 @@ pub(super) mod tests {
                             }
                             assert!(msg["params"]["_meta"][gb::SESSION_META].as_str().is_some());
                             let a = &msg["params"]["arguments"];
-                            let text = tool(&mut f, msg["params"]["name"].as_str().unwrap(), a);
-                            let result = json!({ "content": [{ "type": "text", "text": text.to_string() }] });
+                            let (text, is_error) = tool(&mut f, msg["params"]["name"].as_str().unwrap(), a);
+                            let result = json!({ "content": [{ "type": "text", "text": text.to_string() }], "isError": is_error });
                             respond(req, 200, sse(result), &[("Content-Type", "text/event-stream")]);
                         }
                         other => panic!("unexpected {other}"),
@@ -1032,7 +1309,38 @@ pub(super) mod tests {
         }
     }
 
-    fn tool(f: &mut Fake, name: &str, a: &Value) -> Value {
+    /// Every message, as the server keeps them: (id, sender, body, parent).
+    fn messages(f: &Fake) -> Vec<(i64, String, String, Option<i64>)> {
+        let mut all: Vec<_> = f
+            .to_human
+            .iter()
+            .map(|(id, b, p)| (*id, format!("{ME}/acr"), b.clone(), *p))
+            .chain(
+                f.from_human
+                    .iter()
+                    .map(|(id, b, p, _)| (*id, format!("{ME}/human"), b.clone(), *p)),
+            )
+            .collect();
+        all.sort_by_key(|m| m.0);
+        all
+    }
+
+    /// A tool's result, and whether it's a refusal.
+    fn tool(f: &mut Fake, name: &str, a: &Value) -> (Value, bool) {
+        if name == "dm_send"
+            && let Some(marker) = &f.refuse_dm_with
+            && a["body"].as_str().unwrap_or("").contains(marker.as_str())
+        {
+            f.refused_dms += 1;
+            return (
+                json!({ "code": "no_channel", "message": "your human handle has no linked chat app yet" }),
+                true,
+            );
+        }
+        (tool_ok(f, name, a), false)
+    }
+
+    fn tool_ok(f: &mut Fake, name: &str, a: &Value) -> Value {
         let now = now_ms();
         match name {
             "whoami" => json!({ "principal": ME, "held": f.held }),
@@ -1047,7 +1355,34 @@ pub(super) mod tests {
                 f.to_human.push((id, a["body"].as_str().unwrap().into(), a["parent_id"].as_i64()));
                 json!({ "message_id": id, "delivered_now": true })
             }
-            "dm_inbox" => json!({ "unanswered": f.from_human.iter().filter(|m| !m.3).map(|m| json!({ "id": m.0, "from": format!("{ME}/human"), "parent_id": m.2, "age": "0m", "body": m.1 })).collect::<Vec<_>>() }),
+            // As the server shows them: the first 300 characters of a long body.
+            "dm_inbox" => json!({ "unanswered": f.from_human.iter().filter(|m| !m.3).map(|m| {
+                let body = if m.1.chars().count() > 300 {
+                    format!("{}… (dm_thread for the rest)", m.1.chars().take(300).collect::<String>())
+                } else {
+                    m.1.clone()
+                };
+                json!({ "id": m.0, "from": format!("{ME}/human"), "parent_id": m.2, "age": "0m", "body": body })
+            }).collect::<Vec<_>>() }),
+            // The whole thread, from its root.
+            "dm_thread" => {
+                let all = messages(f);
+                let parent = |id: i64| all.iter().find(|m| m.0 == id).and_then(|m| m.3);
+                let mut root = a["thread"].as_i64().unwrap();
+                while let Some(p) = parent(root) {
+                    root = p;
+                }
+                let in_tree = |mut id: i64| loop {
+                    if id == root {
+                        return true;
+                    }
+                    match parent(id) {
+                        Some(p) => id = p,
+                        None => return false,
+                    }
+                };
+                json!(all.iter().filter(|m| in_tree(m.0)).map(|m| json!({ "id": m.0, "sender": m.1, "body": m.2, "parent_id": m.3 })).collect::<Vec<_>>())
+            }
             "dm_ack" => {
                 let id = a["message_id"].as_i64().unwrap();
                 for m in &mut f.from_human {
@@ -1258,6 +1593,245 @@ pub(super) mod tests {
         s.call("whoami", json!({})).unwrap();
         let on_disk: Value = serde_json::from_slice(&fs::read(&grant).unwrap()).unwrap();
         assert_eq!(on_disk["refresh"], json!(fake.lock().unwrap().refresh));
+    }
+
+    /// The answers a resume of `run` was started with, if one was.
+    fn resumed_with(run: &str) -> Option<BTreeMap<String, Value>> {
+        let file = RESUMED
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(r, _)| r == run)
+            .map(|(_, f)| f.clone())?;
+        serde_json::from_slice(&fs::read(file).ok()?).ok()
+    }
+
+    /// A review waiting at its scope gate whose note has gone out: the
+    /// note's message ID.
+    fn noted(
+        fake: &Arc<Mutex<Fake>>,
+        paths: &Paths,
+        s: &mut Session,
+        cfg: &Config,
+        id: &str,
+    ) -> i64 {
+        let run = waiting(id);
+        crate::acr::save(paths, &run, cfg).unwrap();
+        on_finish(paths, &run, cfg);
+        tick(paths, s, &|_| {}).unwrap();
+        let f = fake.lock().unwrap();
+        f.to_human
+            .iter()
+            .rev()
+            .find(|(_, body, _)| body.contains(id))
+            .map(|(m, _, _)| *m)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_long_reply_is_read_whole_not_from_the_inboxs_snippet() {
+        let (fake, base) = fake();
+        let (paths, mut s) = signed_in(&base);
+        // The sign-in asked for, and holds, only the tools scope.
+        let grant: Value =
+            serde_json::from_slice(&fs::read(gb::dir(&paths).join("grant.json")).unwrap()).unwrap();
+        assert_eq!(grant["scope"], "grayboard:tools");
+        let cfg = cfg(None);
+        let note = noted(&fake, &paths, &mut s, &cfg, "01RUNEEEEEEEEE");
+        // The second answer sits past the inbox's first 300 characters.
+        let body = format!("1: 1\n{}\n2: The Orchestrator", " ".repeat(400));
+        reply(&fake, &body, Some(note));
+        tick(&paths, &mut s, &|_| {}).unwrap();
+        let (_, said) = last_to_human(&fake);
+        assert!(said.starts_with("Resuming it with your answers"), "{said}");
+        let answers = resumed_with("01RUNEEEEEEEEE").unwrap();
+        assert!(answers.values().any(|v| v == "Approve"), "{answers:?}");
+        assert!(
+            answers.values().any(|v| v == "The Orchestrator"),
+            "{answers:?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_further_down_a_slack_thread_still_finds_its_review() {
+        let (fake, base) = fake();
+        let (paths, mut s) = signed_in(&base);
+        let cfg = cfg(None);
+        // Two reviews wait, so only the thread can say which a reply is for.
+        let first = noted(&fake, &paths, &mut s, &cfg, "01RUNFFFFFFFFF");
+        noted(&fake, &paths, &mut s, &cfg, "01RUNGGGGGGGGG");
+        reply(&fake, "sounds good", Some(first));
+        tick(&paths, &mut s, &|_| {}).unwrap();
+        let (answered_in_thread, said) = last_to_human(&fake);
+        assert!(said.contains("couldn't read"), "{said}");
+        // Slack makes the thread's latest message, acrbus's answer, the parent.
+        reply(&fake, "1: 1\n2: The Orchestrator", Some(answered_in_thread));
+        tick(&paths, &mut s, &|_| {}).unwrap();
+        let (_, said) = last_to_human(&fake);
+        assert!(said.starts_with("Resuming it with your answers"), "{said}");
+        assert!(resumed_with("01RUNFFFFFFFFF").is_some());
+        assert!(resumed_with("01RUNGGGGGGGGG").is_none());
+    }
+
+    #[test]
+    fn a_note_that_fails_doesnt_hold_up_your_replies_or_the_claims() {
+        let (fake, base) = fake();
+        let (paths, mut s) = signed_in(&base);
+        let cfg = cfg(None);
+        // One review waits, its note sent, its claim held and near its end.
+        let note = noted(&fake, &paths, &mut s, &cfg, "01RUNHHHHHHHHH");
+        assert!(
+            take_claim(&paths, &mut s, "review:app#21", "01RUNHHHHHHHHH", "n")
+                .unwrap()
+                .taken
+        );
+        let mut held = read_claims(&paths);
+        held.get_mut("review:app#21").unwrap().expires_at = now_ms() + 60_000;
+        save_json(&claims_path(&paths), &held).unwrap();
+        // Another review's note the server refuses, every time.
+        fake.lock().unwrap().refuse_dm_with = Some("01RUNIIIIIIIII".into());
+        let other = waiting("01RUNIIIIIIIII");
+        crate::acr::save(&paths, &other, &cfg).unwrap();
+        on_finish(&paths, &other, &cfg);
+        reply(&fake, "1: 1\n2: The Orchestrator", Some(note));
+        let logged = Mutex::new(Vec::new());
+        let log = |l: String| logged.lock().unwrap().push(l);
+        tick(&paths, &mut s, &log).unwrap();
+        // Your reply was read and acted on, and the claim renewed.
+        assert!(resumed_with("01RUNHHHHHHHHH").is_some());
+        assert!(read_claims(&paths)["review:app#21"].expires_at > now_ms() + 50 * 60_000);
+        // The refused note was said once and waits in the outbox.
+        assert_eq!(fake.lock().unwrap().refused_dms, 1);
+        assert_eq!(files(&outbox(&paths)).len(), 1);
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("couldn't send review 01RUNIIIIIIIII's note")),
+            "{:?}",
+            logged.lock().unwrap()
+        );
+        // It waits before trying again.
+        tick(&paths, &mut s, &log).unwrap();
+        assert_eq!(fake.lock().unwrap().refused_dms, 1);
+        let retries: BTreeMap<String, Retry> = read_json(&retries_path(&paths)).unwrap();
+        assert!(
+            retries
+                .values()
+                .all(|r| r.attempts == 1 && r.next_at > now_ms())
+        );
+    }
+
+    #[test]
+    fn a_refresh_whose_answer_is_lost_is_never_sent_again() {
+        let (fake, base) = fake();
+        let (paths, mut s) = signed_in(&base);
+        let grant_file = gb::dir(&paths).join("grant.json");
+
+        // Refused before it reached the server: safe, and tried again later.
+        let good: Value = serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+        let mut away = good.clone();
+        away["token_endpoint"] = json!("http://127.0.0.1:1/oauth/token");
+        away["access_expires_at"] = json!(0);
+        fs::write(&grant_file, away.to_string()).unwrap();
+        let mut t = Session::open(&paths).unwrap();
+        let e = t.call("whoami", json!({})).unwrap_err();
+        assert!(
+            matches!(gb::trouble(&e), Some(Trouble::Unreachable(_))),
+            "{e:#}"
+        );
+        let on_disk: Value = serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+        assert!(on_disk.get("refresh_pending").is_none() && on_disk["refresh"] == good["refresh"]);
+        assert_eq!(fake.lock().unwrap().refreshes, 0);
+        fs::write(&grant_file, good.to_string()).unwrap();
+
+        // Spent by the server, its answer lost: revoked, and never resent.
+        let spent = fake.lock().unwrap().refresh.clone();
+        {
+            let mut f = fake.lock().unwrap();
+            f.expire_next = true;
+            f.lose_refresh = Some(500);
+        }
+        let e = s.call("whoami", json!({})).unwrap_err();
+        assert!(
+            matches!(gb::trouble(&e), Some(Trouble::SignedOut(m)) if m.contains("sign-in was lost") && m.contains("grayboard login")),
+            "{e:#}"
+        );
+        assert!(s.call("whoami", json!({})).is_err());
+        assert!(Session::open(&paths).is_err());
+        let f = fake.lock().unwrap();
+        assert_eq!(f.refreshes, 1, "sent exactly once");
+        assert_eq!(f.revoked, [spent]);
+    }
+
+    #[test]
+    fn a_refresh_under_way_when_acrbus_stopped_is_never_sent_again() {
+        let (fake, base) = fake();
+        let (paths, _s) = signed_in(&base);
+        let grant_file = gb::dir(&paths).join("grant.json");
+        let mut g: Value = serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+        let token = g["refresh"].clone();
+        g["refresh_pending"] = json!(now_ms() - 5_000);
+        fs::write(&grant_file, g.to_string()).unwrap();
+        let e = Session::open(&paths).err().unwrap();
+        assert!(
+            matches!(gb::trouble(&e), Some(Trouble::SignedOut(m)) if m.contains("under way")),
+            "{e:#}"
+        );
+        let f = fake.lock().unwrap();
+        assert_eq!(f.refreshes, 0);
+        assert_eq!(json!(f.revoked), json!([token]));
+    }
+
+    #[test]
+    fn a_crashed_reviews_claim_is_released_after_a_grace() {
+        let (fake, base) = fake();
+        let (paths, mut s) = signed_in(&base);
+        let cfg = cfg(None);
+        // Running, by its record, with no process driving it.
+        let mut run = waiting("01RUNJJJJJJJJJ");
+        run.status = Status::Running;
+        run.waiting = None;
+        crate::acr::save(&paths, &run, &cfg).unwrap();
+        assert!(
+            take_claim(&paths, &mut s, "review:app#31", "01RUNJJJJJJJJJ", "n")
+                .unwrap()
+                .taken
+        );
+        // A waiting one keeps its claim however long it waits.
+        crate::acr::save(&paths, &waiting("01RUNKKKKKKKKK"), &cfg).unwrap();
+        assert!(
+            take_claim(&paths, &mut s, "review:app#32", "01RUNKKKKKKKKK", "n")
+                .unwrap()
+                .taken
+        );
+        let logged = Mutex::new(Vec::new());
+        let log = |l: String| logged.lock().unwrap().push(l);
+        keep_claims(&paths, &mut s, &log).unwrap();
+        // First seen: said, and given its grace.
+        assert!(fake.lock().unwrap().released.is_empty());
+        assert!(read_claims(&paths)["review:app#31"].orphaned_at.is_some());
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("no process drives it"))
+        );
+        // Past the grace: released.
+        let mut held = read_claims(&paths);
+        held.get_mut("review:app#31").unwrap().orphaned_at = Some(now_ms() - ORPHAN_GRACE_MS - 1);
+        save_json(&claims_path(&paths), &held).unwrap();
+        keep_claims(&paths, &mut s, &log).unwrap();
+        assert_eq!(fake.lock().unwrap().released, ["review:app#31"]);
+        assert!(read_claims(&paths).contains_key("review:app#32"));
+        // A live one is never treated as crashed.
+        let _live = crate::acr::keep::active_guard(&paths, "01RUNJJJJJJJJJ").unwrap();
+        assert_eq!(
+            standing(&paths, "01RUNJJJJJJJJJ", &crate::acr::keep::active(&paths)),
+            Standing::Live
+        );
     }
 
     #[test]
