@@ -972,12 +972,26 @@ pub(super) fn check_prompt(
     )
 }
 
+/// What a check says of a session that read the canary outside its folders.
+pub(super) const READ_OUTSIDE: &str = "it read a file outside its folders";
+
+/// Why a trial's builder can't run here, if it can't: it runs on Claude
+/// Code, confined to the trial's copy, which `setup acr` sets up.
+pub(super) fn builder_missing(paths: &Paths) -> Option<String> {
+    confine_settings(paths).err().map(|_| {
+        format!(
+            "a trial's builder runs on Claude Code, which `{APP_NAME} setup acr` sets up, and \
+             it isn't set up here"
+        )
+    })
+}
+
 /// What's wrong with a check's answer: empty if the session read the copy,
 /// ran its command there, and didn't read the canary.
 pub(super) fn check_answer(text: &str, head: &str, secret: &str, bash: bool) -> Vec<String> {
     let mut wrong = Vec::new();
     if text.contains(secret) {
-        wrong.push("it read a file outside its folders".to_owned());
+        wrong.push(READ_OUTSIDE.to_owned());
     }
     let Some(v) = last_json(text) else {
         wrong.push(format!("its answer has no JSON: {}", text.trim()));
