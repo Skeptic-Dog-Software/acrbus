@@ -250,7 +250,8 @@ pub struct GrayboardConfig {
     /// The team server's URL, such as `https://grayboard.example.com`.
     pub server: String,
     /// The name this machine's acrbus binds on the server, under your
-    /// account. Each machine needs its own.
+    /// account. Each machine needs its own, so the default carries this
+    /// machine's host name, as `acr-<host>`.
     #[serde(default = "default_grayboard_name")]
     pub name: String,
     /// The OAuth client the server operator registered for acrbus.
@@ -261,8 +262,43 @@ pub struct GrayboardConfig {
     pub poll_secs: u64,
 }
 
-fn default_grayboard_name() -> String {
-    "acr".into()
+/// `acr-<this machine's short host name>`, so two machines never take each
+/// other's name.
+pub fn default_grayboard_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let host = if ok {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    grayboard_name_for(&host)
+}
+
+/// The default Grayboard name for host `host`: `acr-` and its short name,
+/// lowercased, with anything outside `[a-z0-9_-]` made `-`, within the
+/// server's 32 characters. Just `acr` when there's no host to tell.
+pub fn grayboard_name_for(host: &str) -> String {
+    let short = host.split('.').next().unwrap_or("").to_lowercase();
+    let mut cleaned: String = short
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    cleaned = cleaned.trim_matches('-').to_string();
+    if cleaned.is_empty() {
+        return "acr".into();
+    }
+    let mut name = format!("acr-{cleaned}");
+    name.truncate(32);
+    name.trim_end_matches('-').to_string()
 }
 
 fn default_grayboard_client() -> String {
@@ -347,6 +383,36 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_machine_gets_a_grayboard_name_of_its_own() {
+        assert_eq!(grayboard_name_for("Skeptic-Mac.local"), "acr-skeptic-mac");
+        assert_eq!(grayboard_name_for("build_box"), "acr-build_box");
+        assert_eq!(grayboard_name_for("büro pc.lan"), "acr-b-ro-pc");
+        assert_eq!(grayboard_name_for(""), "acr");
+        assert_eq!(grayboard_name_for("..."), "acr");
+        let long = grayboard_name_for(&"x".repeat(80));
+        assert_eq!(long.len(), 32);
+        assert!(long.starts_with("acr-x"));
+        // Every name is one the server takes: [a-z0-9_-]{1,32}.
+        for host in [
+            "Skeptic-Mac.local",
+            "a b",
+            "UPPER",
+            "-edge-",
+            &"y".repeat(40),
+        ] {
+            let n = grayboard_name_for(host);
+            assert!(
+                n.len() <= 32
+                    && n.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-".contains(c)),
+                "{n}"
+            );
+        }
+        // This machine's default is one of them.
+        assert!(default_grayboard_name().starts_with("acr"));
+    }
 
     fn never_opened(_: &Config) -> Result<Box<dyn crate::network::Network>> {
         anyhow::bail!("not in this test")

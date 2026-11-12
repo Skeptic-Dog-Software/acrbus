@@ -187,7 +187,8 @@ enum GrayboardCmd {
         /// `[grayboard] server` in config.toml when it has none yet.
         #[arg(long)]
         server: Option<String>,
-        /// The name to bind there (default `acr`). Each machine needs its own.
+        /// The name to bind there. Each machine needs its own; the default is
+        /// `acr-<this host>`, written to config.toml at sign-in.
         #[arg(long)]
         name: Option<String>,
         /// Only print the link, without opening a browser.

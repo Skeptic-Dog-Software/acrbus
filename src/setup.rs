@@ -1491,7 +1491,9 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
 }
 
 /// `[grayboard]` in config.toml, with `server` and `name` set where they're
-/// given: the section is added if there's none, which needs a server.
+/// given: the section is added if there's none, which needs a server. With
+/// no `name` given or set, this machine's default, `acr-<host>`, is written
+/// out, so a later change to the default never moves a signed-in name.
 pub fn grayboard_config(
     paths: &Paths,
     server: Option<&str>,
@@ -1514,6 +1516,8 @@ pub fn grayboard_config(
         .as_table_mut()
         .context("[grayboard] in config.toml isn't a table")?;
     let mut changed = false;
+    let default_name = crate::config::default_grayboard_name();
+    let name = name.or_else(|| table.get("name").is_none().then_some(default_name.as_str()));
     for (key, value) in [("server", server), ("name", name)] {
         if let Some(v) = value
             && table.get(key).and_then(|i| i.as_str()) != Some(v)
@@ -1533,6 +1537,36 @@ pub fn grayboard_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_in_to_grayboard_pins_this_machines_name() {
+        let dir = std::env::temp_dir().join(format!("tb-gbcfg-{}", crate::util::new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        // No name given: this machine's default is written out.
+        let cfg = grayboard_config(&paths, Some("https://grayboard.example.com"), None).unwrap();
+        let mine = crate::config::default_grayboard_name();
+        assert_eq!(cfg.name, mine);
+        let text = fs::read_to_string(&paths.config).unwrap();
+        assert!(text.contains(&format!("name = \"{mine}\"")), "{text}");
+        // One set by hand is kept, and one given replaces it.
+        fs::write(
+            &paths.config,
+            "[grayboard]\nserver = \"https://grayboard.example.com\"\nname = \"acr\"\n",
+        )
+        .unwrap();
+        assert_eq!(grayboard_config(&paths, None, None).unwrap().name, "acr");
+        assert_eq!(
+            grayboard_config(&paths, None, Some("acr-build"))
+                .unwrap()
+                .name,
+            "acr-build"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_second_home_names_its_services_apart_from_the_default() {
