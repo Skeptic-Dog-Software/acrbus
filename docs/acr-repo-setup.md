@@ -275,6 +275,44 @@ since by then it holds the change's context.
 - **Decided non-issues.** Accepting a proposal puts its non-findings in
   `<name>.not-findings.md`, beside the config, and points `not_findings` at
   it. A proposal needn't name the file.
+- **Shared facts.** Each round, the harness maps the change with tools,
+  not models: for each changed file, its definitions the change touches,
+  where they're referenced (`git grep`), the tests that name them, and its
+  hunks; then the test gate's results. Every reviewer and Judge gets the
+  map in its system prompt, after ACR's own and before its own text, so
+  the provider's prompt cache serves it to all of a role's calls but the
+  first. Files a fix left alone come first, as they were, and those it
+  changed after them, so a round shares the last one's cached prefix up to
+  the first file a fix touched; the round's number and the gate's results
+  come last. The map is kept in the review's folder, as
+  `round-<n>.facts.md`. It goes to no call unless every agent the
+  reviewers and the Judge are bound to can take it: pi reads it from a
+  file; Claude Code and omp take it in the same argument as ACR's prompt,
+  up to 100 KB. The `facts` section's settings, each with its default:
+
+  ```yaml
+  facts:
+    shared: true          # build the map and give it to reviewers and Judges
+    warm_secs: 60         # a role's first call goes alone, until its turn shows
+                          # it read its prompt, or this many seconds; 0: no wait
+    keep_alive_secs: 240  # refresh a prefix still in use this often; 0: off
+    judges: per-lens      # per-finding: a Judge per finding, given its claim
+                          # and the lines it cites, none of the reviewer's case
+    reviewers: all        # facts-only: no briefs a model wrote, and no
+                          # decided non-issues (the Judge still applies them)
+    match_tools: true     # same tool definitions for roles on one model
+  ```
+
+  With `match_tools`, the reviewers and the Judge bound to one bridge and
+  model are all shown the union of their tools, so their prompts share a
+  prefix, and each call is held to its own: pi's calls load an extension
+  acrbus ships that refuses any other tool and says which it may use. Other
+  agents keep their own tool lists. A keep-alive is a minimal call through
+  the role's binding, sent only when its bridge has a slot to spare, and
+  counted apart from the roles' work. The provider's prompt cache is keyed
+  to the review and the bridge and model, so every round's calls to one
+  model reach the same cache. `acrbus acr judge-check --per-finding` sets
+  per-finding verdicts against per-lens ones on a key, before you switch.
 - **Plan's estimate.** `acrbus acr plan` counts only the text the review
   sends and reads back. `costs.per_call` adds a measured average for each
   role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to

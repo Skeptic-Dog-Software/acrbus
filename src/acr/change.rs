@@ -449,10 +449,10 @@ fn same_file(a: &str, b: &str) -> bool {
 
 /// A hunk: where it starts in the new file, how many lines it spans there,
 /// and its text.
-type Hunk = (u64, u64, String);
+pub(super) type Hunk = (u64, u64, String);
 
 /// A file's hunks.
-fn hunks(part: &str) -> Vec<Hunk> {
+pub(super) fn hunks(part: &str) -> Vec<Hunk> {
     let mut out: Vec<Hunk> = Vec::new();
     for line in part.split_inclusive('\n') {
         if let Some(rest) = line.strip_prefix("@@ ") {
@@ -570,7 +570,7 @@ pub fn hunks_for<'a>(
 }
 
 /// Splits a diff into each file's part, by its `diff --git` line.
-fn per_file(diff: &str) -> Vec<(String, String)> {
+pub(super) fn per_file(diff: &str) -> Vec<(String, String)> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for line in diff.split_inclusive('\n') {
         if let Some(header) = line.strip_prefix("diff --git ") {

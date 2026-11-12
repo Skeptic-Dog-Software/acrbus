@@ -8,6 +8,7 @@ mod carry;
 mod change;
 mod config;
 mod configure;
+mod facts;
 mod flow;
 mod generated;
 pub mod grayboard;
@@ -179,6 +180,11 @@ pub enum AcrCmd {
         /// Append each key's result to this file, as a line of JSON.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Also rate each finding in a Judge call of its own, given only its
+        /// claim, as `facts.judges: per-finding` does, and set those
+        /// verdicts against the per-dimension ones and the key's.
+        #[arg(long)]
+        per_finding: bool,
     },
     /// Configure a repository's review from what's in it. The configurer, a
     /// strong model, reviews the whole repository, in a clone of its own, and
@@ -351,6 +357,15 @@ pub enum AcrCmd {
         run_id: String,
         #[arg(long)]
         text: bool,
+    },
+    /// A review's calls summed by round and role: fresh, cached and output
+    /// tokens, dollars and times, and what each fan-out's calls shared at
+    /// the head. For any review this bus kept, at work or finished, so two
+    /// can be set side by side. `--json` for the rows as the report has them.
+    Usage {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Carry on with a review that's waiting for a person.
     Resume {
@@ -621,6 +636,57 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
     }
 }
 
+/// A reviewer's or Judge's call, given the round's shared facts: the facts
+/// file, the cache's key for its bridge and model, and, when its roles'
+/// tools are matched, every tool their calls are given, holding it to its
+/// own.
+fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
+    if !matches!(call.role, Role::Reviewer | Role::Judge) || call.writes {
+        return;
+    }
+    options.facts = Some(shared.facts.display().to_string());
+    let b = call.binding;
+    options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
+    if call.no_tools {
+        return;
+    }
+    let group = (b.agent.clone(), b.model.clone());
+    if let (Some(all), Some(own)) = (shared.tools.get(&group), b.tools.as_ref())
+        && all != own
+    {
+        options.tools = Some(all.clone());
+        options.allowed_tools = Some(own.clone());
+    }
+}
+
+/// What a call given more tools than its own is told, at the end of its
+/// brief.
+fn tools_note(own: &[String]) -> String {
+    format!(
+        "\n\nThe tools you may use: {}. You're shown others, which other roles use: a call \
+         to one of them is refused.",
+        if own.is_empty() {
+            "none".to_string()
+        } else {
+            own.join(", ")
+        }
+    )
+}
+
+/// The prompt cache's key for a run's calls to one bridge and model: the
+/// run, and a short hash of the two, which a header can carry.
+fn cache_key(run: &str, agent: &str, model: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(format!("{agent}\n{}", model.unwrap_or_default()));
+    let short: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let run: String = run
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+        .take(100)
+        .collect();
+    format!("acr-{run}-{short}")
+}
+
 pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
     RunOptions {
         // The binding's tools, writing ones too: some headless agents may
@@ -636,6 +702,9 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         log: None,
         // A review runs on one machine, which the bridge checks too.
         review: Some(true),
+        facts: None,
+        cache_key: None,
+        allowed_tools: None,
     }
 }
 
@@ -1265,6 +1334,12 @@ struct BridgeCaller {
     /// process is gone by then.
     calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     calls_file: std::sync::Mutex<Option<PathBuf>>,
+    /// The round's shared facts, for its reviewers and Judges.
+    shared: std::sync::Mutex<Option<flow::Shared>>,
+    /// By label, each call's bridge and request once sent, and whether it
+    /// has been answered: to tell when a fan-out's first has filled the
+    /// prompt cache.
+    sent: std::sync::Mutex<std::collections::HashMap<String, (String, String, bool)>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1299,6 +1374,8 @@ impl BridgeCaller {
             shares: Default::default(),
             calls: Default::default(),
             calls_file: std::sync::Mutex::new(None),
+            shared: std::sync::Mutex::new(None),
+            sent: Default::default(),
         })
     }
 
@@ -1354,7 +1431,7 @@ impl BridgeCaller {
         ));
     }
 
-    fn share(&self, role: Role) -> Option<u64> {
+    fn share_of(&self, role: Role) -> Option<u64> {
         self.shares
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1486,9 +1563,47 @@ impl Caller for BridgeCaller {
         self.progress.line(what);
     }
 
+    fn share(&self, shared: Option<flow::Shared>) -> bool {
+        // Only if every agent the round's calls go to takes them: one that
+        // didn't would lose what the calls leave out for them.
+        let shared = shared.filter(|sh| {
+            let bytes = fs::metadata(&sh.facts).map_or(u64::MAX, |m| m.len());
+            sh.agents.iter().all(|a| {
+                let bridge = a.split('@').next().unwrap_or_default();
+                crate::bridge::takes_facts(&self.paths, bridge, bytes)
+            })
+        });
+        let given = shared.is_some();
+        *self.shared.lock().unwrap_or_else(|e| e.into_inner()) = shared;
+        given
+    }
+
+    fn warmed(&self, label: &str) -> Option<bool> {
+        let sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((bridge, id, answered)) = sent.get(label).cloned() else {
+            return Some(false);
+        };
+        drop(sent);
+        if answered {
+            return Some(true);
+        }
+        // Its agent records a turn's tokens once the turn is done: by then,
+        // the provider has cached what it read.
+        Some(matches!(
+            crate::bridge::standing(&self.paths, &bridge, &id),
+            crate::bridge::Standing::Running { tokens: Some(t), .. } if t.input + t.cache_read + t.cache_write > 0
+        ))
+    }
+
+    fn has_room(&self, binding: &config::Binding) -> bool {
+        let bridge = binding.agent.split('@').next().unwrap_or_default();
+        // One slot always left over for the review's own calls.
+        crate::bridge::has_room(&self.paths, bridge, 1)
+    }
+
     fn call(&self, call: &Call) -> Result<Answer> {
         let bridge = call.binding.agent.split('@').next().unwrap_or_default();
-        let share = self.share(call.role);
+        let share = self.share_of(call.role);
         let token = self
             .progress
             .start(&call.label, call.binding_name, bridge, share);
@@ -1506,6 +1621,11 @@ impl Caller for BridgeCaller {
 
 impl BridgeCaller {
     fn call_once(&self, call: &Call, bridge: &str, token: progress::Token) -> Result<Answer> {
+        // A label an earlier round used is this call's now.
+        self.sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&call.label);
         let b = call.binding;
         // Fixes only from a binding the user lets write.
         if call.writes && !b.writes {
@@ -1514,7 +1634,15 @@ impl BridgeCaller {
                 call.binding_name
             );
         }
-        let options = call_options(call, self.keep_logs, self.asks_for(b, bridge));
+        let mut options = call_options(call, self.keep_logs, self.asks_for(b, bridge));
+        if let Some(shared) = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            with_shared(&mut options, call, shared);
+        }
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {
             let name = path
@@ -1525,6 +1653,11 @@ impl BridgeCaller {
             attachments.push(self.attach(&name, &bytes)?);
         }
         let mut body = call.prompt.to_string();
+        // Given every tool its bridge's roles are, so their prompts share a
+        // prefix: told which are its own, last, and held to them.
+        if let Some(own) = &options.allowed_tools {
+            body.push_str(&tools_note(own));
+        }
         if body.len() > MAX_BODY {
             attachments.push(self.attach("brief.txt", body.as_bytes())?);
             body = "Your brief is in the attached file brief.txt.".to_string();
@@ -1548,6 +1681,21 @@ impl BridgeCaller {
         })?;
         let sent: Sent = client.reply()?;
         self.progress.sent(token, &sent.id);
+        self.sent.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            call.label.clone(),
+            (bridge.to_string(), sent.id.clone(), false),
+        );
+        let label = call.label.clone();
+        let _marked = OnDrop(|| {
+            if let Some(entry) = self
+                .sent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&label)
+            {
+                entry.2 = true;
+            }
+        });
         self.in_flight(&sent.id, true);
         let request = sent.id.clone();
         let _answered = OnDrop(|| self.in_flight(&request, false));
@@ -1601,10 +1749,35 @@ impl BridgeCaller {
     }
 }
 
+/// A review's record, from its folder while it's kept there, or from its
+/// archive once it's finished and packed.
+fn kept_run(paths: &Paths, id: &str) -> Result<Run> {
+    let folder = run_dir(paths, id).join("run.json");
+    let bytes = match fs::read(&folder) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let kept = keep::kept(paths, id).with_context(|| format!("no review {id}"))?;
+            if kept.is_dir() {
+                fs::read(kept.join("run.json"))?
+            } else {
+                let name = kept.file_name().unwrap_or_default().to_string_lossy();
+                crate::util::packed_file(
+                    &kept,
+                    &format!("{}/run.json", name.trim_end_matches(".tar.gz")),
+                )?
+            }
+        }
+    };
+    serde_json::from_slice(&bytes).with_context(|| format!("reading review {id}'s record"))
+}
+
 fn save(paths: &Paths, run: &Run, cfg: &Config) -> Result<()> {
     let dir = run_dir(paths, &run.id);
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("run.json"), serde_json::to_vec_pretty(run)?)?;
+    fs::write(
+        dir.join("run.json"),
+        serde_json::to_vec_pretty(&report::record(run))?,
+    )?;
     fs::write(dir.join("config.json"), serde_json::to_vec_pretty(cfg)?)?;
     let report = report::report(run, cfg);
     fs::write(dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
@@ -1852,10 +2025,14 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     // Waiting for you, or over: Grayboard hears, if it's set up.
     grayboard::on_finish(paths, run, cfg);
     keep::finished(paths, run, true)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report::report(run, cfg))?
-    );
+    let summary = report::report(run, cfg);
+    for line in summary.by_role.iter().map(report::RoleUsage::line) {
+        eprintln!("{APP_NAME}: {line}");
+    }
+    for p in &run.prefixes {
+        eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
+    }
+    println!("{}", serde_json::to_string_pretty(&summary)?);
     if let Some(pr) = pr {
         post(run, cfg, pr)?;
     }
@@ -2449,6 +2626,30 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             return finish(paths, &run, &cfg, post_pr);
         }
         AcrCmd::Clean { dry_run } => clean(paths, dry_run)?,
+        AcrCmd::Usage { run_id, json } => {
+            let run = kept_run(paths, &run_id)?;
+            let rows = report::by_role(&run.usage);
+            if json {
+                let out = serde_json::json!({
+                    "run_id": run.id, "by_role": rows, "facts": run.facts,
+                    "prefixes": run.prefixes,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                for row in &rows {
+                    println!("{}", row.line());
+                }
+                for p in &run.prefixes {
+                    println!("round {}: {}", p.round, p.line());
+                }
+                if run.usage.iter().any(|u| u.label.is_none()) {
+                    println!(
+                        "(calls recorded before 0.1.21 carry no label, so the Sizer's call that \
+                         finds defects more than one lens found counts under the Sizer)"
+                    );
+                }
+            }
+        }
         AcrCmd::Ask { run_id, text } => {
             not_finished(paths, &run_id)?;
             // Running, it asks nothing yet: where each lens stands instead.
@@ -2670,9 +2871,13 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 )
             );
         }
-        AcrCmd::JudgeCheck { keys, out } => {
+        AcrCmd::JudgeCheck {
+            keys,
+            out,
+            per_finding,
+        } => {
             for key in keys {
-                let result = calibrate(paths, &key)?;
+                let result = calibrate(paths, &key, per_finding)?;
                 println!(
                     "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
                     result["key"].as_str().unwrap_or_default(),
@@ -2682,6 +2887,19 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     result["agreed_non_blockers"],
                     result["unrated"],
                 );
+                if let Some(each) = result.get("per_finding") {
+                    println!(
+                        "  per finding: blockers agreed {}, missed {}, overrated {}; non-blockers \
+                         agreed {}; unrated {}; same verdict as per dimension {} of {}",
+                        each["agreed_blockers"],
+                        each["missed_blockers"],
+                        each["overrated"],
+                        each["agreed_non_blockers"],
+                        each["unrated"],
+                        each["same_as_per_dimension"],
+                        each["compared"],
+                    );
+                }
                 if let Some(out) = &out {
                     let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
                     std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
@@ -3449,7 +3667,7 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     Ok(())
 }
 
-fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
+fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_json::Value> {
     use serde_json::json;
     let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
     if key.findings.is_empty() {
@@ -3496,9 +3714,59 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
     caller.keep_logs = true;
     let tag = regex::Regex::new(r"\[K(\d+)\]").expect("a fixed pattern");
     let mut judged: Vec<Option<(bool, String)>> = vec![None; key.findings.len()];
+    let mut each: Vec<Option<(bool, String)>> = vec![None; key.findings.len()];
     let mut dimensions: Vec<&str> = key.findings.iter().map(|f| f.dimension.as_str()).collect();
     dimensions.sort();
     dimensions.dedup();
+    let judge_name = cfg.binding_name(Role::Judge, None)?;
+    let keep_tags = "\n\nKeep each finding's title as it's given, with its [K..] tag, and judge \
+                     each on its own: don't merge them.";
+    let raw = |i: usize, f: &trial::KeyFinding| roles::Raw {
+        title: format!(
+            "[K{i}] {}",
+            f.what
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>()
+        ),
+        detail: f.what.clone(),
+        file: None,
+        line: None,
+    };
+    // A Judge's ratings, by the key's findings they name: `only`, for a
+    // call given one finding, takes its first rating whatever its title.
+    let rule = |lens: &config::Lens,
+                ratings: Vec<roles::Rating>,
+                only: Option<usize>,
+                into: &mut Vec<Option<(bool, String)>>| {
+        for r in ratings {
+            let tagged = tag
+                .captures(&r.title)
+                .and_then(|c| c[1].parse::<usize>().ok())
+                .filter(|i| *i < into.len());
+            let Some(i) = tagged.or(only) else {
+                continue;
+            };
+            if only.is_some() && into[i].is_some() {
+                continue;
+            }
+            let flow::Ruled {
+                severity, action, ..
+            } = flow::ruling(
+                &cfg,
+                lens,
+                &flow::grounded(r, &lines, lens.blocker.as_deref()),
+            );
+            let blocks = matches!(
+                action,
+                config::Action::Blocks | config::Action::BlocksUnlessWaived
+            );
+            into[i] = Some((blocks, format!("{severity:?}")));
+        }
+    };
     for d in dimensions {
         let lens = cfg
             .lenses
@@ -3515,30 +3783,15 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
                 severity: Default::default(),
                 include_generated: false,
             });
-        let raws: Vec<roles::Raw> = key
+        let mine: Vec<(usize, roles::Raw)> = key
             .findings
             .iter()
             .enumerate()
             .filter(|(_, f)| f.dimension == d)
-            .map(|(i, f)| roles::Raw {
-                title: format!(
-                    "[K{i}] {}",
-                    f.what
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ),
-                detail: f.what.clone(),
-                file: None,
-                line: None,
-            })
+            .map(|(i, f)| (i, raw(i, f)))
             .collect();
-        let prompt = roles::judge_prompt(&lens, &[raws], &decided)?
-            + "\n\nKeep each finding's title as it's given, with its [K..] tag, and judge each \
-               on its own: don't merge them.";
+        let raws: Vec<roles::Raw> = mine.iter().map(|(_, r)| r.clone()).collect();
+        let prompt = roles::judge_prompt(&lens, &[raws], &decided)? + keep_tags;
         let answer = caller.call(&Call {
             role: Role::Judge,
             binding_name: cfg.binding_name(Role::Judge, None)?,
@@ -3550,56 +3803,100 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             repo: &s.tree,
             label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
-        for r in roles::read_ratings(&answer.text)? {
-            let Some(i) = tag
-                .captures(&r.title)
-                .and_then(|c| c[1].parse::<usize>().ok())
-                .filter(|i| *i < judged.len())
-            else {
-                continue;
-            };
-            let flow::Ruled {
-                severity, action, ..
-            } = flow::ruling(
-                &cfg,
-                &lens,
-                &flow::grounded(r, &lines, lens.blocker.as_deref()),
-            );
-            let blocks = matches!(
-                action,
-                config::Action::Blocks | config::Action::BlocksUnlessWaived
-            );
-            judged[i] = Some((blocks, format!("{severity:?}")));
+        rule(&lens, roles::read_ratings(&answer.text)?, None, &mut judged);
+        if !per_finding {
+            continue;
+        }
+        // Each finding on its own, all at once, as a review's are.
+        let answers: Vec<(usize, Result<Vec<roles::Rating>>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = mine
+                .iter()
+                .map(|(i, r)| {
+                    let (caller, lens, artifact, tree) = (&caller, &lens, &artifact, &s.tree);
+                    let decided = &decided;
+                    scope.spawn(move || {
+                        let prompt = roles::join(&roles::judge_finding_parts(lens, r, "", decided));
+                        let rated = caller.call(&Call {
+                            role: Role::Judge,
+                            binding_name: judge_name,
+                            binding: judge,
+                            prompt: &prompt,
+                            artifact: Some(artifact),
+                            writes: false,
+                            no_tools: false,
+                            repo: tree,
+                            label: format!("{}: the Judge, on key finding {i}", lens.id),
+                        });
+                        (*i, rated.and_then(|a| roles::read_ratings(&a.text)))
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for (i, rated) in answers {
+            match rated {
+                Ok(ratings) => rule(&lens, ratings, Some(i), &mut each),
+                Err(e) => eprintln!("{APP_NAME}: key finding {i}'s own Judge: {e:#}"),
+            }
         }
     }
     drop(allowed);
-    let mut rows = Vec::new();
-    let (mut agreed_b, mut missed, mut over, mut agreed_n, mut unrated) = (0, 0, 0, 0, 0);
-    for (f, j) in key.findings.iter().zip(&judged) {
-        match (f.blocker, j.as_ref().map(|(b, _)| *b)) {
-            (true, Some(true)) => agreed_b += 1,
-            (true, Some(false)) => missed += 1,
-            (false, Some(true)) => over += 1,
-            (false, Some(false)) => agreed_n += 1,
-            (_, None) => unrated += 1,
+    let tally = |judged: &[Option<(bool, String)>]| {
+        let mut rows = Vec::new();
+        let (mut agreed_b, mut missed, mut over, mut agreed_n, mut unrated) = (0, 0, 0, 0, 0);
+        for (f, j) in key.findings.iter().zip(judged) {
+            match (f.blocker, j.as_ref().map(|(b, _)| *b)) {
+                (true, Some(true)) => agreed_b += 1,
+                (true, Some(false)) => missed += 1,
+                (false, Some(true)) => over += 1,
+                (false, Some(false)) => agreed_n += 1,
+                (_, None) => unrated += 1,
+            }
+            rows.push(json!({
+                "id": f.id, "dimension": f.dimension, "key_blocker": f.blocker,
+                "judged_blocker": j.as_ref().map(|(b, _)| *b),
+                "severity": j.as_ref().map(|(_, s)| s.clone()),
+            }));
         }
-        rows.push(json!({
-            "id": f.id, "dimension": f.dimension, "key_blocker": f.blocker,
-            "judged_blocker": j.as_ref().map(|(b, _)| *b),
-            "severity": j.as_ref().map(|(_, s)| s.clone()),
-        }));
+        let dropped = judged
+            .iter()
+            .filter(|j| j.as_ref().is_some_and(|(_, s)| s == "Rejected"))
+            .count();
+        json!({
+            "agreed_blockers": agreed_b, "missed_blockers": missed, "overrated": over,
+            "agreed_non_blockers": agreed_n, "unrated": unrated, "dropped": dropped,
+            "findings": rows,
+        })
+    };
+    let mut result = tally(&judged);
+    result["key"] = json!(
+        key_path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+    );
+    result["repo"] = json!(change::name(&s.tree)?);
+    result["repo_path"] = json!(key.repo);
+    result["fingerprint"] = json!(fp);
+    if per_finding {
+        let mut alone = tally(&each);
+        let pairs: Vec<(bool, bool)> = judged
+            .iter()
+            .zip(&each)
+            .filter_map(|(a, b)| Some((a.as_ref()?.0, b.as_ref()?.0)))
+            .collect();
+        alone["compared"] = json!(pairs.len());
+        alone["same_as_per_dimension"] = json!(pairs.iter().filter(|(a, b)| a == b).count());
+        alone["differ"] = json!(
+            key.findings
+                .iter()
+                .zip(judged.iter().zip(&each))
+                .filter(|(_, (a, b))| matches!((a, b), (Some(a), Some(b)) if a.0 != b.0))
+                .map(|(f, _)| f.id.clone())
+                .collect::<Vec<_>>()
+        );
+        result["per_finding"] = alone;
     }
-    let dropped = judged
-        .iter()
-        .filter(|j| j.as_ref().is_some_and(|(_, s)| s == "Rejected"))
-        .count();
-    Ok(json!({
-        "key": key_path.file_stem().map(|n| n.to_string_lossy().into_owned()),
-        "agreed_blockers": agreed_b, "missed_blockers": missed, "overrated": over,
-        "agreed_non_blockers": agreed_n, "unrated": unrated, "dropped": dropped,
-        "findings": rows,
-        "repo": change::name(&s.tree)?, "repo_path": key.repo, "fingerprint": fp,
-    }))
+    Ok(result)
 }
 
 /// What a calibration of a repository is made against: its config and
@@ -3618,7 +3915,20 @@ fn fingerprint(cfg: &Config, text: &str, decided: &str) -> Result<calibration::F
         severity: Default::default(),
         include_generated: false,
     };
-    let prompt = roles::judge_prompt(&lens, &[Vec::new()], "")?;
+    let mut prompt = roles::judge_prompt(&lens, &[Vec::new()], "")?;
+    // A Judge for each finding is a Judge with its own brief. The default
+    // adds nothing, so a calibration made before it was one stands.
+    if cfg.facts.judges == config::JudgeMode::PerFinding {
+        let claim = roles::Raw {
+            title: String::new(),
+            detail: String::new(),
+            file: None,
+            line: None,
+        };
+        prompt.push_str(&roles::join(&roles::judge_finding_parts(
+            &lens, &claim, "", "",
+        )));
+    }
     Ok(calibration::Fingerprint {
         config: calibration::hash(&[text, decided]),
         judge: calibration::hash(&[
@@ -4553,5 +4863,122 @@ mod tests {
             ..call(Role::Judge, false)
         };
         assert_eq!(call_options(&any, false, None).tools, None);
+    }
+
+    #[test]
+    fn a_reviewers_and_judges_calls_get_the_rounds_facts_key_and_matched_tools() {
+        let reviewer = config::Binding {
+            agent: "pi@here".into(),
+            model: Some("m".into()),
+            tools: Some(vec!["grep".into(), "read".into()]),
+            ..config::Binding::default()
+        };
+        let judge = config::Binding {
+            tools: Some(vec!["bash".into(), "grep".into(), "read".into()]),
+            ..reviewer.clone()
+        };
+        let shared = flow::Shared {
+            facts: PathBuf::from("/state/acr/r/round-1.facts.md"),
+            key: "01RUN".into(),
+            tools: std::collections::BTreeMap::from([(
+                ("pi@here".to_string(), Some("m".to_string())),
+                vec!["bash".to_string(), "grep".to_string(), "read".to_string()],
+            )]),
+            agents: vec!["pi@here".into()],
+        };
+        let repo = PathBuf::from("/repo");
+        let call = |role, binding, writes, no_tools| flow::Call {
+            role,
+            binding_name: "b",
+            binding,
+            prompt: "p",
+            artifact: None,
+            writes,
+            no_tools,
+            repo: &repo,
+            label: "x".into(),
+        };
+        let given = |c: &flow::Call| {
+            let mut o = call_options(c, false, None);
+            with_shared(&mut o, c, &shared);
+            o
+        };
+        let r = given(&call(Role::Reviewer, &reviewer, false, false));
+        assert_eq!(r.facts.as_deref(), Some("/state/acr/r/round-1.facts.md"));
+        assert_eq!(
+            r.tools,
+            Some(vec!["bash".into(), "grep".into(), "read".into()])
+        );
+        assert_eq!(r.allowed_tools, reviewer.tools, "held to its own");
+        let j = given(&call(Role::Judge, &judge, false, false));
+        assert_eq!(j.tools, judge.tools);
+        assert_eq!(
+            j.allowed_tools, None,
+            "its own are every tool: nothing to hold"
+        );
+        assert_eq!(r.cache_key, j.cache_key, "one key for one bridge and model");
+        let key = r.cache_key.unwrap();
+        assert!(key.starts_with("acr-01RUN-") && key.len() <= 128, "{key}");
+        let other = cache_key("01RUN", "pi@here", Some("other"));
+        assert_ne!(key, other, "another model, another key");
+        // No tools stays none; the Orchestrator, a Sizer and a fix get
+        // nothing of it.
+        let bare = given(&call(Role::Judge, &judge, false, true));
+        assert_eq!((bare.tools, bare.allowed_tools), (Some(Vec::new()), None));
+        assert!(bare.facts.is_some());
+        for (role, writes) in [
+            (Role::Orchestrator, false),
+            (Role::Sizer, false),
+            (Role::Reviewer, true),
+        ] {
+            let o = given(&call(role, &reviewer, writes, false));
+            assert_eq!(
+                (o.facts, o.cache_key, o.allowed_tools),
+                (None, None, None),
+                "{role:?}"
+            );
+        }
+        assert!(tools_note(&["read".into()]).contains("The tools you may use: read."));
+        assert!(tools_note(&[]).contains("The tools you may use: none."));
+    }
+
+    #[test]
+    fn matched_tools_are_the_union_for_a_bridge_and_model_only_where_lists_differ() {
+        let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
+        let repo = config::parse_repo(
+            "version: 1\ntiers: [{id: t, match: {description: x}, fan_out: 1}]\nlenses: [{id: a, criteria: c, triggers: {paths: [\"**\"]}}]\n",
+        )
+        .unwrap();
+        let mut cfg = config::resolve(&user, repo, &config::Flags::default()).unwrap();
+        let lens = cfg.lenses[0].clone();
+        let r = cfg
+            .binding_name(Role::Reviewer, Some(&lens))
+            .unwrap()
+            .to_string();
+        let j = cfg.binding_name(Role::Judge, None).unwrap().to_string();
+        assert_ne!(r, j, "the example binds them apart");
+        let set = |cfg: &mut Config, name: &str, model: &str, tools: &[&str]| {
+            let b = cfg.allowed_bindings.get_mut(name).unwrap();
+            b.agent = "pi@here".into();
+            b.model = Some(model.into());
+            b.tools = Some(tools.iter().map(|t| t.to_string()).collect());
+        };
+        set(&mut cfg, &r, "big", &["read", "grep"]);
+        set(&mut cfg, &j, "big", &["read", "bash"]);
+        let matched = flow::matched_tools(&cfg);
+        assert_eq!(
+            matched.get(&("pi@here".to_string(), Some("big".to_string()))),
+            Some(&vec![
+                "bash".to_string(),
+                "grep".to_string(),
+                "read".to_string()
+            ])
+        );
+        // Another model can't share their prefix, so nothing is matched.
+        set(&mut cfg, &j, "small", &["read", "bash"]);
+        assert!(flow::matched_tools(&cfg).is_empty());
+        set(&mut cfg, &j, "big", &["read", "bash"]);
+        cfg.facts.match_tools = false;
+        assert!(flow::matched_tools(&cfg).is_empty());
     }
 }

@@ -43,6 +43,7 @@ For `pipe_result`, or for your user:
 - **For each dimension:** its criteria, each round's blockers and non-blockers, how each blocker was folded in, and whether it's confirmed or waived, or still open and why.
 - **Disagreements:** each one, with both sides, marked as your user's call. Or say there were none.
 - **What ran:** the model and effort the reviewers actually ran on. Claude Code can substitute a model the organization blocks, or use a lower effort than asked for.
+- **What it cost:** the report's `by_role`, each round's calls by role, with fresh, cached and output tokens and dollars, as it gives them.
 - Label reviewers as AI agents in roles, for example "Reviewer (AI agent), correctness", so nobody reading the report takes them for people.
 - **Don't overclaim.** Say only what each review actually covered.
 

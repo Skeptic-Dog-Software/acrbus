@@ -181,6 +181,19 @@
       "type": "array",
       "items": {"type": "string"},
       "description": "The models a review of this repository may use, as patterns such as example/*, matched without regard to case. Every binding a review would call must name a model one of them matches, or the config is refused. Left out, any model the user's bindings name; set in the user's defaults, it holds every repository that doesn't set its own."
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a round shares what tools found of the change (each changed file's definitions, where they're referenced, the tests that name them, and its hunks) and the test gate's results with its reviewers and Judges, ahead of their own text, so every call of a role reads them from the provider's prompt cache. Each field left out takes the default.",
+      "properties": {
+        "shared": {"type": "boolean", "description": "Build the facts each round and give them to every reviewer and Judge. Default true."},
+        "warm_secs": {"type": "integer", "minimum": 0, "description": "Seconds the rest of a role's calls wait for its first to fill the prompt cache before they start. 0 starts them all at once. Default 60."},
+        "keep_alive_secs": {"type": "integer", "minimum": 0, "description": "Seconds between refreshes of a role's cached prefix while its calls run, so the provider doesn't evict it: a minimal call through the same binding, only when its bridge has a slot to spare, counted apart as keep-alive. 0 turns it off. Default 240."},
+        "judges": {"enum": ["per-lens", "per-finding"], "description": "per-lens, the default: one Judge rates a lens's findings together. per-finding: a Judge for each finding, given its claim and the lines it cites, and none of the reviewer's reasoning."},
+        "reviewers": {"enum": ["all", "facts-only"], "description": "all, the default: reviewers get the Orchestrator's briefs and the decided non-issues too. facts-only: only what tools found, and no decided non-issues, which the Judge still applies."},
+        "match_tools": {"type": "boolean", "description": "Give the reviewers and the Judge on one bridge and model the same tool definitions, the union of theirs, so their prompts share a cached prefix, and refuse a call to a tool outside a role's own. Only for an agent acrbus can hold to a list; others keep their own tools. Default true."}
+      }
     }
   },
   "$defs": {

@@ -371,6 +371,7 @@ Things that matter for an agent other than Claude Code:
 | a round's setup didn't seem to run | Its `warm.log`, in the round's copies, says the command, how it ended and how long it took; progress says `setup: ok`, `failed` or `none configured`, and every reviewer hears of a failed one. |
 | copies take a lot of space | `acrbus acr doctor` counts them; `acrbus acr clean` clears those of finished work now. On macOS they're clones that share blocks with the repository, so they use less disk than their apparent size. |
 | the doctor says a bridge doesn't give its agent ACR's system prompt | If its agent is Claude Code, omp or pi, set `kind` in its table. Otherwise put the placeholder the doctor names in the argument its agent takes a system prompt in. Then restart the bridge. See "The system prompt" in the README. |
+| a review cost more than expected | The report's `by_role` gives each round's calls by role: fresh, cached and output tokens, dollars and the shortest and longest call, with a fan-out's first call's cache reads beside the rest's, and `prefixes` how many bytes a fan-out's calls, and each round with the last, share at the head. Low cache reads after the first call mean the cache missed: see "Shared facts" in the setup guide. |
 | a call "timed out" | It ran as long as its bridge allows. Raise the bridge's `timeout_secs` and `max_timeout_secs`, and restart it. |
 
 [Setting up ACR review for a repository](acr-repo-setup.md) is the reference

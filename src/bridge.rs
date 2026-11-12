@@ -65,8 +65,25 @@ const POLL: Duration = Duration::from_millis(50);
 const TOKENS_EVERY: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
-    Duration::from_secs(30)
+    // Often enough, too, for a review to see soon that a fan-out's first
+    // call has filled the prompt cache, and let the rest go.
+    Duration::from_secs(10)
 };
+/// The most of a review's facts that go in an argument, for an agent that
+/// takes its system prompt only as text: under what Linux lets one argument
+/// hold.
+const FACTS_IN_ARG: usize = 100 * 1024;
+/// The most a facts file may hold.
+const FACTS_MAX: u64 = 8 * 1024 * 1024;
+/// What a review's call is told its prompt cache's key is.
+const CACHE_KEY_ENV: &str = "ACRBUS_CACHE_KEY";
+/// What a review's call is told it may use, when every role gets the same
+/// tools.
+const ALLOWED_TOOLS_ENV: &str = "ACRBUS_ALLOWED_TOOLS";
+/// acrbus's extension for pi, which sends the cache key and holds a call to
+/// its tools.
+const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
+
 /// How much of a failed run's stderr goes in its failure reply's text.
 const STDERR_TAIL: usize = 300;
 /// The connection slot of the receiver.
@@ -253,6 +270,12 @@ struct Plan {
     tools: Option<Vec<String>>,
     /// Part of an ACR review: its agent gets ACR's system prompt.
     review: bool,
+    /// A review's shared facts, ahead of the call's own text.
+    facts: Option<PathBuf>,
+    /// A review's key for the prompt cache's routing.
+    cache_key: Option<String>,
+    /// With every role given the same tools: the ones this call may use.
+    allowed_tools: Option<Vec<String>>,
 }
 
 impl Plan {
@@ -630,11 +653,39 @@ impl Settings {
             effort: None,
             tools: None,
             review: false,
+            facts: None,
+            cache_key: None,
+            allowed_tools: None,
         };
         let Some(options) = options else {
             return Ok(plan);
         };
         plan.review = options.review == Some(true);
+        if !plan.review
+            && (options.facts.is_some()
+                || options.cache_key.is_some()
+                || options.allowed_tools.is_some())
+        {
+            return Err("facts, a cache key and allowed tools are only for a review".into());
+        }
+        if let Some(facts) = &options.facts {
+            let path = PathBuf::from(facts);
+            if !path.is_absolute() {
+                return Err(format!("facts file {facts} isn't a full path"));
+            }
+            plan.facts = Some(path);
+        }
+        if let Some(key) = &options.cache_key {
+            if key.is_empty()
+                || key.len() > 128
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(format!("cache key {key:?} isn't one a header can carry"));
+            }
+            plan.cache_key = Some(key.clone());
+        }
         if let Some(tools) = &options.tools {
             if tools.is_empty() {
                 // Only by flags made for it: an empty list in tools_env could
@@ -650,6 +701,21 @@ impl Settings {
             } else {
                 plan.tools = Some(tools.clone());
             }
+        }
+        if let Some(allowed) = &options.allowed_tools {
+            // Only an agent acrbus can hold to a list, and only within the
+            // tools the call is given: never more than those.
+            if self.agent_kind() != Some(Kind::Pi) {
+                return Err("this agent can't hold a call to some of its tools".into());
+            }
+            let given = plan
+                .tools
+                .as_ref()
+                .ok_or("allowed tools need the call's tools")?;
+            if let Some(bad) = allowed.iter().find(|t| !given.contains(t)) {
+                return Err(format!("allowed tool {bad:?} isn't one the call is given"));
+            }
+            plan.allowed_tools = Some(allowed.clone());
         }
         if let Some(session) = &options.session {
             let mode = [SessionMode::Fresh, SessionMode::PerSender]
@@ -1647,7 +1713,6 @@ fn read_report(paths: &Paths, agent: &str) -> Option<Report> {
     read_json(&state_dir(paths, agent).join("status.json"))
 }
 
-/// Whether a bridge has come up since `since`, in Unix milliseconds.
 /// How many runs a bridge has going now: none if it isn't running.
 pub fn busy(paths: &Paths, agent: &str) -> usize {
     read_report(paths, agent)
@@ -1655,6 +1720,31 @@ pub fn busy(paths: &Paths, agent: &str) -> usize {
         .map_or(0, |r| r.running.len())
 }
 
+/// Whether bridge `agent` is up with a slot free, `spare` of them past
+/// what it runs now, for a call nothing waits on. A bridge whose settings
+/// can't be read has none.
+pub fn has_room(paths: &Paths, agent: &str, spare: usize) -> bool {
+    let Ok(settings) = load(paths, agent) else {
+        return false;
+    };
+    read_report(paths, agent)
+        .filter(Report::alive)
+        .is_some_and(|r| r.running.len() + spare < settings.max_concurrent)
+}
+
+/// Whether bridge `agent`'s calls in a review take a facts file of `bytes`
+/// in their system prompt: pi reads the file, other agents take it in the
+/// same argument as ACR's prompt, up to what one can hold, and an agent
+/// whose kind isn't known takes none.
+pub fn takes_facts(paths: &Paths, agent: &str, bytes: u64) -> bool {
+    load(paths, agent).is_ok_and(|s| match s.agent_kind() {
+        Some(Kind::Pi) => bytes <= FACTS_MAX,
+        Some(_) => bytes <= FACTS_IN_ARG as u64,
+        None => false,
+    })
+}
+
+/// Whether a bridge has come up since `since`, in Unix milliseconds.
 pub fn started_since(paths: &Paths, agent: &str, since: i64) -> bool {
     read_report(paths, agent).is_some_and(|r| r.alive() && r.started_at >= since)
 }
@@ -2143,6 +2233,46 @@ impl Bridge {
             body: text,
             ext: None,
         }))
+    }
+
+    /// The bus's state folder: this bridge's folder is two below it.
+    fn state_root(&self) -> PathBuf {
+        self.dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.dir.clone())
+    }
+
+    /// A review's facts file, if it's one this bus keeps: a file in its
+    /// state folder's `acr`, not too large. With its text.
+    fn facts_file(&self, path: &Path) -> Result<(PathBuf, String)> {
+        let root = self.state_root().join("acr");
+        let real = path
+            .canonicalize()
+            .with_context(|| format!("the facts file {} isn't there", path.display()))?;
+        let under = root.canonicalize().is_ok_and(|r| real.starts_with(&r));
+        let meta = fs::metadata(&real)?;
+        if !under || !meta.is_file() || meta.len() > FACTS_MAX {
+            bail!("{} isn't a facts file this bus keeps", path.display());
+        }
+        let text = fs::read_to_string(&real)?;
+        Ok((real, text))
+    }
+
+    /// acrbus's extension for pi, written once for this version where only
+    /// this user can read it.
+    fn extension(&self) -> Result<PathBuf> {
+        let dir = self.state_root().join("acr-extensions");
+        let path = dir.join(format!("acrbus-{}.js", env!("CARGO_PKG_VERSION")));
+        if fs::read_to_string(&path).is_ok_and(|t| t == PI_EXTENSION) {
+            return Ok(path);
+        }
+        fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!(".acrbus-{}.js", new_id()));
+        fs::write(&tmp, PI_EXTENSION)?;
+        fs::rename(&tmp, &path)?;
+        Ok(path)
     }
 
     // Taking messages.
@@ -2907,10 +3037,37 @@ impl Bridge {
         }
         // Every role of a review gets ACR's system prompt, the way its agent
         // takes one.
-        if plan.review
-            && let Some(kind) = self.cfg.agent_kind()
-        {
-            add_system_prompt(&mut args, kind, crate::setup::SYSTEM_PROMPT);
+        let kind = self.cfg.agent_kind().filter(|_| plan.review);
+        let facts = match &plan.facts {
+            Some(path) => Some(self.facts_file(path)?),
+            None => None,
+        };
+        if let Some(kind) = kind {
+            // ACR's system prompt first, then the round's facts, both ahead
+            // of anything that differs between its calls. pi reads a file
+            // for its own flag; the others take the facts in the same text,
+            // up to what an argument can hold.
+            let mut prompt = crate::setup::SYSTEM_PROMPT.to_string();
+            if let (Some(text), false) = (&facts, kind == Kind::Pi) {
+                if text.1.len() <= FACTS_IN_ARG {
+                    prompt = format!("{prompt}\n\n{}", text.1);
+                } else {
+                    self.log(format!(
+                        "{}: the facts are too long for this agent's argument, so it reads \
+                         the change without them",
+                        msg.id
+                    ));
+                }
+            }
+            add_system_prompt(&mut args, kind, &prompt);
+            if let (Some((path, _)), Kind::Pi) = (&facts, kind) {
+                args.push("--append-system-prompt".into());
+                args.push(path.display().to_string());
+            }
+            if kind == Kind::Pi && (plan.cache_key.is_some() || plan.allowed_tools.is_some()) {
+                args.push("-e".into());
+                args.push(self.extension()?.display().to_string());
+            }
         }
         let mut command = Command::new(&self.cfg.command);
         command.args(&args);
@@ -2928,6 +3085,17 @@ impl Bridge {
             .env("HOME", &self.cfg.home)
             .env("PATH", &self.cfg.path)
             .env("TMPDIR", run_dir.join("tmp"));
+        if let Some(key) = plan.cache_key.as_ref().filter(|_| kind.is_some()) {
+            command.env(CACHE_KEY_ENV, key);
+        }
+        if let Some(allowed) = &plan.allowed_tools {
+            command.env(ALLOWED_TOOLS_ENV, allowed.join(","));
+        }
+        // Anthropic's longer-lived prompt cache, which Claude Code takes by
+        // this, for a review's calls, whose prefix outlives five minutes.
+        if kind == Some(Kind::Claude) {
+            command.env("ENABLE_PROMPT_CACHING_1H", "1");
+        }
         // Values can name the run's places, such as {SESSION_DIR}, but never
         // the message, and never read a file in.
         let places: Vec<(&str, &str)> = vars
@@ -4212,6 +4380,7 @@ mod tests {
             effort: some("high"),
             log: None,
             review: None,
+            ..RunOptions::default()
         })
         .unwrap();
         assert_eq!(narrowed.tools, tools);
@@ -5205,6 +5374,188 @@ mod tests {
             "{reply}"
         );
         assert!(!plain.contains("--append-system-prompt"), "{plain}");
+    }
+
+    /// A pi bridge whose calls may choose among a few tools.
+    const PI_TOOLS: &str = r#"
+        kind = "pi"
+        [options]
+        tools = ["read", "grep", "mcp__jira_query"]
+        tools_args = ["--tools", "{TOOLS}"]
+        "#;
+
+    #[test]
+    fn a_reviews_facts_cache_key_and_tool_limit_reach_pi_after_acrs_prompt() {
+        let rig = Rig::new();
+        // A facts file where the bus keeps its reviews: under its state
+        // folder's `acr`, two above this bridge's folder.
+        let root = rig
+            .dir
+            .parent()
+            .unwrap()
+            .join("acr")
+            .join(format!("facts-{}", &new_id()[14..]));
+        fs::create_dir_all(&root).unwrap();
+        let facts = root.join("round-1.facts.md");
+        fs::write(&facts, "# The change\n\nFACTS-CANARY\n").unwrap();
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'key=%s\nallowed=%s\n' "$ACRBUS_CACHE_KEY" "$ACRBUS_ALLOWED_TOOLS""#;
+        let bridge = rig.start(rig.settings(script, PI_TOOLS));
+        let tools = vec!["grep".to_string(), "read".to_string()];
+        let review = with(RunOptions {
+            review: Some(true),
+            facts: Some(facts.display().to_string()),
+            cache_key: Some("acr-r1-0a1b2c".into()),
+            tools: Some(tools.clone()),
+            allowed_tools: Some(vec!["read".into()]),
+            ..RunOptions::default()
+        });
+        let reply = rig.reply_to(&rig.ask_with(review));
+        // Without a cache key or a limit, no extension is loaded.
+        let bare = rig.reply_to(&rig.ask_with(with(RunOptions {
+            review: Some(true),
+            facts: Some(facts.display().to_string()),
+            ..RunOptions::default()
+        })));
+        bridge.stop().unwrap();
+        let first = crate::setup::SYSTEM_PROMPT.lines().next().unwrap();
+        let acr = reply.find(&format!("[{first}")).expect("ACR's prompt");
+        let real = facts.canonicalize().unwrap();
+        let given = reply
+            .find(&format!("[--append-system-prompt]\n[{}]", real.display()))
+            .expect("the facts file, for pi to read");
+        assert!(acr < given, "ACR's prompt, then the facts: {reply}");
+        let ext = reply.find("[-e]\n[").expect("acrbus's extension");
+        assert!(given < ext, "{reply}");
+        assert!(reply.contains(&format!("acrbus-{}.js]", env!("CARGO_PKG_VERSION"))));
+        assert!(reply.contains("key=acr-r1-0a1b2c\n"), "{reply}");
+        assert!(reply.trim_end().ends_with("allowed=read"), "{reply}");
+        assert!(
+            reply.contains("[--tools]\n[grep,read]"),
+            "every tool's definition: {reply}"
+        );
+        assert!(!bare.contains("[-e]"), "{bare}");
+        assert!(
+            bare.contains("key=\n") && bare.trim_end().ends_with("allowed="),
+            "{bare}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn facts_a_cache_key_and_a_tool_limit_are_only_for_a_review_and_never_widen() {
+        let rig = Rig::new();
+        let plain = generous(&rig, "echo hi");
+        let pi = rig.settings("echo hi", PI_TOOLS);
+        let tools = Some(vec!["grep".to_string(), "read".to_string()]);
+        let not_review = pi.plan(Some(&RunOptions {
+            cache_key: Some("k".into()),
+            ..RunOptions::default()
+        }));
+        assert!(not_review.unwrap_err().contains("only for a review"));
+        let wider = pi.plan(Some(&RunOptions {
+            review: Some(true),
+            tools: tools.clone(),
+            allowed_tools: Some(vec!["mcp__jira_query".into()]),
+            ..RunOptions::default()
+        }));
+        assert!(wider.unwrap_err().contains("isn't one the call is given"));
+        let unheld = plain.plan(Some(&RunOptions {
+            review: Some(true),
+            tools: tools.clone(),
+            allowed_tools: Some(vec!["read".into()]),
+            ..RunOptions::default()
+        }));
+        assert!(unheld.unwrap_err().contains("can't hold"));
+        let header = pi.plan(Some(&RunOptions {
+            review: Some(true),
+            cache_key: Some("a key\r\nX-Other: 1".into()),
+            ..RunOptions::default()
+        }));
+        assert!(header.unwrap_err().contains("isn't one a header can carry"));
+        let relative = pi.plan(Some(&RunOptions {
+            review: Some(true),
+            facts: Some("facts.md".into()),
+            ..RunOptions::default()
+        }));
+        assert!(relative.unwrap_err().contains("isn't a full path"));
+        let held = pi
+            .plan(Some(&RunOptions {
+                review: Some(true),
+                tools: tools.clone(),
+                allowed_tools: Some(vec!["read".into()]),
+                ..RunOptions::default()
+            }))
+            .unwrap();
+        assert_eq!(
+            (held.tools, held.allowed_tools),
+            (tools, Some(vec!["read".to_string()]))
+        );
+    }
+
+    #[test]
+    fn the_pi_extension_sets_the_affinity_header_and_refuses_tools_outside_the_list() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-ext-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const handlers = {};
+acrbus({ on: (name, f) => { handlers[name] = f; } });
+const headers = {};
+if (handlers.before_provider_headers) handlers.before_provider_headers({ headers });
+const out = { header: headers["x-session-affinity"] ?? null };
+if (handlers.tool_call) {
+  out.read = await handlers.tool_call({ toolName: "read" }) ?? null;
+  out.bash = await handlers.tool_call({ toolName: "bash" }) ?? null;
+}
+console.log(JSON.stringify(out));
+"#,
+        )
+        .unwrap();
+        let run = |env: &[(&str, &str)]| -> serde_json::Value {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .env_remove("ACRBUS_CACHE_KEY")
+                .env_remove("ACRBUS_ALLOWED_TOOLS");
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let both = run(&[
+            ("ACRBUS_CACHE_KEY", "acr-r1-0a1b2c"),
+            ("ACRBUS_ALLOWED_TOOLS", "read,grep"),
+        ]);
+        assert_eq!(both["header"], "acr-r1-0a1b2c");
+        assert_eq!(both["read"], serde_json::Value::Null, "its own tool runs");
+        assert_eq!(both["bash"]["block"], true);
+        let why = both["bash"]["reason"].as_str().unwrap();
+        assert!(
+            why.contains("may not use bash") && why.contains("read, grep"),
+            "{why}"
+        );
+        // A list it can't read refuses every tool.
+        let bad = run(&[("ACRBUS_ALLOWED_TOOLS", "read;rm -rf")]);
+        assert_eq!(bad["read"]["block"], true);
+        assert_eq!(bad["header"], serde_json::Value::Null);
+        // Nothing set, nothing done.
+        let none = run(&[]);
+        assert_eq!(none, serde_json::json!({"header": null}));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
