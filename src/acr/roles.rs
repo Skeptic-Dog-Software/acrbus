@@ -172,6 +172,37 @@ pub fn read_sized(text: &str) -> Result<Sized> {
     json_in(text)
 }
 
+/// What the Sizer is asked of a round's findings: which of them, found by
+/// different lenses, are the same defect. `found` is (lens, id, where,
+/// title, detail).
+pub fn same_prompt(found: &[(String, String, String, String, String)]) -> String {
+    let mut list = String::new();
+    for (lens, id, at, title, detail) in found {
+        let detail: String = detail.chars().take(300).collect();
+        list.push_str(&format!(
+            "- {id} [{lens}] {at}: {title}\n  {}\n",
+            detail.trim()
+        ));
+    }
+    format!(
+        "Reviewers of different lenses each reported the findings below. Group the ones that \
+         are the same defect: the same cause in the same place, which one fix would fix. \
+         Findings that are only near each other, or alike in kind, are different defects. \
+         Leave out a finding that's like no other.\n\n{list}\nAnswer with JSON only: \
+         {{\"same\": [[\"<id>\", \"<id>\"], ...]}}, or {{\"same\": []}} if none are the same."
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct Same {
+    same: Vec<Vec<String>>,
+}
+
+/// Each group of findings that are the same defect.
+pub fn read_same(text: &str) -> Result<Vec<Vec<String>>> {
+    one_json_in::<Same>(text).map(|s| s.same)
+}
+
 /// The lenses are required, so a stray object doesn't pass for "none
 /// apply"; the escalations are required where there were some to check,
 /// which the reader of the answer sees to.

@@ -2045,8 +2045,103 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             result.outcome = Outcome::Confirmed;
         }
     }
+    same_defects(run, s, caller);
     settle(run, cfg);
     Ok(())
+}
+
+/// Findings that different lenses made of one defect this round, grouped
+/// by one small call on the Sizer's binding, so that a person decides each
+/// defect once and whoever fixes reads it once. Each keeps its own ruling:
+/// the grouping only says which to decide together. A lens's own findings
+/// aren't grouped, and a call that fails groups nothing, and says so.
+fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
+    let round = run.round;
+    let found: Vec<(String, Finding)> = run
+        .lenses
+        .values()
+        .filter_map(|l| {
+            l.rounds
+                .last()
+                .filter(|r| r.round == round)
+                .map(|r| (l.id.clone(), r))
+        })
+        .flat_map(|(lens, r)| {
+            r.findings
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.state,
+                        FindingState::Open | FindingState::Logged | FindingState::Folded
+                    )
+                })
+                .map(move |f| (lens.clone(), f.clone()))
+        })
+        .collect();
+    let lenses: std::collections::BTreeSet<&str> = found.iter().map(|(l, _)| l.as_str()).collect();
+    if lenses.len() < 2 {
+        return;
+    }
+    let listed: Vec<(String, String, String, String, String)> = found
+        .iter()
+        .map(|(lens, f)| {
+            let at = match (&f.file, f.line) {
+                (Some(file), Some(line)) => format!("{file}:{line}"),
+                (Some(file), None) => file.clone(),
+                _ => "the change".to_string(),
+            };
+            (
+                lens.clone(),
+                f.id.clone(),
+                at,
+                f.title.clone(),
+                f.detail.clone(),
+            )
+        })
+        .collect();
+    let what = "the Sizer, finding defects more than one lens found";
+    let groups = ask(
+        run,
+        s,
+        caller,
+        Role::Sizer,
+        what,
+        &roles::same_prompt(&listed),
+        None,
+    )
+    .and_then(|text| roles::read_same(&text));
+    let groups = match groups {
+        Ok(groups) => groups,
+        Err(e) => {
+            if let Some(r) = run.lenses.values_mut().find_map(|l| l.rounds.last_mut()) {
+                r.notes.push(format!(
+                    "findings more than one lens made of one defect weren't grouped: {e:#}"
+                ));
+            }
+            return;
+        }
+    };
+    for group in groups {
+        let mut members: Vec<&(String, Finding)> = found
+            .iter()
+            .filter(|(_, f)| group.contains(&f.id))
+            .collect();
+        // The one that blocks, and the gravest, stands for the rest.
+        members.sort_by_key(|(_, f)| (!f.blocks(), f.severity));
+        let Some(((first_lens, first), rest)) = members.split_first().map(|(f, r)| (*f, r)) else {
+            continue;
+        };
+        for (lens, f) in rest.iter().filter(|(l, _)| l != first_lens) {
+            if let Some(g) = run
+                .lenses
+                .get_mut(lens)
+                .and_then(|l| l.rounds.last_mut())
+                .and_then(|r| r.findings.iter_mut().find(|g| g.id == f.id))
+            {
+                g.same_as = Some(first.id.clone());
+            }
+        }
+    }
 }
 
 fn all_settled(run: &Run) -> bool {
@@ -5010,6 +5105,76 @@ lenses:
             "alpha's Judge waited for beta's reviewer"
         );
         assert_eq!(run.lenses["alpha"].rounds[0].findings.len(), 1);
+    }
+
+    #[test]
+    fn one_defect_two_lenses_found_is_decided_once_and_fixed_once() {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => rating("High"),
+                Role::Sizer if prompt.contains("the same defect") => {
+                    r#"{"same": [["alpha-r1-1", "beta-r1-1"]]}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (mut run, c) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.waiting, Some(Gate::Fold));
+        let beta = &run.lenses["beta"].rounds[0].findings[0];
+        assert_eq!(beta.same_as.as_deref(), Some("alpha-r1-1"));
+        assert!(beta.blocks(), "it keeps its own ruling");
+        // Asked about once, as found by both.
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Missed"]);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        let q = &ask.carousels[0].questions[0];
+        assert!(q.question.contains("also found by beta"), "{}", q.question);
+        // One answer decides both, and the fixer reads it once.
+        let a = answered(&run, &cfg, &[("Blocker 1", "Fix it".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        for lens in ["alpha", "beta"] {
+            assert_eq!(
+                run.lenses[lens].rounds[0].findings[0].state,
+                FindingState::Folded,
+                "{lens}"
+            );
+        }
+        let brief = fix_list(&to_fix(&run), &[]);
+        assert_eq!(brief.matches("a defect").count(), 1, "{brief}");
+        assert!(
+            brief.contains("The same defect was found by: beta"),
+            "{brief}"
+        );
+        let _ = c;
+    }
+
+    #[test]
+    fn findings_go_ungrouped_and_say_so_when_the_grouping_fails() {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => rating("High"),
+                _ => "no idea".to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let notes: Vec<&String> = run
+            .lenses
+            .values()
+            .flat_map(|l| &l.rounds[0].notes)
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.contains("weren't grouped")),
+            "{notes:?}"
+        );
+        assert!(
+            run.lenses
+                .values()
+                .all(|l| l.rounds[0].findings.iter().all(|f| f.same_as.is_none()))
+        );
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Blocker 2", "Missed"]);
     }
 
     #[test]
