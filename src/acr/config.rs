@@ -252,6 +252,22 @@ pub struct Integrations {
     pub labels: Option<Labels>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<CommentFormat>,
+    /// What a review waiting for you sends to Grayboard, when config.toml
+    /// has `[grayboard]`: its questions in full, the default, or only that
+    /// it waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grayboard: Option<Share>,
+}
+
+/// How much of a review's questions go to Grayboard, and so to your Slack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Share {
+    /// The questions and their options, to answer by replying.
+    Full,
+    /// Only "review X needs your answer: N questions"; you answer at the
+    /// review's machine.
+    Nudge,
 }
 
 /// What a repository sets. The user's config and a run's flags can set it

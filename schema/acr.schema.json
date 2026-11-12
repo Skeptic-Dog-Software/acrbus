@@ -81,7 +81,8 @@
             "confirmed": {"type": "string"}
           }
         },
-        "comment": {"enum": ["summary", "full"]}
+        "comment": {"enum": ["summary", "full"]},
+        "grayboard": {"enum": ["full", "nudge"], "description": "With [grayboard] in config.toml: what a review waiting for you sends there, its questions in full (the default) or only that it waits."}
       }
     },
     "bindings": {

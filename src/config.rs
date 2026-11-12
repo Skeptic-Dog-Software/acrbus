@@ -232,11 +232,45 @@ pub struct Config {
     /// the bus.
     #[serde(default)]
     pub bridges: std::collections::HashMap<String, toml::Value>,
+    /// A Grayboard team server that reviews ask their questions through
+    /// and that holds their claims. Left out, reviews never reach one.
+    #[serde(default)]
+    pub grayboard: Option<GrayboardConfig>,
     /// Settings a network reads, such as the path to a CLI it runs: keys
     /// only the program's networks declare (`network::Kind::settings`).
     /// Anything else is refused when the config is loaded.
     #[serde(flatten)]
     pub network_settings: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// `[grayboard]` in config.toml: the server, and who acrbus is on it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrayboardConfig {
+    /// The team server's URL, such as `https://grayboard.example.com`.
+    pub server: String,
+    /// The name this machine's acrbus binds on the server, under your
+    /// account. Each machine needs its own.
+    #[serde(default = "default_grayboard_name")]
+    pub name: String,
+    /// The OAuth client the server operator registered for acrbus.
+    #[serde(default = "default_grayboard_client")]
+    pub client_id: String,
+    /// How often, in seconds, the daemon checks for your answers.
+    #[serde(default = "default_grayboard_poll")]
+    pub poll_secs: u64,
+}
+
+fn default_grayboard_name() -> String {
+    "acr".into()
+}
+
+fn default_grayboard_client() -> String {
+    "acrbus".into()
+}
+
+fn default_grayboard_poll() -> u64 {
+    20
 }
 
 fn default_max_subagents() -> u32 {

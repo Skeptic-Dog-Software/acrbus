@@ -153,9 +153,64 @@ the config, for reading a proposal or writing one yourself, and
 | `acrbus acr carry` | Carry work that isn't code, such as a document, into git so it can be reviewed. |
 | `acrbus acr check`, `acrbus acr trial` | Check that a trial can run, then measure a review design on a change whose defects are known. |
 | `acrbus acr judge-check <key>...` | Compare the Judge's rulings with a past review's, as a benchmark. |
+| `acrbus grayboard login`, `status`, `logout` | Sign in to a Grayboard team server, so reviews ask you there and claim their changes. See [Grayboard](#grayboard-answer-from-your-phone). |
 
 The method itself is in [the ACR skill](plugin/skills/acr/SKILL.md), and the
 config's schema in [schema/acr.schema.json](schema/acr.schema.json).
+
+### Grayboard: answer from your phone
+
+With a [Grayboard](https://github.com/nolnoch/grayboard) team server, a
+review that waits for you sends you its questions, and your reply answers
+them; and a review claims its change there, so a second review of it
+doesn't start on any machine while the first runs or waits.
+
+- **Your questions, in Slack.** When a review pauses at a gate, the daemon
+  sends its questions to your `human` handle, which Grayboard's Slack app
+  brings to your phone. Reply in the thread, a line per question: its
+  number, then the option's number or name, such as `1: 1` and `2: Fix it`.
+  Where a question takes your own words, write them after its number. The
+  daemon checks your answers against the review and resumes it in the
+  background, logging to its `progress.log`, and writes when it waits
+  again or ends. A reply it can't read, or one to questions the review has
+  moved past, gets an answer saying so. Answers that choose fixes for the
+  review's builder session go to that session over the bus, for it to
+  apply and fix.
+- **A claim on the change.** `acr run` claims `review:<repository>#<pr>`,
+  or `review:<repository>@<head>` with no pull request, and refuses to
+  start when someone else holds it, naming them and since when. The daemon
+  renews the claim while the review runs or waits, and releases it when
+  the review is confirmed or stopped. A merge or deploy hook can refuse
+  while it's held: `grayboard claims --prefix 'review:myrepo#123'` exits 2
+  when a claim matches.
+
+Setting it up:
+
+1. The server's operator registers acrbus as an OAuth client, in the
+   server's `GRAYBOARD_OAUTH_CLIENTS`:
+   `{"clientId":"acrbus","name":"acrbus review pipeline","redirectUris":["http://127.0.0.1/callback"],"scopes":["grayboard:tools","grayboard:delivery"],"tokenEndpointAuthMethod":"none","allowRefresh":true,"sessionSource":true}`.
+   `sessionSource` lets it bind a name and send messages as you.
+2. Sign in, in your browser: `acrbus grayboard login --server
+   https://grayboard.example.com`. That adds `[grayboard]` to config.toml.
+3. Restart the daemon, `acrbus service install`, and check:
+   `acrbus grayboard status` says the handle it holds.
+
+| `[grayboard]` in config.toml | Is |
+| --- | --- |
+| `server` | The team server. Required. |
+| `name` | The name this machine's acrbus binds under your account. Default `acr`: give each machine its own, such as `acr-mini`. |
+| `client_id` | The client the operator registered. Default `acrbus`. |
+| `poll_secs` | How often the daemon checks for your answers. Default 20. |
+
+A repository's config says how much goes there: `integrations: {grayboard:
+nudge}` sends only "review X needs your answer: N questions", and you
+answer at its machine; `full`, the default, sends the questions. Only the
+daemon holds the sign-in and the session. Its files, the grant (`0600`),
+the notes sent, your answers and the resumes' output, are under
+`grayboard/` in the state folder, and the daemon's cleanup clears them
+after 30 days. When the server is away, reviews go on without it: notes
+wait to be sent, and a run that can't ask for its claim says so and
+starts anyway.
 
 ### Bindings
 

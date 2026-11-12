@@ -1,6 +1,6 @@
 [package]
 name = "acrbus"
-version = "0.1.16"
+version = "0.1.18"
 edition = "2024"
 rust-version = "1.88"
 description = "Adversarial convergence review (ACR) on a local agent bus: bridges to any headless agent, no network needed"
@@ -30,4 +30,4 @@ sha2 = "0.11.1"
 tiny_http = "0.12.0"
 toml = "1.1.8"
 toml_edit = "0.25.19"
-ureq = { version = "3.5.0", default-features = false }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }

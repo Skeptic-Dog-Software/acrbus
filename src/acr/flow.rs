@@ -320,6 +320,10 @@ pub fn dollars(usage: &[Usage]) -> Option<f64> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
+    /// The bus name of the session that started the review, when it was
+    /// one: who its fixes are for, if answers come from elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter: Option<String>,
     pub repo: PathBuf,
     pub base: String,
     pub head: Option<String>,
@@ -790,6 +794,7 @@ pub fn start(
 ) -> Result<Run> {
     let mut run = Run {
         id: id.to_string(),
+        starter: None,
         // Whole, so that history finds it from anywhere.
         repo: repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()),
         base: base.to_string(),
@@ -2452,6 +2457,12 @@ fn refocus(run: &mut Run, s: &Setting, caller: &dyn Caller, before: Option<&str>
 }
 
 /// The blockers still to fix, by lens, from rounds no fix has had yet.
+/// Whether the review now waits on its builder session to fix: what was
+/// chosen to fix goes to the session, not the Orchestrator.
+pub fn session_fixes(run: &Run) -> bool {
+    run.fixer == Fixer::Session && !to_fix(run).is_empty()
+}
+
 fn to_fix(run: &Run) -> Vec<(String, Finding)> {
     let since = run.steelmans.last().map_or(0, |m| m.round);
     run.lenses

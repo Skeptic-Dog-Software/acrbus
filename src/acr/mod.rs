@@ -10,6 +10,7 @@ mod config;
 mod configure;
 mod flow;
 mod generated;
+pub mod grayboard;
 mod keep;
 mod plan;
 pub mod progress;
@@ -388,6 +389,59 @@ fn user_config_path(paths: &Paths) -> PathBuf {
 
 fn run_dir(paths: &Paths, id: &str) -> PathBuf {
     keep::dir(paths).join(id)
+}
+
+/// With Grayboard set up, claims the change for review `id`, so a second
+/// review of it doesn't start anywhere while this one runs or waits.
+/// Refuses when someone else holds it; goes on, saying so, when the claim
+/// can't be asked about.
+fn claim(paths: &Paths, repo: &str, target: &Target, post_pr: Option<u64>, id: &str) -> Result<()> {
+    if !grayboard::configured(paths) {
+        return Ok(());
+    }
+    let head = target.head.as_deref().and_then(|h| {
+        change::git(
+            &target.repo,
+            &["rev-parse", "--verify", &format!("{h}^{{commit}}")],
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+    });
+    let key = grayboard::claim_key(repo, target.pr.or(post_pr), head.as_deref());
+    let note = format!("{APP_NAME} review {id}");
+    let req = crate::local::Request::GrayboardClaim {
+        key: key.clone(),
+        run: id.to_string(),
+        note,
+    };
+    let answer: grayboard::ClaimAnswer = match crate::local::call(&paths.socket(), &req) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "{APP_NAME}: couldn't claim {key} on Grayboard ({e:#}); going on without it."
+            );
+            return Ok(());
+        }
+    };
+    if answer.taken {
+        eprintln!("{APP_NAME}: claimed {key} on Grayboard for review {id}.");
+        return Ok(());
+    }
+    if let Some(problem) = answer.problem {
+        eprintln!("{APP_NAME}: couldn't claim {key} on Grayboard: {problem}");
+        return Ok(());
+    }
+    let now = crate::util::now_ms();
+    bail!(
+        "{key} is claimed by {}{}{}: another review of this change is under way. Wait for it \
+         to end, or ask its owner.",
+        answer.held_by.as_deref().unwrap_or("someone"),
+        answer
+            .since
+            .map(|t| format!(" since {}", crate::util::ago(t, now)))
+            .unwrap_or_default(),
+        answer.note.map(|n| format!(" ({n})")).unwrap_or_default(),
+    )
 }
 
 /// Refuses to go on with a review that's finished: its files stay a while,
@@ -1655,6 +1709,8 @@ fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: 
 /// Prints a run's report, and says what to do next.
 fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<ExitCode> {
     save(paths, run, cfg)?;
+    // Waiting for you, or over: Grayboard hears, if it's set up.
+    grayboard::on_finish(paths, run, cfg);
     keep::finished(paths, run, true)?;
     println!(
         "{}",
@@ -1968,9 +2024,12 @@ pub fn sweep(paths: &Paths) -> usize {
         + flow::prune_copies(&copies_root(paths))
         + trial::prune(paths)
         + configure::prune_findings(&paths.state)
+        + grayboard::prune(paths)
 }
 
-pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
+/// `starter`: the bus name of the session running the command, when it's
+/// one, which a review records as its builder.
+pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<ExitCode> {
     // Every role a review starts reads the system prompt this version has.
     if let Err(e) = crate::setup::keep_system_prompt(paths) {
         eprintln!("{APP_NAME}: couldn't keep ACR's system prompt: {e:#}");
@@ -2065,6 +2124,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
             let id = new_id();
+            claim(paths, &name, &target, post_pr, &id)?;
             let mut s = setting(paths, &cfg, &id, Some(list))?;
             s.description = description;
             s.builder_brief = target
@@ -2086,6 +2146,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 );
             }
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
+            run.starter = starter;
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
@@ -3447,7 +3508,7 @@ mod tests {
         };
         // It says where the proposal is, and exits 1, rather than failing to
         // find a config.
-        assert_eq!(super::run(&paths, asked).unwrap(), ExitCode::FAILURE);
+        assert_eq!(super::run(&paths, asked, None).unwrap(), ExitCode::FAILURE);
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());
         let _ = fs::remove_dir_all(&repo);
     }
@@ -3709,9 +3770,9 @@ mod tests {
             post_pr: None,
         };
         // Going on needs the head checked out, before anything else.
-        let err = format!("{:#}", super::run(&paths, resume(false)).unwrap_err());
+        let err = format!("{:#}", super::run(&paths, resume(false), None).unwrap_err());
         assert!(err.contains("has to be what's checked out"), "{err}");
-        super::run(&paths, resume(true)).unwrap();
+        super::run(&paths, resume(true), None).unwrap();
         // Ended, and kept to be looked at, packed, but it can't go on.
         let kept = keep::kept(&paths, "r-stop").unwrap();
         let name = kept.file_name().unwrap().to_string_lossy().into_owned();
@@ -3720,7 +3781,7 @@ mod tests {
             &format!("{}/run.json", name.trim_end_matches(".tar.gz")),
         );
         assert!(run.is_ok(), "{name}");
-        let err = format!("{:#}", super::run(&paths, resume(true)).unwrap_err());
+        let err = format!("{:#}", super::run(&paths, resume(true), None).unwrap_err());
         assert!(err.contains("has finished"), "{err}");
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());
         let _ = fs::remove_dir_all(&repo);

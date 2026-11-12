@@ -16,6 +16,7 @@ pub mod cli;
 pub mod config;
 mod daemon;
 mod format;
+mod grayboard;
 mod hook;
 mod local;
 mod mcp;
