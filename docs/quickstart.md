@@ -200,6 +200,12 @@ In Claude Code, the ACR skill shows each carousel to you as given. Your
 verdicts on findings, and the defects you say were missed, are kept as
 feedback for `acr calibrate`.
 
+With a Grayboard team server, the questions also come to your phone, through
+Grayboard's Slack app, and replying in their thread answers them: `acrbus
+grayboard login --server <url>`, then restart the bus. The README's
+[Grayboard section](../README.md#grayboard-answer-from-your-phone) says how
+to reply, and what the server's operator registers first.
+
 The gates:
 
 | Waits for | When | It asks |

@@ -171,6 +171,33 @@ enum Cmd {
         #[command(subcommand)]
         command: BridgeCmd,
     },
+    /// A Grayboard team server: reviews ask you their questions there, which
+    /// its Slack app brings to your phone, and claim their changes.
+    Grayboard {
+        #[command(subcommand)]
+        command: GrayboardCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GrayboardCmd {
+    /// Sign in to the server as this machine's acrbus, in your browser.
+    Login {
+        /// The server, such as https://grayboard.example.com. Saved as
+        /// `[grayboard] server` in config.toml when it has none yet.
+        #[arg(long)]
+        server: Option<String>,
+        /// The name to bind there (default `acr`). Each machine needs its own.
+        #[arg(long)]
+        name: Option<String>,
+        /// Only print the link, without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Sign out, revoking the sign-in on the server.
+    Logout,
+    /// Whether the daemon is signed in, the name it holds, and what waits.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -312,6 +339,82 @@ fn agent_name(explicit: Option<String>) -> Result<String> {
     }
 }
 
+/// The bus name of the agent session running this command, if it's one:
+/// named outright, or a Claude Code or Codex session's.
+fn session_agent(explicit: Option<String>) -> Option<String> {
+    let in_session = explicit.is_some()
+        || [
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CLAUDE_PROJECT_DIR",
+        ]
+        .iter()
+        .any(|v| env::var_os(v).is_some_and(|x| !x.is_empty()));
+    if !in_session {
+        return None;
+    }
+    agent_name(explicit).ok()
+}
+
+fn grayboard_cmd(paths: &Paths, command: GrayboardCmd) -> Result<()> {
+    match command {
+        GrayboardCmd::Login {
+            server,
+            name,
+            no_browser,
+        } => {
+            let cfg = setup::grayboard_config(paths, server.as_deref(), name.as_deref())?;
+            crate::grayboard::login(paths, &cfg, &crate::grayboard::show_link(!no_browser))?;
+            println!(
+                "Signed in to {} as {}'s client `{}`. The daemon binds `{}` there once it's \
+                 restarted: `{APP_NAME} service install` restarts it.",
+                cfg.server, APP_NAME, cfg.client_id, cfg.name
+            );
+        }
+        GrayboardCmd::Logout => {
+            if crate::grayboard::logout(paths)? {
+                println!("Signed out of Grayboard.");
+            } else {
+                println!("Not signed in to Grayboard.");
+            }
+        }
+        GrayboardCmd::Status => {
+            let Some(cfg) = crate::grayboard::settings(paths) else {
+                println!(
+                    "Grayboard isn't set up: add [grayboard] to config.toml, or run `{APP_NAME} grayboard login --server <url>`."
+                );
+                return Ok(());
+            };
+            let st: Option<crate::grayboard::Status> =
+                local::call(&paths.socket(), &Request::GrayboardStatus).unwrap_or(None);
+            println!("Server: {}", cfg.server);
+            println!(
+                "Signed in: {}",
+                if crate::grayboard::read_grant(paths).is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            match st {
+                None => println!(
+                    "Daemon: not running Grayboard; restart it with `{APP_NAME} service install`"
+                ),
+                Some(st) => {
+                    println!("Holds: {}", st.handle.as_deref().unwrap_or("nothing yet"));
+                    if let Some(p) = st.problem {
+                        println!("Problem: {p}");
+                    }
+                    if let Some(t) = st.last_ok {
+                        println!("Last in touch: {}", util::ago(t, util::now_ms()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
     let paths = Paths::find()?;
     paths.check_socket()?;
@@ -360,7 +463,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             ServiceCmd::Install { now } => setup::service_install(&paths, now)?,
             ServiceCmd::Uninstall => setup::service_uninstall(&paths)?,
         },
-        Cmd::Acr { command } => return acr::run(&paths, command),
+        Cmd::Acr { command } => return acr::run(&paths, command, session_agent(cli.agent)),
+        Cmd::Grayboard { command } => grayboard_cmd(&paths, command)?,
         Cmd::Bridge { command } => match command {
             BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
             BridgeCmd::Install { agent, now } => setup::bridge_install(&paths, &agent, now)?,

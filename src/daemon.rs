@@ -56,7 +56,18 @@ pub fn run(paths: &Paths) -> Result<()> {
     let network = crate::network::open(&cfg)?;
     let _ = fs::remove_file(&socket);
     let store = Store::open(&paths.db())?;
+    let grayboard = cfg.grayboard.clone();
     let bus = Bus::start(cfg, network, store, paths.attachments());
+    if let Some(gcfg) = grayboard {
+        // Reviews' questions and claims, through the one session there.
+        let events = bus.clone();
+        crate::grayboard::start(
+            paths.clone(),
+            gcfg,
+            crate::acr::grayboard::tick,
+            Box::new(move |line| events.event(line)),
+        );
+    }
     {
         // launchd's log for the daemon, which nothing else cuts back.
         let (bus, log) = (bus.clone(), paths.log());
@@ -627,6 +638,12 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
         Request::Agents => conn.write(&bus.agent_list()?)?,
         Request::Peers => conn.write(&bus.peers()?)?,
         Request::Status => conn.write(&status(bus)?)?,
+        Request::GrayboardClaim { key, run, note } => {
+            conn.write(&crate::acr::grayboard::claim_request(&key, &run, &note))?;
+        }
+        Request::GrayboardStatus => {
+            conn.write(&crate::grayboard::service().map(|s| s.status()))?;
+        }
         Request::Tail { after } => {
             let deadline = Instant::now() + Duration::from_secs(25);
             let events = bus

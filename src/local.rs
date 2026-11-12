@@ -177,6 +177,15 @@ pub enum Request {
     Agents,
     Peers,
     Status,
+    /// Claims a change for a review on Grayboard, through the daemon's one
+    /// session there. Answers a `ClaimAnswer`.
+    GrayboardClaim {
+        key: String,
+        run: String,
+        note: String,
+    },
+    /// How the daemon's Grayboard session is, if it has one.
+    GrayboardStatus,
     /// Events after `after`, waiting a while for one.
     Tail {
         after: u64,

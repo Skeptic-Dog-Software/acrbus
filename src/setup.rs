@@ -1490,6 +1490,46 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// `[grayboard]` in config.toml, with `server` and `name` set where they're
+/// given: the section is added if there's none, which needs a server.
+pub fn grayboard_config(
+    paths: &Paths,
+    server: Option<&str>,
+    name: Option<&str>,
+) -> Result<crate::config::GrayboardConfig> {
+    let text = fs::read_to_string(&paths.config).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("reading {}", paths.config.display()))?;
+    if doc.get("grayboard").is_none() {
+        if server.is_none() {
+            bail!(
+                "{} has no [grayboard]: pass --server with your team server's URL",
+                paths.config.display()
+            );
+        }
+        doc["grayboard"] = toml_edit::table();
+    }
+    let table = doc["grayboard"]
+        .as_table_mut()
+        .context("[grayboard] in config.toml isn't a table")?;
+    let mut changed = false;
+    for (key, value) in [("server", server), ("name", name)] {
+        if let Some(v) = value
+            && table.get(key).and_then(|i| i.as_str()) != Some(v)
+        {
+            table[key] = toml_edit::value(v);
+            changed = true;
+        }
+    }
+    if changed {
+        write(&paths.config, &doc.to_string())?;
+    }
+    crate::config::Config::load(&paths.config)?
+        .grayboard
+        .context("config.toml's [grayboard] didn't load")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
