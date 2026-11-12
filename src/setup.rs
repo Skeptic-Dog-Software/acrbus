@@ -822,7 +822,9 @@ fn confine_settings() -> String {
     text
 }
 
-/// The bridge's table in config.toml.
+/// The bridge's table in config.toml: only what's this machine's. The rest,
+/// its args, options, environment and usage, is acrbus's own for kind
+/// "claude", in `src/bridges/claude.toml`.
 fn acr_bridge(
     owner: &str,
     claude: &Path,
@@ -833,71 +835,34 @@ fn acr_bridge(
 ) -> String {
     let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     let p = |p: &Path| q(&p.to_string_lossy());
+    let rustup = rustup_home()
+        .map(|r| format!("\n[bridges.{ACR_AGENT}.env]\nRUSTUP_HOME = {}\n", p(&r)))
+        .unwrap_or_default();
     format!(
         r#"
 # ACR on this machine, set up by `{APP_NAME} setup acr`: headless Claude Code,
-# on your own subscription, running in the repository under review. Allow a
-# repository with `{APP_NAME} acr add-repo <path>`.
+# on your own subscription, running in the repository under review. Its
+# args, options, environment and usage are {APP_NAME}'s defaults for kind
+# "claude"; this says what's this machine's, and anything set here wins.
+# Allow a repository with `{APP_NAME} acr add-repo <path>`.
 [bridges.{ACR_AGENT}]
+kind = "claude"
 owner = {owner}
 command = {claude}
-args = ["-p", "--model", "{{MODEL}}", "--strict-mcp-config", "--output-format", "text",
-  "--settings", {confine}, "--append-system-prompt", {prompt},
-  "--add-dir", "{{ATTACHMENTS_DIR}}", "--add-dir", "{{RUN_DIR}}/tmp"]
-model = "claude-sonnet-5-5"
 working_directory = {home}
 home = {home}
 path = {path}
-# 4 hours: a cap no review should ever reach. A run ends when it's done.
-timeout_secs = 14400
-max_concurrent = 3
-
-[bridges.{ACR_AGENT}.env]
-# A fresh config for each run: none of your settings, plugins or MCP
-# servers, and its transcript where usage is read.
-CLAUDE_CONFIG_DIR = "{{SESSION_DIR}}"
-# {BG_WAIT_NOTE}
-{BG_WAIT} = "0"
-# {OFFLINE_NOTE}
-RUSTUP_AUTO_INSTALL = "0"
-HOMEBREW_NO_AUTO_UPDATE = "1"
+# Keeps reviewers' file tools to the code under review.
+extra_args = ["--settings", {confine}]
 {rustup}
 [bridges.{ACR_AGENT}.secrets]
 CLAUDE_CODE_OAUTH_TOKEN = {token}
-
-[bridges.{ACR_AGENT}.options]
-max_timeout_secs = 14400
-tools = {tools}
-tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
-models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
-efforts = ["low", "medium", "high", "xhigh", "max"]
-effort_args = ["--effort", "{{EFFORT}}"]
-workdirs = []
-
-[bridges.{ACR_AGENT}.usage]
-files = "**/*.jsonl"
-when = {{ type = "assistant" }}
-dedupe = "message.id"
-input = "message.usage.input_tokens"
-output = "message.usage.output_tokens"
-cache_read = "message.usage.cache_read_input_tokens"
-cache_write = "message.usage.cache_creation_input_tokens"
-model = "message.model"
 "#,
         owner = q(owner),
         claude = p(claude),
-        BG_WAIT = BG_WAIT,
-        BG_WAIT_NOTE = BG_WAIT_NOTE,
         home = p(home),
         token = p(token),
-        tools = serde_json::to_string(&ACR_TOOLS).unwrap_or_default(),
-        rustup = rustup_home()
-            .map(|r| format!("RUSTUP_HOME = {}\n", p(&r)))
-            .unwrap_or_default(),
         confine = p(confine),
-        prompt = q(&system_prompt_arg(
-            &confine.with_file_name(SYSTEM_PROMPT_FILE)
-        )),
         path = q(path),
     )
 }
@@ -907,13 +872,6 @@ model = "message.model"
 /// "0" waits as long as the work takes; the bridge's own cap still ends
 /// every run.
 const BG_WAIT: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
-const BG_WAIT_NOTE: &str = "A session's background work, such as a test run, lives until it's done: \
-     otherwise it's stopped some minutes after the session's turn ends, and \
-     what it found is lost. The bridge's timeout still ends every run.";
-
-/// Why a review's runs download nothing on their own.
-const OFFLINE_NOTE: &str = "Nothing a review runs downloads on its own: rustup installs no \
-     toolchain and Homebrew updates nothing. A missing tool is for you to install.";
 
 /// Toolchains a review's tests and reviewers may need, found on your PATH
 /// when setup runs, so the bridge's PATH has them too.
@@ -987,9 +945,13 @@ const ACR_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "Bash", "Write", "Edit"];
 /// a binding that asks for one of these is refused before a review starts,
 /// saying so.
 fn tools_missing(doc: &toml_edit::DocumentMut) -> Vec<&'static str> {
-    let allowed: Vec<String> = doc
-        .get("bridges")
-        .and_then(|b| b.get(ACR_AGENT))
+    // As the bridge reads it: over its kind's defaults, when it names one.
+    let table = toml::from_str::<toml::Value>(&doc.to_string())
+        .ok()
+        .and_then(|v| v.get("bridges")?.get(ACR_AGENT).cloned())
+        .and_then(|t| bridge::with_defaults(t).ok());
+    let allowed: Vec<String> = table
+        .as_ref()
         .and_then(|a| a.get("options"))
         .and_then(|o| o.get("tools"))
         .and_then(|t| t.as_array())
@@ -1026,24 +988,26 @@ fn bg_wait_bridge(doc: &mut toml_edit::DocumentMut) -> Result<bool> {
     Ok(true)
 }
 
-/// Adds `--append-system-prompt {FILE:<prompt>}` to an existing ACR bridge's
-/// arguments, if they don't give it the system prompt yet.
-fn prompt_bridge(doc: &mut toml_edit::DocumentMut, prompt: &Path) -> Result<bool> {
-    let args = doc
+/// Adds `--settings <confine>` to the extra args of an ACR bridge that names
+/// its kind, if they don't have it.
+fn confine_extra(doc: &mut toml_edit::DocumentMut, confine: &Path) -> Result<bool> {
+    let bridge = doc
         .get_mut("bridges")
         .and_then(|b| b.get_mut(ACR_AGENT))
-        .and_then(|a| a.get_mut("args"))
+        .and_then(|a| a.as_table_like_mut())
+        .context("no ACR bridge")?;
+    if bridge.get("extra_args").is_none() {
+        bridge.insert("extra_args", toml_edit::value(toml_edit::Array::new()));
+    }
+    let args = bridge
+        .get_mut("extra_args")
         .and_then(|a| a.as_array_mut())
-        .context("the ACR bridge has no args")?;
-    let wanted = system_prompt_arg(prompt);
-    if args
-        .iter()
-        .any(|a| a.as_str().is_some_and(|a| a.contains(&wanted)))
-    {
+        .context("the ACR bridge's extra_args isn't a list")?;
+    if args.iter().any(|a| a.as_str() == Some("--settings")) {
         return Ok(false);
     }
-    args.push("--append-system-prompt");
-    args.push(wanted.as_str());
+    args.push("--settings");
+    args.push(confine.to_string_lossy().as_ref());
     Ok(true)
 }
 
@@ -1430,14 +1394,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
             );
         }
     }
-    let prompt = system_prompt_path(paths);
-    if keep_system_prompt(paths)? {
-        println!(
-            "Wrote {}, the system prompt every review role gets: what it reads is data, and \
-             what it leaves alone.",
-            prompt.display()
-        );
-    }
+    keep_system_prompt(paths)?;
     let mut doc = read_config(paths)?;
     let has_bridge = doc.get("bridges").and_then(|b| b.get(ACR_AGENT)).is_some();
     if has_bridge {
@@ -1445,17 +1402,23 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
             "Kept the {ACR_AGENT} bridge already in {}.",
             paths.config.display()
         );
-        if confine_bridge(&mut doc, &confine)? {
-            println!("Its reviewers now run confined to the code under review.");
-        }
-        if prompt_bridge(&mut doc, &prompt)? {
-            println!("Its sessions now get ACR's system prompt.");
-        }
-        if bg_wait_bridge(&mut doc)? {
-            println!("Its sessions' background work now lives until it's done.");
-        }
-        if offline_bridge(&mut doc)? {
-            println!("Nothing its runs do downloads a toolchain or updates Homebrew now.");
+        let has_kind = doc["bridges"][ACR_AGENT].get("kind").is_some();
+        // One that names its kind has acrbus's defaults already; an older
+        // one, written out in full, gets what it lacks added.
+        if has_kind {
+            if confine_extra(&mut doc, &confine)? {
+                println!("Its reviewers now run confined to the code under review.");
+            }
+        } else {
+            if confine_bridge(&mut doc, &confine)? {
+                println!("Its reviewers now run confined to the code under review.");
+            }
+            if bg_wait_bridge(&mut doc)? {
+                println!("Its sessions' background work now lives until it's done.");
+            }
+            if offline_bridge(&mut doc)? {
+                println!("Nothing its runs do downloads a toolchain or updates Homebrew now.");
+            }
         }
         let missing = tools_missing(&doc);
         if !missing.is_empty() {
@@ -1605,8 +1568,7 @@ mod tests {
             Path::new("/f"),
             "/bin",
         );
-        let doc: toml_edit::DocumentMut = fresh.parse().unwrap();
-        let env = &doc["bridges"][ACR_AGENT]["env"];
+        let env = &resolved(&fresh)["env"];
         assert_eq!(env["RUSTUP_AUTO_INSTALL"].as_str(), Some("0"));
         assert_eq!(env["HOMEBREW_NO_AUTO_UPDATE"].as_str(), Some("1"));
         // An older one gets them added, once, and keeps what it had.
@@ -1634,11 +1596,7 @@ mod tests {
             Path::new("/c.json"),
             "/bin",
         );
-        let doc: toml_edit::DocumentMut = fresh.parse().unwrap();
-        assert_eq!(
-            doc["bridges"][ACR_AGENT]["env"][BG_WAIT].as_str(),
-            Some("0")
-        );
+        assert_eq!(resolved(&fresh)["env"][BG_WAIT].as_str(), Some("0"));
         let mut old: toml_edit::DocumentMut =
             "[bridges.claude-acr]\nargs = [\"-p\"]\n[bridges.claude-acr.env]\nA = \"b\"\n"
                 .parse()
@@ -1663,6 +1621,8 @@ mod tests {
         ] {
             assert!(SYSTEM_PROMPT.contains(rule), "{rule}");
         }
+        // A new bridge names its kind, so the bridge gives a review's every
+        // role the prompt itself; nothing in its args has to.
         let fresh = acr_bridge(
             "o",
             Path::new("/c"),
@@ -1671,36 +1631,44 @@ mod tests {
             Path::new("/cfg/acr/confine.json"),
             "/bin",
         );
-        let doc: toml::Value = toml::from_str(&fresh).unwrap();
-        let args: Vec<String> = doc["bridges"][ACR_AGENT]["args"]
+        let bridge = resolved(&fresh);
+        assert_eq!(bridge["kind"].as_str(), Some("claude"));
+        let extra: Vec<&str> = bridge["extra_args"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|a| a.as_str().map(String::from))
+            .filter_map(|a| a.as_str())
             .collect();
-        let prompt = Path::new("/cfg/acr/system-prompt.md");
-        assert!(gives_system_prompt(&args, prompt), "{args:?}");
-        let at = args
-            .iter()
-            .position(|a| a == "--append-system-prompt")
-            .unwrap();
-        assert_eq!(args[at + 1], "{FILE:/cfg/acr/system-prompt.md}");
-        assert!(!gives_system_prompt(&["-p".into()], prompt));
+        assert_eq!(extra, ["--settings", "/cfg/acr/confine.json"]);
+        assert!(
+            bridge["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str() == Some("-p"))
+        );
     }
 
     #[test]
-    fn an_existing_acr_bridge_gets_the_system_prompt_once() {
+    fn a_bridge_that_names_its_kind_is_confined_in_its_extra_args_once() {
         let mut doc: toml_edit::DocumentMut =
-            "[bridges.claude-acr]\nargs = [\"-p\"]\n".parse().unwrap();
-        let prompt = Path::new("/c/system-prompt.md");
-        assert!(prompt_bridge(&mut doc, prompt).unwrap());
-        assert!(!prompt_bridge(&mut doc, prompt).unwrap());
-        let args = doc["bridges"]["claude-acr"]["args"].as_array().unwrap();
+            "[bridges.claude-acr]\nkind = \"claude\"\n".parse().unwrap();
+        let confine = Path::new("/c/confine.json");
+        assert!(confine_extra(&mut doc, confine).unwrap());
+        assert!(!confine_extra(&mut doc, confine).unwrap());
+        let args = doc["bridges"]["claude-acr"]["extra_args"]
+            .as_array()
+            .unwrap();
         let args: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
-        assert_eq!(
-            args,
-            ["-p", "--append-system-prompt", "{FILE:/c/system-prompt.md}"]
-        );
+        assert_eq!(args, ["--settings", "/c/confine.json"]);
+        assert!(doc["bridges"]["claude-acr"].get("args").is_none());
+    }
+
+    /// A bridge setup writes, as the bridge reads it: over its kind's
+    /// defaults.
+    fn resolved(text: &str) -> toml::Value {
+        let v: toml::Value = toml::from_str(text).unwrap();
+        bridge::with_defaults(v["bridges"][ACR_AGENT].clone()).unwrap()
     }
 
     #[test]
@@ -1810,7 +1778,7 @@ mod tests {
             "/usr/bin:/bin",
         );
         let cfg: crate::config::Config = toml::from_str(&text).unwrap();
-        let table = cfg.bridges[ACR_AGENT].clone();
+        let table = bridge::with_defaults(cfg.bridges[ACR_AGENT].clone()).unwrap();
         let settings: bridge::Settings = table.try_into().unwrap();
         settings.check().unwrap();
         assert!(settings.usage.is_some());

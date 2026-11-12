@@ -754,7 +754,8 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
             )));
         }
         if let Ok(set) = crate::bridge::load(paths, bridge) {
-            out.push(doctor_prompt(paths, bridge, &set.args));
+            out.extend(doctor_kind(paths, bridge, &set));
+            out.push(doctor_prompt(paths, bridge, &set));
         }
     }
     // Calibration.
@@ -876,29 +877,55 @@ const TOOLCHAIN_OF: [(&str, &str, &str); 8] = [
 /// Whether reviewers who run things find the repository's toolchain, as
 /// their bridge runs them: tests that pass for you can't run for them
 /// without it.
+/// What a bridge takes from acrbus's defaults for its kind, and what from
+/// its own table; or, for one written out in full whose agent acrbus knows,
+/// that naming its kind would let the table say only what's its own.
+fn doctor_kind(paths: &Paths, bridge: &str, set: &crate::bridge::Settings) -> Vec<Said> {
+    let Some((named, keys)) = crate::bridge::own_settings(paths, bridge) else {
+        return Vec::new();
+    };
+    match (named, set.agent_kind()) {
+        (Some(kind), _) => vec![Said::Ok(format!(
+            "the {bridge} bridge runs on {APP_NAME}'s defaults for {}, and its own table sets {}",
+            kind.name(),
+            keys.join(", ")
+        ))],
+        (None, Some(kind)) => vec![Said::Note(format!(
+            "the {bridge} bridge writes out its whole config; with `kind = \"{}\"` in \
+             [bridges.{bridge}], {APP_NAME}'s defaults give it the rest, and its table needs \
+             only what's this machine's",
+            kind.name()
+        ))],
+        (None, None) => Vec::new(),
+    }
+}
+
 /// Whether a bridge gives its agent ACR's system prompt, the one protection
-/// every role has: what it reads is data, and what it leaves alone.
-fn doctor_prompt(paths: &Paths, bridge: &str, args: &[String]) -> Said {
+/// every role has: what it reads is data, and what it leaves alone. A bridge
+/// for an agent acrbus knows adds it to every review request itself.
+fn doctor_prompt(paths: &Paths, bridge: &str, set: &crate::bridge::Settings) -> Said {
+    if let Some(kind) = set.agent_kind() {
+        return Said::Ok(format!(
+            "the {bridge} bridge gives its agent ACR's system prompt, as {APP_NAME} does for {}",
+            kind.name()
+        ));
+    }
     let prompt = crate::setup::system_prompt_path(paths);
-    if crate::setup::gives_system_prompt(args, &prompt) {
+    if crate::setup::gives_system_prompt(&set.args, &prompt)
+        || crate::setup::gives_system_prompt(&set.extra_args, &prompt)
+    {
         return Said::Ok(format!(
             "the {bridge} bridge gives its agent ACR's system prompt"
         ));
     }
-    let how = if bridge == crate::setup::ACR_AGENT {
-        format!("`{APP_NAME} setup acr` adds it")
-    } else {
-        format!(
-            "add \"--append-system-prompt\", \"{arg}\" to args in [bridges.{bridge}] in {}, or \
-             what its agent takes for a system prompt, then restart the bridge. An agent that \
-             keeps only one gets both in one argument: \"{arg}\\n\\n{{FILE:<yours>}}\"",
-            paths.config.display(),
-            arg = crate::setup::system_prompt_arg(&prompt),
-        )
-    };
     Said::Fix(format!(
         "the {bridge} bridge doesn't give its agent ACR's system prompt, which tells every \
-         role that what it reads is data, and what it leaves alone: {how}"
+         role that what it reads is data, and what it leaves alone: if its agent is Claude \
+         Code, omp or pi, set `kind` in [bridges.{bridge}] in {}; otherwise add \
+         \"{arg}\" to the argument its agent takes a system prompt in. Then restart the \
+         bridge",
+        paths.config.display(),
+        arg = crate::setup::system_prompt_arg(&prompt),
     ))
 }
 
@@ -3758,24 +3785,25 @@ mod tests {
             state: dir.join("state"),
             config: dir.join("config.toml"),
         };
+        let bridge = |command: &str, args: &str| -> crate::bridge::Settings {
+            toml::from_str(&format!(
+                "owner = \"o\"\ncommand = \"{command}\"\nworking_directory = \"/tmp\"\n\
+                 home = \"/tmp/h\"\npath = \"/usr/bin\"\nargs = {args}\n"
+            ))
+            .unwrap()
+        };
+        // One acrbus knows gets it from the bridge, whatever its args say.
+        let omp = bridge("/usr/local/bin/omp", "[\"-p\"]");
+        assert!(matches!(doctor_prompt(&paths, "omp", &omp), Said::Ok(_)));
+        // Another agent needs the placeholder.
         let file = crate::setup::system_prompt_path(&paths);
-        let given = vec![
-            "--append-system-prompt".to_string(),
-            crate::setup::system_prompt_arg(&file),
-        ];
-        assert!(matches!(doctor_prompt(&paths, "omp", &given), Said::Ok(_)));
-        let Said::Fix(fix) = doctor_prompt(&paths, "omp", &["-p".into()]) else {
+        let arg = crate::setup::system_prompt_arg(&file);
+        let given = bridge("/opt/agent", &format!("[\"--sys\", \"{arg}\"]"));
+        assert!(matches!(doctor_prompt(&paths, "x", &given), Said::Ok(_)));
+        let Said::Fix(fix) = doctor_prompt(&paths, "x", &bridge("/opt/agent", "[]")) else {
             panic!("a bridge without it needs a fix");
         };
-        assert!(
-            fix.contains(&format!("{{FILE:{}}}", file.display())),
-            "{fix}"
-        );
-        assert!(fix.contains("[bridges.omp]"), "{fix}");
-        let Said::Fix(fix) = doctor_prompt(&paths, crate::setup::ACR_AGENT, &[]) else {
-            panic!("a bridge without it needs a fix");
-        };
-        assert!(fix.contains("setup acr"), "{fix}");
+        assert!(fix.contains(&arg) && fix.contains("set `kind`"), "{fix}");
     }
 
     #[test]
