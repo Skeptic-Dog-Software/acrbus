@@ -4943,6 +4943,71 @@ mod tests {
     }
 
     #[test]
+    fn every_judge_and_the_judge_keep_alive_ask_for_the_same_prefix_and_cache_key() {
+        // Everything a call's bridge turns into what comes before its own
+        // text: model, effort, tools, the facts and the cache key. Two
+        // Judges and the keep-alive that refreshes their prefix must agree
+        // on all of it, or the keep-alive warms a prefix no Judge reads.
+        let judge = config::Binding {
+            agent: "pi@here".into(),
+            model: Some("glm".into()),
+            effort: Some("low".into()),
+            tools: Some(vec!["grep".into(), "read".into()]),
+            ..config::Binding::default()
+        };
+        let shared = |round: u32| flow::Shared {
+            facts: PathBuf::from(format!("/state/acr/r/round-{round}.facts.md")),
+            key: "01RUN".into(),
+            tools: std::collections::BTreeMap::new(),
+            agents: vec!["pi@here".into()],
+        };
+        let repo = PathBuf::from("/repo");
+        let diff = PathBuf::from("/state/acr/r/a.diff");
+        // Two Judges, each with its own brief and the change attached, and
+        // the keep-alive, with neither.
+        let calls: [(&str, Option<&Path>, &str); 3] = [
+            ("judge A's brief", Some(&diff), "a: the Judge"),
+            ("judge B's brief", Some(&diff), "b: the Judge"),
+            (roles::KEEP_ALIVE, None, "cache keep-alive: Judges"),
+        ];
+        let prefix = |round: u32, (prompt, artifact, label): &(&str, Option<&Path>, &str)| {
+            let c = flow::Call {
+                role: Role::Judge,
+                binding_name: "judge",
+                binding: &judge,
+                prompt,
+                artifact: *artifact,
+                writes: false,
+                no_tools: false,
+                repo: &repo,
+                label: label.to_string(),
+            };
+            let mut o = call_options(&c, false, None);
+            with_shared(&mut o, &c, &shared(round));
+            (
+                o.model,
+                o.effort,
+                o.tools,
+                o.allowed_tools,
+                o.facts,
+                o.cache_key,
+                o.review,
+            )
+        };
+        let first = prefix(1, &calls[0]);
+        for c in &calls[1..] {
+            assert_eq!(prefix(1, c), first, "{}", c.2);
+        }
+        assert_eq!(first.1.as_deref(), Some("low"), "the binding's effort");
+        assert!(first.5.is_some(), "a cache key");
+        // A later round has its own facts, but keeps the key, so it reaches
+        // the replica the last round warmed.
+        let later = prefix(2, &calls[2]);
+        assert_ne!(later.4, first.4);
+        assert_eq!(later.5, first.5);
+    }
+
+    #[test]
     fn matched_tools_are_the_union_for_a_bridge_and_model_only_where_lists_differ() {
         let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
         let repo = config::parse_repo(
