@@ -248,12 +248,23 @@ pub struct Converged {
     pub disagreements: Vec<super::flow::Disagreement>,
 }
 
-/// A trial's scratch folder and its copy of the change. They stay however
-/// it ends, with what its sessions left, until the daemon's cleanup clears
-/// them `cleanup::KEEP` later.
+/// A trial's scratch folder and its copy of the change, named for when it
+/// began. However it ends, they're packed, with what its sessions left, into
+/// `<folder>.tar.gz`, until the daemon's cleanup clears them
+/// `cleanup::KEEP` later.
 pub(super) struct Scratch {
     pub dir: PathBuf,
     pub tree: PathBuf,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.dir.is_dir()
+            && let Err(e) = crate::util::pack(&self.dir)
+        {
+            eprintln!("{APP_NAME}: couldn't pack {}: {e:#}", self.dir.display());
+        }
+    }
 }
 
 impl Scratch {
@@ -265,7 +276,7 @@ impl Scratch {
     /// Where what the trial left is kept, and for how long.
     pub(super) fn kept(&self) -> String {
         format!(
-            "What it left is kept in {} for {} days.",
+            "What it left is kept in {}.tar.gz for {} days.",
             self.dir.display(),
             crate::cleanup::KEEP_DAYS
         )
@@ -279,19 +290,30 @@ fn kept_dir(paths: &Paths) -> PathBuf {
 
 /// How long the change a review to convergence left is kept, to audit it.
 const PATCH_DAYS: u64 = 30;
+/// A trial folder still unpacked after this many days was left by one that
+/// was killed: none runs this long.
+const STALE_DAYS: u32 = 3;
 
 fn patches_dir(paths: &Paths) -> PathBuf {
     paths.state.join("acr-bench").join("converged")
 }
 
-/// Removes trials' folders and canaries once they're past keeping, and the
-/// changes reviews to convergence left. The daemon's hourly cleanup calls
-/// it. Returns how many went.
+/// Removes trials' archives and canaries once they're past keeping, and the
+/// changes reviews to convergence left. It packs the folder of a trial that
+/// was killed, once none could still be running. The daemon's hourly
+/// cleanup calls it. Returns how many went.
 pub(super) fn prune(paths: &Paths) -> usize {
     let day = Duration::from_secs(24 * 3600);
+    let trials = paths.state.join("acr-trials");
+    for entry in fs::read_dir(&trials).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() && crate::util::older_than(&path, day * STALE_DAYS) {
+            let _ = crate::util::pack(&path);
+        }
+    }
     let places = [
         (kept_dir(paths), crate::cleanup::KEEP),
-        (paths.state.join("acr-trials"), crate::cleanup::KEEP),
+        (trials, crate::cleanup::KEEP),
         (patches_dir(paths), day * PATCH_DAYS as u32),
     ];
     let mut gone = 0;
@@ -322,7 +344,7 @@ impl Canary {
     pub(super) fn new(paths: &Paths) -> Result<Canary> {
         let dir = paths.state.join("acr-trials");
         fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("canary-{}.txt", new_id()));
+        let path = dir.join(crate::util::stamped(&format!("canary-{}.txt", new_id())));
         let secret = format!("canary-{}", new_id());
         fs::write(&path, format!("{secret}\n"))?;
         Ok(Canary { path, secret })
@@ -368,7 +390,10 @@ pub(super) fn resolved(mut key: Key) -> Result<Key> {
 /// change turned out. It's named after the repository, so its review config
 /// is found.
 pub(super) fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
-    let dir = paths.state.join("acr-trials").join(new_id());
+    let dir = paths
+        .state
+        .join("acr-trials")
+        .join(crate::util::stamped(&new_id()));
     fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
     let name = super::change::name(&key.repo)?;
@@ -1263,7 +1288,10 @@ pub fn rescore(paths: &Paths, key_path: &Path, results: &Path) -> Result<usize> 
     let name = key_name(key_path);
     let text =
         fs::read_to_string(results).with_context(|| format!("reading {}", results.display()))?;
-    let dir = paths.state.join("acr-trials").join(new_id());
+    let dir = paths
+        .state
+        .join("acr-trials")
+        .join(crate::util::stamped(&new_id()));
     fs::create_dir_all(&dir)?;
     let s = Scratch {
         tree: dir.clone(),
@@ -1397,9 +1425,16 @@ mod tests {
             .output()
             .unwrap();
         assert!(!out.status.success(), "the later commit is in the copy");
-        let tree = s.tree.clone();
+        let scratch = s.dir.clone();
         drop(s);
-        assert!(tree.exists(), "the copy stays when the trial ends");
+        let archive = scratch.with_file_name(format!(
+            "{}.tar.gz",
+            scratch.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            archive.is_file(),
+            "the copy is kept, packed, when the trial ends"
+        );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&repo);
     }
@@ -1570,12 +1605,18 @@ mod tests {
             "{said}"
         );
         drop(s);
-        // It all stays, the copy too, until the daemon's cleanup.
+        // It all stays, packed, the copy too, until the daemon's cleanup.
+        let archive = trial.with_file_name(format!(
+            "{}.tar.gz",
+            trial.file_name().unwrap().to_string_lossy()
+        ));
+        let name = trial.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            fs::read_to_string(trial.join("builder/debug.txt")).unwrap(),
-            "where it stopped"
+            crate::util::packed_file(&archive, &format!("{name}/builder/debug.txt")).unwrap(),
+            b"where it stopped"
         );
-        assert!(trial.join("repo/a.txt").exists());
+        assert!(crate::util::packed_file(&archive, &format!("{name}/repo/a.txt")).is_ok());
+        assert!(!trial.exists());
         assert_eq!(prune(&paths), 0, "not yet old");
         let _ = fs::remove_dir_all(&dir);
     }

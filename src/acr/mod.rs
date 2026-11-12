@@ -393,11 +393,12 @@ fn run_dir(paths: &Paths, id: &str) -> PathBuf {
 /// Refuses to go on with a review that's finished: its files stay a while,
 /// to be looked at, but it's over.
 fn not_finished(paths: &Paths, id: &str) -> Result<()> {
-    if keep::is_finished(paths, id) {
+    if let Some(kept) = keep::kept(paths, id) {
         bail!(
-            "review {id} has finished. Its files are kept in {} until the daemon's cleanup \
-             clears them, but it can't go on: start a new one",
-            run_dir(paths, id).display()
+            "review {id} has finished. Its files are kept in {} for {} days, but it can't \
+             go on: start a new one",
+            kept.display(),
+            crate::cleanup::KEEP_DAYS
         );
     }
     Ok(())
@@ -1011,7 +1012,10 @@ fn doctor_tests(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
         ));
         return out;
     };
-    let root = copies_root(paths).join(format!("doctor-{}", crate::util::new_id()));
+    let root = copies_root(paths).join(crate::util::stamped(&format!(
+        "doctor-{}",
+        crate::util::new_id()
+    )));
     let copy = root.join(repo.file_name().unwrap_or_default());
     let limit = std::time::Duration::from_secs(tests.timeout.unwrap_or(900));
     if let Err(e) = change::copy_of(repo, &copy) {
@@ -2548,7 +2552,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         }
     }
     allow_copies(paths, &cfg)?;
-    let copies = copies_root(paths).join(format!("check-{}", new_id()));
+    let copies = copies_root(paths).join(crate::util::stamped(&format!("check-{}", new_id())));
     let caller = BridgeCaller::new(paths)?;
     for (name, b) in chosen {
         // Without a list, it gets whatever its bridge gives, a shell maybe.
@@ -2995,7 +2999,10 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
         Vec::new()
     };
     let folds = feedback.iter().map(|f| f.at).max();
-    let root = copies_root(paths).join(format!("configure-{}", crate::util::new_id()));
+    let root = copies_root(paths).join(crate::util::stamped(&format!(
+        "configure-{}",
+        crate::util::new_id()
+    )));
     // The clone stays, with what the configurer did in it, until the
     // daemon's cleanup.
     fs::create_dir_all(&root)?;
@@ -3705,8 +3712,14 @@ mod tests {
         let err = format!("{:#}", super::run(&paths, resume(false)).unwrap_err());
         assert!(err.contains("has to be what's checked out"), "{err}");
         super::run(&paths, resume(true)).unwrap();
-        // Ended, and kept to be looked at, but it can't go on.
-        assert!(run_dir(&paths, "r-stop").join("run.json").exists());
+        // Ended, and kept to be looked at, packed, but it can't go on.
+        let kept = keep::kept(&paths, "r-stop").unwrap();
+        let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+        let run = crate::util::packed_file(
+            &kept,
+            &format!("{}/run.json", name.trim_end_matches(".tar.gz")),
+        );
+        assert!(run.is_ok(), "{name}");
         let err = format!("{:#}", super::run(&paths, resume(true)).unwrap_err());
         assert!(err.contains("has finished"), "{err}");
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());

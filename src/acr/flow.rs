@@ -1565,17 +1565,20 @@ fn write_tests(
     (pins, written.done)
 }
 
-/// Where a round's copies go. Each is named afresh, so a copy never lands on
-/// one an earlier round or a resumed one left, since they stay, to be
-/// looked at, until the daemon's cleanup clears them.
+/// Where a round's copies go. Each is named afresh, starting with the time
+/// it's made, so a copy never lands on one an earlier round or a resumed one
+/// left, since they stay, to be looked at, until the daemon's cleanup clears
+/// them. They're left unpacked: each is a clone of the repository that costs
+/// next to nothing on disk, and what a reviewer did in it is in its packed
+/// session.
 struct Copies(Option<PathBuf>);
 
 impl Copies {
     fn fresh(dir: Option<PathBuf>) -> Copies {
         Copies(dir.map(|dir| {
             let name = dir.file_name().unwrap_or_default().to_string_lossy();
-            let name = format!("{name}-{}", crate::util::new_id());
-            dir.with_file_name(name)
+            let name = format!("{name}-{}", &crate::util::new_id()[20..]);
+            dir.with_file_name(crate::util::stamped(&name))
         }))
     }
 }
@@ -3228,11 +3231,12 @@ lenses:
         assert_ne!(a, b);
         for dir in [&a, &b] {
             assert_eq!(dir.parent(), Some(root));
-            assert!(
-                dir.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("gate-")
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(crate::util::unstamped(&name).starts_with("gate-"), "{name}");
+            assert_ne!(
+                crate::util::unstamped(&name),
+                name,
+                "it starts with its time"
             );
         }
         assert!(Copies::fresh(None).0.is_none());
@@ -3253,11 +3257,26 @@ lenses:
         fs::write(review.join("run.json"), "{}").unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
-        assert!(
-            review.join("round-1.diff").exists()
-                && super::super::keep::is_finished(&paths, &run.id),
-            "a finished review keeps its files, marked finished"
+        // Kept, packed once, under the time it finished.
+        let kept = super::super::keep::kept(&paths, &run.id).unwrap();
+        let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+        let base = name.trim_end_matches(".tar.gz");
+        assert_eq!(
+            crate::util::packed_file(&kept, &format!("{base}/round-1.diff")).unwrap(),
+            b"+x"
         );
+        assert!(!review.exists());
+        let archives = fs::read_dir(super::super::keep::dir(&paths))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tar.gz")
+            })
+            .count();
+        assert_eq!(archives, 1, "packed once");
         let noted = super::super::keep::history(&paths, &run.repo);
         assert_eq!(noted.len(), 1, "noted once");
         assert_eq!(noted[0].lenses["alpha"], 2);

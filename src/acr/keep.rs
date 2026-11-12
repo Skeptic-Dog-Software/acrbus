@@ -1,9 +1,10 @@
 //! What ACR keeps, and for how long. A finished review leaves a line of
-//! history, which estimates come from, and keeps its files for
-//! `cleanup::KEEP`, to be looked at. One waiting for a person keeps them,
-//! to go on from, until `UNFINISHED`. Nothing removes them as a review
-//! ends: the daemon's hourly cleanup clears them once they're old, which is
-//! cheap: a look at each directory, and nothing read.
+//! history, which estimates come from, and its files, packed into
+//! `<time>-<id>.tar.gz` as it finishes, to be looked at for
+//! `cleanup::KEEP`. One waiting for a person keeps them as they are, to go
+//! on from, until `UNFINISHED`. Nothing removes them as a review ends: the
+//! daemon's hourly cleanup clears them once they're old, which is cheap: a
+//! look at each name, and nothing read.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +24,7 @@ const HISTORY: &str = "history.jsonl";
 /// The finished reviews of each repository that history keeps.
 pub const HISTORY_RUNS: usize = 20;
 /// How long a review waiting for a person stays before it's taken as left.
-const UNFINISHED: Duration = Duration::from_secs(30 * 86_400);
+const UNFINISHED: Duration = crate::cleanup::KEEP;
 /// In a review's directory while a process is driving it: that process's ID.
 const ACTIVE_MARK: &str = "pid";
 
@@ -75,7 +76,23 @@ const FINISHED_MARK: &str = "finished";
 /// Whether review `id` has finished. Its files are kept a while, but it
 /// can't go on.
 pub fn is_finished(paths: &Paths, id: &str) -> bool {
-    dir(paths).join(id).join(FINISHED_MARK).exists()
+    kept(paths, id).is_some()
+}
+
+/// Where a finished review's files are kept: its archive, or its folder,
+/// marked, should packing it have failed.
+pub fn kept(paths: &Paths, id: &str) -> Option<PathBuf> {
+    fs::read_dir(dir(paths))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            match name.strip_suffix(".tar.gz") {
+                Some(base) => crate::util::unstamped(base) == id,
+                None => crate::util::unstamped(&name) == id && path.join(FINISHED_MARK).exists(),
+            }
+        })
 }
 
 pub fn dir(paths: &Paths) -> PathBuf {
@@ -171,15 +188,16 @@ pub fn history(paths: &Paths, repo: &Path) -> Vec<Record> {
         .collect()
 }
 
-/// Once a review is finished: notes it in history, if `noted`, and marks
-/// it finished. Its report has been printed. Its files stay, to be looked
-/// at, until the daemon's cleanup clears them. A review that isn't finished
-/// keeps them, to go on from.
+/// Once a review is finished: notes it in history, if `noted`, marks it
+/// finished, and packs its files into `<time>-<id>.tar.gz`, to be looked at
+/// until the daemon's cleanup clears them. Its report has been printed. A
+/// review that isn't finished keeps them as they are, to go on from.
 pub fn finished(paths: &Paths, run: &Run, noted: bool) -> Result<()> {
     if !matches!(
         run.status,
         super::flow::Status::Confirmed | super::flow::Status::Stopped
-    ) {
+    ) || is_finished(paths, &run.id)
+    {
         return Ok(());
     }
     if noted && let Some(record) = Record::of(run) {
@@ -199,12 +217,33 @@ pub fn finished(paths: &Paths, run: &Run, noted: bool) -> Result<()> {
     fs::create_dir_all(&review)
         .and_then(|()| File::create(review.join(FINISHED_MARK)))
         .with_context(|| format!("marking {} finished", review.display()))?;
+    // Packed under its time, so an agent that searches files later doesn't
+    // come on its findings. Should that fail, the daemon's cleanup packs it.
+    if let Err(e) = pack(&review) {
+        eprintln!("{APP_NAME}: couldn't pack review {}'s files: {e:#}", run.id);
+    }
     Ok(())
 }
 
-/// Removes reviews finished `cleanup::KEEP` ago, and ones left waiting
-/// after `UNFINISHED`, going by when each was last saved. Returns how many.
-/// The daemon's hourly cleanup calls it.
+/// Packs a finished review's folder, named for the time now if it isn't
+/// named with one.
+fn pack(review: &Path) -> Result<PathBuf> {
+    let name = review.file_name().unwrap_or_default().to_string_lossy();
+    let review = if crate::util::unstamped(&name) == name {
+        let stamped = review.with_file_name(crate::util::stamped(&name));
+        fs::rename(review, &stamped)?;
+        stamped
+    } else {
+        review.to_path_buf()
+    };
+    crate::util::pack(&review)
+}
+
+/// Removes reviews finished `cleanup::KEEP` ago, going by the time they're
+/// named for, and ones left waiting after `UNFINISHED`, going by when each
+/// was last saved. Packs a finished one that wasn't, once it's been
+/// `cleanup::PACK_AFTER`. Returns how many it removed. The daemon's hourly
+/// cleanup calls it.
 pub fn prune(paths: &Paths) -> usize {
     prune_at(paths, SystemTime::now())
 }
@@ -213,25 +252,36 @@ fn prune_at(paths: &Paths, now: SystemTime) -> usize {
     let Ok(entries) = fs::read_dir(dir(paths)) else {
         return 0;
     };
+    let running = active(paths);
     let mut gone = 0;
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let age = crate::util::age_at(&path, now).unwrap_or_default();
+        if name.contains(".tar.gz") {
+            if age > crate::cleanup::KEEP && fs::remove_file(&path).is_ok() {
+                gone += 1;
+            }
             continue;
         }
-        let review = entry.path();
-        let saved = fs::metadata(review.join("run.json"))
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            || running.iter().any(|id| id == crate::util::unstamped(&name))
+        {
+            continue;
+        }
+        if path.join(FINISHED_MARK).exists() {
+            if age > crate::cleanup::KEEP {
+                gone += usize::from(fs::remove_dir_all(&path).is_ok());
+            } else if age > crate::cleanup::PACK_AFTER {
+                let _ = pack(&path);
+            }
+            continue;
+        }
+        let saved = fs::metadata(path.join("run.json"))
             .or_else(|_| entry.metadata())
             .and_then(|m| m.modified());
-        let Ok(saved) = saved else {
-            continue;
-        };
-        let keep = if review.join(FINISHED_MARK).exists() {
-            crate::cleanup::KEEP
-        } else {
-            UNFINISHED
-        };
-        if now.duration_since(saved).is_ok_and(|age| age > keep)
-            && fs::remove_dir_all(&review).is_ok()
+        if saved.is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > UNFINISHED))
+            && fs::remove_dir_all(&path).is_ok()
         {
             gone += 1;
         }
@@ -297,24 +347,33 @@ mod tests {
     }
 
     #[test]
-    fn a_review_is_kept_a_while_after_it_finishes_and_one_left_waiting_longer() {
+    fn a_finished_review_is_packed_and_kept_a_while_and_one_left_waiting_longer() {
         let p = paths();
-        for (id, done) in [("done", true), ("waiting", false)] {
+        let review = |id: &str| {
             let review = dir(&p).join(id);
             fs::create_dir_all(&review).unwrap();
-            fs::write(review.join("run.json"), "{}").unwrap();
-            if done {
-                File::create(review.join(FINISHED_MARK)).unwrap();
-            }
-        }
-        assert!(is_finished(&p, "done") && !is_finished(&p, "waiting"));
+            fs::write(review.join("run.json"), "{\"found\": \"a finding\"}").unwrap();
+            review
+        };
+        review("waiting");
+        // Finished, but its packing failed: the cleanup packs it later.
+        let left = review("left");
+        File::create(left.join(FINISHED_MARK)).unwrap();
+        assert!(is_finished(&p, "left") && !is_finished(&p, "waiting"));
+        let archive = pack(&review("done")).unwrap();
+        assert!(is_finished(&p, "done") && !dir(&p).join("done").exists());
+        let name = archive.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(crate::util::unstamped(&name), "done.tar.gz", "{name}");
         let now = SystemTime::now();
-        assert_eq!(prune_at(&p, now + Duration::from_secs(1)), 0, "both stay");
         let minute = Duration::from_secs(60);
-        assert_eq!(prune_at(&p, now + crate::cleanup::KEEP + minute), 1);
-        assert!(!dir(&p).join("done").exists());
-        assert!(dir(&p).join("waiting").exists());
-        assert_eq!(prune_at(&p, now + UNFINISHED + minute), 1);
+        assert_eq!(prune_at(&p, now + minute), 0, "all stay");
+        assert!(left.exists(), "not an hour yet");
+        assert_eq!(prune_at(&p, now + crate::cleanup::PACK_AFTER + minute), 0);
+        assert!(!left.exists() && is_finished(&p, "left"), "packed now");
+        assert_eq!(prune_at(&p, now + crate::cleanup::KEEP - minute), 0);
+        // Finished or left waiting, each goes once it's past keeping.
+        assert_eq!(prune_at(&p, now + crate::cleanup::KEEP + minute), 3);
+        assert!(!is_finished(&p, "done") && !is_finished(&p, "left"));
         assert!(!dir(&p).join("waiting").exists());
         fs::remove_dir_all(&p.state).unwrap();
     }

@@ -149,8 +149,8 @@ pub struct Settings {
     /// The most stderr a result carries, in bytes.
     #[serde(default = "default_stderr_tail")]
     pub stderr_tail_bytes: usize,
-    /// Days to keep each run's log and folder, which the daemon's hourly
-    /// cleanup clears after them.
+    /// Days to keep each run's archive, which the daemon's hourly cleanup
+    /// clears after them.
     #[serde(default = "default_log_retention")]
     pub log_retention_days: u32,
     /// What a request may ask for. Left out, it may ask for nothing.
@@ -1342,14 +1342,41 @@ struct Saved {
     ext: Option<Box<Extras>>,
 }
 
-/// The folder for try `attempt` at a request, under `runs`: named for the
-/// try, or the next one free, should a try's folder be there already, as
-/// one a stopped bridge left is.
-fn try_dir(runs: &Path, attempt: u32) -> PathBuf {
+/// The folder for try `attempt` in a request's folder: named for the try,
+/// or the next one free, should a try's folder be there already, as one a
+/// stopped bridge left is.
+fn try_dir(request: &Path, attempt: u32) -> PathBuf {
     (attempt.max(1)..)
-        .map(|n| runs.join(n.to_string()))
+        .map(|n| request.join(n.to_string()))
         .find(|dir| !dir.exists())
-        .unwrap_or_else(|| runs.join(new_id()))
+        .unwrap_or_else(|| request.join(new_id()))
+}
+
+/// A request's folder under `runs`, while it's at work or if packing it
+/// failed: named with its time, or by its ID alone, from before names had
+/// times.
+fn find_request(runs: &Path, id: &str) -> Option<PathBuf> {
+    fs::read_dir(runs)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            e.file_type().is_ok_and(|t| t.is_dir())
+                && crate::util::unstamped(&e.file_name().to_string_lossy()) == id
+        })
+        .map(|e| e.path())
+}
+
+/// A request's archive under `runs`, once it's packed.
+fn find_archive(runs: &Path, id: &str) -> Option<PathBuf> {
+    fs::read_dir(runs)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".tar.gz")
+                .is_some_and(|base| crate::util::unstamped(base) == id)
+        })
+        .map(|e| e.path())
 }
 
 /// Copies every transcript under a session's `projects` folder, as a
@@ -1488,14 +1515,16 @@ pub fn state_dir(paths: &Paths, agent: &str) -> PathBuf {
 /// What the daemon's cleanup cleared of one bridge's files.
 #[derive(Debug, Default, PartialEq)]
 pub struct Swept {
-    /// Runs whose log and folder went.
+    /// Runs whose archive, or folder, went.
     pub runs: usize,
+    /// Finished runs it packed, that weren't.
+    pub packed: usize,
     /// Whether `bridge.log` was cut back to its last lines.
     pub log_cut: bool,
 }
 
 /// Clears what the bridge for `agent` keeps of its runs once its
-/// `log_retention_days` have passed: each run's log, and its folder, with
+/// `log_retention_days` have passed: each run's archive, with its log, and
 /// the agent's session, scratch files and what it was sent. A run still
 /// open stays however old. The bridge itself removes none of it, so it can
 /// all be looked at: this is the daemon's hourly cleanup, and nothing else
@@ -1510,27 +1539,46 @@ pub fn sweep(paths: &Paths, agent: &str) -> Swept {
 }
 
 /// `sweep`, of the bridge whose folder is `dir`, for runs older than `age`.
+/// It also packs a run that finished but wasn't packed, once it's been
+/// `cleanup::PACK_AFTER`.
 fn sweep_dir(dir: &Path, age: Duration) -> Swept {
     let open = |id: &str| dir.join("inflight").join(format!("{id}.json")).exists();
+    let mut swept = Swept::default();
     let mut gone = HashSet::new();
     for sub in ["log", "runs"] {
         for entry in fs::read_dir(dir.join(sub)).into_iter().flatten().flatten() {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if !open(&id)
-                && crate::util::older_than(&entry.path(), age)
-                && fs::remove_dir_all(entry.path()).is_ok()
+            let (path, name) = (
+                entry.path(),
+                entry.file_name().to_string_lossy().into_owned(),
+            );
+            let id = crate::util::unstamped(name.split(".tar.gz").next().unwrap_or_default());
+            if open(id) {
+                continue;
+            }
+            if crate::util::older_than(&path, age) {
+                let removed = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                if removed.is_ok() {
+                    gone.insert(id.to_string());
+                }
+            } else if sub == "runs"
+                && path.is_dir()
+                && crate::util::older_than(&path, crate::cleanup::PACK_AFTER)
+                && crate::util::pack(&path).is_ok()
             {
-                gone.insert(id);
+                swept.packed += 1;
             }
         }
     }
-    Swept {
-        runs: gone.len(),
-        log_cut: matches!(
-            crate::util::trim_log(&dir.join("bridge.log"), LOG_MAX, LOG_KEEP),
-            Ok(true)
-        ),
-    }
+    swept.runs = gone.len();
+    swept.log_cut = matches!(
+        crate::util::trim_log(&dir.join("bridge.log"), LOG_MAX, LOG_KEEP),
+        Ok(true)
+    );
+    swept
 }
 
 fn read_report(paths: &Paths, agent: &str) -> Option<Report> {
@@ -1555,16 +1603,32 @@ pub fn show_log(paths: &Paths, agent: &str, run: &str, part: Option<&str>) -> Re
     if !is_id(run) {
         bail!("{run:?} isn't a run ID");
     }
-    let dir = state_dir(paths, agent).join("log").join(run);
-    if !dir.exists() {
+    let dir = state_dir(paths, agent);
+    let runs = dir.join("runs");
+    // Unpacked while it's at work, and from before runs were packed.
+    let plain = find_request(&runs, run).or_else(|| {
+        let old = dir.join("log").join(run);
+        old.is_dir().then_some(old)
+    });
+    let archive = find_archive(&runs, run);
+    let read = |file: &str| -> Result<Vec<u8>> {
+        if let Some(d) = &plain {
+            return Ok(fs::read(d.join(file))?);
+        }
+        let archive = archive.as_ref().context("no archive")?;
+        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+        let name = name.trim_end_matches(".tar.gz");
+        crate::util::packed_file(archive, &format!("{name}/{file}"))
+    };
+    let Some(kept) = plain.clone().or_else(|| archive.clone()) else {
         bail!("{agent} has no log of run {run}; it may have passed log_retention_days");
-    }
+    };
     if let Some(part) = part {
-        io::copy(&mut File::open(dir.join(part))?, &mut io::stdout())?;
+        io::stdout().write_all(&read(part)?)?;
         return Ok(());
     }
-    print!("{}", fs::read_to_string(dir.join("meta.json"))?);
-    println!("\nOutput: {}", dir.display());
+    print!("{}", String::from_utf8_lossy(&read("meta.json")?));
+    println!("\nKept in: {}", kept.display());
     Ok(())
 }
 
@@ -1720,7 +1784,7 @@ impl Bridge {
         attachments: Attachments,
         out: Box<dyn Write + Send>,
     ) -> Result<Bridge> {
-        for sub in ["inflight", "runs", "log"] {
+        for sub in ["inflight", "runs"] {
             let path = dir.join(sub);
             fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         }
@@ -1990,8 +2054,12 @@ impl Bridge {
         self.dir.join("inflight").join(format!("{id}.reply"))
     }
 
-    fn log_dir(&self, id: &str) -> PathBuf {
-        self.dir.join("log").join(id)
+    /// The folder a request keeps everything in: a folder for each try, its
+    /// output, its record and any transcripts. It's named for when the
+    /// request was first taken, and packed once it's answered.
+    fn request_dir(&self, id: &str) -> PathBuf {
+        let runs = self.dir.join("runs");
+        find_request(&runs, id).unwrap_or_else(|| runs.join(crate::util::stamped(id)))
     }
 
     fn save_journal(&self, id: &str, journal: &Journal) {
@@ -2319,7 +2387,7 @@ impl Bridge {
             options: msg.ext.as_ref().and_then(|e| e.options.clone()),
             result: result.clone(),
         };
-        let dir = self.log_dir(&msg.id);
+        let dir = self.request_dir(&msg.id);
         let logged = fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| write_json(&dir.join("meta.json"), &log));
@@ -2344,6 +2412,15 @@ impl Bridge {
             });
         if let Err(e) = kept {
             self.log(format!("couldn't save the reply to {}: {e:#}", msg.id));
+        }
+        // Answered, with the reply saved: all it left goes into one archive,
+        // which only acrbus or tar opens, kept until the daemon's cleanup.
+        // Before sending, which can wait a long while on a machine away.
+        let dir = self.request_dir(&msg.id);
+        if dir.is_dir()
+            && let Err(e) = crate::util::pack(&dir)
+        {
+            self.log(format!("couldn't pack what {} left: {e:#}", msg.id));
         }
         self.send_reply(msg, &saved);
     }
@@ -2446,11 +2523,11 @@ impl Bridge {
             )));
         }
         self.save_journal(&msg.id, &journal);
-        let runs = self.dir.join("runs").join(&msg.id);
+        let request = self.request_dir(&msg.id);
         let outcome = loop {
             // Each try starts fresh in a folder of its own, and leaves it
-            // to be looked at: the daemon's cleanup clears it later.
-            let run_dir = try_dir(&runs, journal.attempts);
+            // to be looked at.
+            let run_dir = try_dir(&request, journal.attempts);
             let outcome = self
                 .run(job, &mut journal, &run_dir)
                 .unwrap_or_else(|e| Outcome::Finished(self.failed(format!("{e:#}"))));
@@ -2567,7 +2644,7 @@ impl Bridge {
 
         // Kept whatever happened, with secrets out, and it's what everything
         // after this reads.
-        let log_dir = self.log_dir(&msg.id);
+        let log_dir = self.request_dir(&msg.id);
         fs::create_dir_all(&log_dir)?;
         let (stdout, stderr) = (
             self.keep_output(&stdout, &log_dir.join("stdout"), false)?,
@@ -3101,6 +3178,34 @@ mod tests {
             self.dir.join("state")
         }
 
+        /// The archive request `id` went into once it was answered.
+        fn archive(&self, id: &str) -> PathBuf {
+            until("its run to be packed", || {
+                find_archive(&self.state().join("runs"), id)
+            })
+        }
+
+        /// A file kept of request `id`, by its path in the request's folder.
+        fn kept(&self, id: &str, file: &str) -> String {
+            let archive = self.archive(id);
+            let name = archive.file_name().unwrap().to_string_lossy();
+            let name = name.trim_end_matches(".tar.gz");
+            let bytes = crate::util::packed_file(&archive, &format!("{name}/{file}")).unwrap();
+            String::from_utf8(bytes).unwrap()
+        }
+
+        /// What's kept of request `id`: each path in its folder.
+        fn kept_names(&self, id: &str) -> Vec<String> {
+            let archive = self.archive(id);
+            let name = archive.file_name().unwrap().to_string_lossy();
+            let prefix = format!("{}/", name.trim_end_matches(".tar.gz"));
+            crate::util::packed_names(&archive)
+                .unwrap()
+                .into_iter()
+                .filter_map(|n| n.strip_prefix(&prefix).map(str::to_string))
+                .collect()
+        }
+
         fn bridge(&self, cfg: Settings) -> Bridge {
             let log = Box::new(self.log.clone());
             let store = &self.bus.attachments;
@@ -3521,13 +3626,9 @@ mod tests {
         let id = rig.ask("hello");
         assert_eq!(rig.reply_to(&id), "answered on try 2");
         bridge.stop().unwrap();
-        // Each try had a folder of its own, and both stay to be looked at.
-        let runs = rig.state().join("runs").join(&id);
+        // Each try had a folder of its own, and both are kept, packed.
         for n in ["1", "2"] {
-            assert_eq!(
-                fs::read_to_string(runs.join(n).join("try")).unwrap().trim(),
-                n
-            );
+            assert_eq!(rig.kept(&id, &format!("{n}/try")).trim(), n);
         }
     }
 
@@ -3574,18 +3675,20 @@ mod tests {
             echo note > "$TMPDIR/left"
             echo "$1" >> "$HOME/sessions""#;
         let bridge = rig.start(rig.settings(script, ""));
+        let mut ids = Vec::new();
         for question in ["first", "second"] {
             let id = rig.ask(question);
             assert_eq!(words(&rig.reply_to(&id)), "session 0 tmp 0");
+            ids.push(id);
         }
         bridge.stop().unwrap();
         let seen = fs::read_to_string(rig.home("sessions")).unwrap();
         let dirs: Vec<&str> = seen.lines().collect();
         assert_eq!(dirs.len(), 2);
         assert_ne!(dirs[0], dirs[1]);
-        // Each stays, to be looked at, until the daemon's cleanup.
-        for dir in dirs {
-            assert!(Path::new(dir).join("left").exists(), "{dir} wasn't kept");
+        // Each is kept, packed, until the daemon's cleanup.
+        for id in &ids {
+            assert_eq!(rig.kept(id, "1/session/left"), "note\n");
         }
     }
 
@@ -3858,12 +3961,10 @@ mod tests {
         assert_eq!(rig.reply_to(&id), "answered again");
         assert!(left.wait().unwrap().signal().is_some());
         bridge.stop().unwrap();
-        // What the first try left stays, and the next ran in its own folder.
-        assert_eq!(
-            fs::read_to_string(first.join("stdout")).unwrap(),
-            "what the first try said"
-        );
-        assert!(rig.state().join("runs").join(&id).join("2").is_dir());
+        // What the first try left is kept, and the next ran in its own
+        // folder beside it.
+        assert_eq!(rig.kept(&id, "1/stdout"), "what the first try said");
+        assert!(rig.kept_names(&id).contains(&"2".to_string()));
     }
 
     #[test]
@@ -4207,7 +4308,7 @@ mod tests {
         bridge.stop().unwrap();
         assert!(!rig.home("ran").exists());
         // It's on record, with what was asked.
-        let log: RunLog = read_json(&rig.state().join("log").join(&id).join("meta.json")).unwrap();
+        let log: RunLog = serde_json::from_str(&rig.kept(&id, "meta.json")).unwrap();
         assert_eq!(log.result.status, RunStatus::Refused);
         assert_eq!(log.options.unwrap().model.as_deref(), Some("gpt-evil"));
     }
@@ -4654,9 +4755,8 @@ mod tests {
         assert!(tail_text.len() <= 400);
         assert!(tail_text.ends_with("the plain ending"), "{tail_text}");
         assert!(tail_text.contains("configured: [secret]"), "{tail_text}");
-        let log = rig.state().join("log").join(&id);
-        let kept = fs::read_to_string(log.join("stderr")).unwrap();
-        let meta = fs::read_to_string(log.join("meta.json")).unwrap();
+        let kept = rig.kept(&id, "stderr");
+        let meta = rig.kept(&id, "meta.json");
         let replied = reply.msg.body.clone();
         for text in [tail_text, kept, meta, replied, rig.log.text()] {
             for leak in [
@@ -4742,8 +4842,7 @@ mod tests {
         let whole = fs::read(rig.bus.attachments.path(&a.sha256)).unwrap();
         assert_eq!(whole.len(), 200_000);
         assert!(whole.iter().all(|b| *b == b'x'));
-        let log = rig.state().join("log").join(&id).join("stdout");
-        assert_eq!(fs::metadata(log).unwrap().len(), 200_000);
+        assert_eq!(rig.kept(&id, "stdout").len(), 200_000);
     }
 
     #[test]
@@ -4868,10 +4967,9 @@ mod tests {
         rig.reply_to(&id);
         rig.wait_acked(&id);
         bridge.stop().unwrap();
-        let dir = rig.state().join("log").join(&id);
-        assert_eq!(fs::read_to_string(dir.join("stdout")).unwrap(), "out\n");
-        assert_eq!(fs::read_to_string(dir.join("stderr")).unwrap(), "err\n");
-        let log: RunLog = read_json(&dir.join("meta.json")).unwrap();
+        assert_eq!(rig.kept(&id, "stdout"), "out\n");
+        assert_eq!(rig.kept(&id, "stderr"), "err\n");
+        let log: RunLog = serde_json::from_str(&rig.kept(&id, "meta.json")).unwrap();
         assert_eq!(log.sender, "sim@here");
         assert_eq!(log.options.unwrap().timeout, Some(7));
         assert_eq!(log.result.status, RunStatus::Ok);
@@ -4879,7 +4977,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runs_log_and_folder_stay_until_the_cleanup_clears_them() {
+    fn a_run_is_packed_once_answered_and_kept_until_the_cleanup_clears_it() {
         let rig = Rig::new();
         let settings = || rig.settings(r#"echo note > "$2/tmp/scratch"; echo out"#, "");
         let bridge = rig.start(settings());
@@ -4890,29 +4988,51 @@ mod tests {
         // A start clears nothing either.
         let bridge = rig.start(settings());
         bridge.stop().unwrap();
-        let (log, run) = (
-            rig.state().join("log").join(&id),
-            rig.state().join("runs").join(&id),
-        );
-        assert!(log.join("stdout").exists());
+        let runs = rig.state().join("runs");
+        let archive = rig.archive(&id);
+        let name = archive.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            run.join("1/tmp/scratch").exists(),
-            "the agent's own files stay"
+            crate::util::unstamped(&name) == format!("{id}.tar.gz")
+                && name != format!("{id}.tar.gz"),
+            "named for its time: {name}"
         );
-        // One still open stays however old.
+        assert_eq!(rig.kept(&id, "stdout"), "out\n");
+        assert_eq!(
+            rig.kept(&id, "1/tmp/scratch"),
+            "note\n",
+            "the agent's own files"
+        );
+        assert!(
+            find_request(&runs, &id).is_none(),
+            "nothing's left unpacked"
+        );
+        // One still open stays however old, and one that finished unpacked
+        // is packed an hour on.
+        let hours_ago = |h: i64| crate::util::stamp(now_ms() - h * 3_600_000);
         let open = new_id();
-        fs::create_dir_all(rig.state().join("runs").join(&open).join("1")).unwrap();
+        fs::create_dir_all(runs.join(format!("{}-{open}", hours_ago(2))).join("1")).unwrap();
         fs::write(
             rig.state().join("inflight").join(format!("{open}.json")),
             "{}",
         )
         .unwrap();
-        let swept = sweep_dir(&rig.state(), Duration::from_secs(3600));
-        assert_eq!(swept, Swept::default(), "not old yet");
+        let left = new_id();
+        let unpacked = runs.join(format!("{}-{left}", hours_ago(2)));
+        fs::create_dir_all(&unpacked).unwrap();
+        fs::write(unpacked.join("stdout"), "left\n").unwrap();
+        let month = Duration::from_secs(30 * 86_400);
+        let swept = sweep_dir(&rig.state(), month);
+        assert_eq!((swept.runs, swept.packed), (0, 1));
+        assert!(!unpacked.exists() && find_archive(&runs, &left).is_some());
+        assert_eq!(
+            sweep_dir(&rig.state(), month),
+            Swept::default(),
+            "nothing more"
+        );
         let swept = sweep_dir(&rig.state(), Duration::ZERO);
-        assert_eq!(swept.runs, 1);
-        assert!(!log.exists() && !run.exists());
-        assert!(rig.state().join("runs").join(&open).exists());
+        assert_eq!(swept.runs, 2);
+        assert!(find_archive(&runs, &id).is_none() && find_archive(&runs, &left).is_none());
+        assert!(find_request(&runs, &open).is_some());
     }
 
     #[test]
@@ -5059,8 +5179,7 @@ mod tests {
         };
         rig.bus.db().store_incoming(&msg, "o", now_ms()).unwrap();
         rig.bus.notify();
-        let meta = rig.state().join("log").join(&msg.id).join("meta.json");
-        let logged = until("the refusal", || fs::read_to_string(&meta).ok());
+        let logged = rig.kept(&msg.id, "meta.json");
         assert!(logged.contains("refused"), "{logged}");
         assert!(
             !rig.home("ran").exists(),
@@ -5094,8 +5213,8 @@ mod tests {
             RunStatus::Ok
         );
         rig.wait_acked(&id);
-        assert!(rig.state().join("log").join(&id).join("stdout").exists());
-        assert!(rig.state().join("runs").join(&id).join("1").is_dir());
+        assert_eq!(rig.kept(&id, "stdout"), "out\n");
+        assert!(rig.kept_names(&id).contains(&"1".to_string()));
         bridge.stop().unwrap();
     }
 
