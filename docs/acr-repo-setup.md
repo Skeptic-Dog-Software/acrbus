@@ -45,10 +45,12 @@ defaults:
     reviewer: reviewer-runs
 ```
 
-A binding's `timeout` is its role's budget. A slow model can think for
-minutes between steps and still look busy, so give a binding a `fallback`,
-another binding on a faster model, and a call that runs out of time is
-tried once there instead of failing the role.
+Calls have no time budget. A call runs until it answers, and one that
+stalls, using no CPU and writing no file for its bridge's `idle_secs` (20
+minutes unless set), is ended and tried again by its bridge. Left out, a
+binding's `timeout` is as long as its bridge allows; set, it's a cap that no
+call should reach, not a budget, since a call cut off loses its work. While
+a review runs, it says what's at work at least once a minute.
 
 If a repository's reviews may use only some models, say so in its config,
 with patterns:
@@ -57,8 +59,8 @@ with patterns:
 allowed_models: ["vendor-b/*"]
 ```
 
-Every binding its reviews would call, the configurer and fallbacks too,
-must name a model one matches, or the config is refused before anything
+Every binding its reviews would call, the configurer too, must name a
+model one matches, or the config is refused before anything
 runs. Set in your acr.yaml's `defaults`, it holds every repository on the
 machine that doesn't set its own.
 

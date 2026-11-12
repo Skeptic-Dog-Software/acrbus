@@ -11,6 +11,7 @@ mod flow;
 mod generated;
 mod keep;
 mod plan;
+pub mod progress;
 mod report;
 mod roles;
 mod stages;
@@ -684,6 +685,7 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
     if cfg.probes_off {
         out.push(Said::Note(config::PROBES_OFF.to_string()));
     }
+    out.extend(cfg.time_notes().into_iter().map(Said::Note));
     // Every binding against its bridge, working here.
     if let Some(machine) = &machine {
         match check_on(paths, &cfg, machine, repo, false) {
@@ -701,6 +703,33 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
                 };
                 out.push(Said::Fix(format!("{e}.{add}")));
             }
+        }
+    }
+    // How long its calls may run, and when a stalled one ends: what a
+    // person needs to judge a long call by.
+    let mut bridges: Vec<&str> = cfg
+        .chosen_bindings()
+        .iter()
+        .filter_map(|(_, b)| b.agent.split_once('@'))
+        .map(|(bridge, _)| bridge)
+        .collect();
+    bridges.sort_unstable();
+    bridges.dedup();
+    for bridge in bridges {
+        if let (Ok(set), Some(longest)) = (
+            crate::bridge::load(paths, bridge),
+            crate::bridge::longest(paths, bridge),
+        ) {
+            let took = |secs: u64| progress::took(std::time::Duration::from_secs(secs));
+            let stalls = if set.idle_secs == 0 {
+                "never ends one for going quiet".to_string()
+            } else {
+                format!("ends one that's quiet for {}", took(set.idle_secs))
+            };
+            out.push(Said::Ok(format!(
+                "the {bridge} bridge lets a review's call run up to {}, and {stalls}",
+                took(longest)
+            )));
         }
     }
     // Calibration.
@@ -1006,6 +1035,10 @@ struct BridgeCaller {
     /// review otherwise leaves none of: for a trial, to see what each
     /// reviewer did.
     keep_logs: bool,
+    /// Where the bridges' settings are, for how long a call may run.
+    paths: Paths,
+    /// What a person following the review is told as it goes.
+    progress: progress::Progress,
 }
 
 impl Drop for BridgeCaller {
@@ -1032,7 +1065,25 @@ impl BridgeCaller {
             ),
             made: std::sync::Mutex::default(),
             keep_logs: false,
+            paths: Paths {
+                state: paths.state.clone(),
+                config: paths.config.clone(),
+            },
+            progress: progress::Progress::new(paths),
         })
+    }
+
+    /// How long a call on `b` asks its bridge to let it run: its binding's
+    /// cap, or else the longest the bridge allows, never the bridge's
+    /// default, which may be minutes.
+    fn asks_for(&self, b: &config::Binding, bridge: &str) -> Option<u64> {
+        b.timeout
+            .or_else(|| crate::bridge::longest(&self.paths, bridge))
+    }
+
+    /// Writes the review's progress to `path` as well as to stderr.
+    fn log_to(&self, path: PathBuf) {
+        self.progress.log_to(path);
     }
 
     /// Adds an attachment, noting it to remove later if it wasn't there
@@ -1094,7 +1145,22 @@ impl Caller for BridgeCaller {
         change::tree_diff(repo, from, to).ok()
     }
 
+    fn note(&self, what: &str) {
+        self.progress.note(what);
+    }
+
     fn call(&self, call: &Call) -> Result<Answer> {
+        let bridge = call.binding.agent.split('@').next().unwrap_or_default();
+        let token = self.progress.start(&call.label, call.binding_name, bridge);
+        let answer = self.call_once(call, bridge, token);
+        let failed = answer.as_ref().err().map(|e| format!("{e:#}"));
+        self.progress.end(token, failed.as_deref());
+        answer
+    }
+}
+
+impl BridgeCaller {
+    fn call_once(&self, call: &Call, bridge: &str, token: progress::Token) -> Result<Answer> {
         let b = call.binding;
         // Fixes only from a binding the user lets write.
         if call.writes && !b.writes {
@@ -1110,6 +1176,10 @@ impl Caller for BridgeCaller {
             // A review keeps its own record, and leaves nothing behind,
             // unless it's a trial's, kept to see what each agent did.
             log: Some(self.keep_logs),
+            // Nothing cuts a call off while it works: it asks for as long as
+            // its bridge allows, unless its binding caps it, and the bridge
+            // ends one that stalls.
+            timeout: self.asks_for(b, bridge),
             ..options_for(b)
         };
         let mut attachments = Vec::new();
@@ -1144,6 +1214,7 @@ impl Caller for BridgeCaller {
             wait_secs: Some(wait),
         })?;
         let sent: Sent = client.reply()?;
+        self.progress.sent(token, &sent.id);
         let awaited = match client.reply::<Awaited>() {
             Ok(awaited) => awaited,
             // The daemon went away mid-wait, as it does when it's updated.
@@ -1159,7 +1230,12 @@ impl Caller for BridgeCaller {
                 let result = msg.result();
                 let status = result.map_or(RunStatus::Ok, |r| r.status);
                 if status == RunStatus::Timeout {
-                    return Err(flow::OverTime(format!("{} timeout: {}", b.agent, msg.body)).into());
+                    bail!(
+                        "{} timeout: {}. It ran as long as {bridge} allows, so raise its \
+                         timeout_secs and max_timeout_secs if a call needs longer",
+                        b.agent,
+                        msg.body
+                    );
                 }
                 if status != RunStatus::Ok {
                     bail!("{} {}: {}", b.agent, status.as_str(), msg.body);
@@ -1179,14 +1255,11 @@ impl Caller for BridgeCaller {
                     text,
                     run_id: sent.id,
                     usage: result.and_then(|r| r.usage.clone()),
-                    via: None,
                 })
             }
             Awaited::Undelivered { why } => bail!("{}: {why}", b.agent),
             Awaited::Unanswered => bail!("{} marked it handled without answering", b.agent),
-            Awaited::TimedOut => {
-                Err(flow::OverTime(format!("{} didn't answer in {wait} seconds", b.agent)).into())
-            }
+            Awaited::TimedOut => bail!("{} didn't answer in {wait} seconds", b.agent),
         }
     }
 }
@@ -1239,6 +1312,24 @@ fn post(run: &Run, cfg: &Config, pr: u64) -> Result<()> {
         gh(&["pr", "comment", &number, "--body-file", "-"], Some(&text))?;
     }
     Ok(())
+}
+
+/// Starts a review's progress log in its folder, and says where it is, and
+/// what in its bindings could cut its calls off.
+fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: &str) {
+    let log = run_dir(paths, id).join("progress.log");
+    if let Some(dir) = log.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    caller.log_to(log.clone());
+    caller.note(&format!(
+        "review {id} {how}. It says what it's doing as it goes, at least once a minute, \
+         here and in {}",
+        log.display()
+    ));
+    for note in cfg.time_notes() {
+        caller.note(&note);
+    }
 }
 
 /// Prints a run's report, and says what to do next.
@@ -1572,6 +1663,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             if cfg.probes_off {
                 println!("{}", config::PROBES_OFF);
             }
+            for note in cfg.time_notes() {
+                println!("{note}");
+            }
             if cfg.allowed_bindings.is_empty() {
                 println!(
                     "Bindings not checked: there's no {}.",
@@ -1596,6 +1690,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             } else {
                 if cfg.probes_off {
                     println!("{}", config::PROBES_OFF);
+                }
+                for note in cfg.time_notes() {
+                    println!("{note}");
                 }
                 describe_plan(&plan);
             }
@@ -1641,6 +1738,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
             let change = reload(&cfg, repo, base, head)?;
             let caller = BridgeCaller::new(paths)?;
+            following(&caller, paths, &id, &cfg, "started");
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
@@ -1693,6 +1791,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             s.description = run.description.clone();
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
+            following(&caller, paths, &run_id, &cfg, "resumed");
             let head = run.head.clone();
             let reloading =
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
@@ -2047,6 +2146,10 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: false,
             repo: &tree,
+            label: format!(
+                "the check: {name}{place}",
+                place = if in_copy { ", in a copy" } else { "" }
+            ),
         });
         let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
         let place = if in_copy {
@@ -2084,6 +2187,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: true,
             repo: &s.tree,
+            label: "the check: the steelman".to_string(),
         });
         let wrong = answer.map(|a| {
             let mut wrong = trial::check_answer(&a.text, &key.head, &canary.secret, true);
@@ -2406,17 +2510,9 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     let (binding_name, binding) = configure::binding(&user)?;
     let kept_at = outside_config(paths, &repo)?;
     let current = fs::read_to_string(&kept_at).ok();
-    // The configurer, and its fallback, are held to the models this
-    // repository's review may use: its config's, or the user's for every
-    // repository.
-    let mut configuring = vec![(binding_name.as_str(), &binding)];
-    if let Some((name, b)) = binding
-        .fallback
-        .as_ref()
-        .and_then(|f| user.allowed_bindings.get_key_value(f))
-    {
-        configuring.push((name.as_str(), b));
-    }
+    // The configurer is held to the models this repository's review may
+    // use: its config's, or the user's for every repository.
+    let configuring = vec![(binding_name.as_str(), &binding)];
     let allowed = current
         .as_deref()
         .and_then(|text| config::parse_repo(text).ok())
@@ -2491,11 +2587,7 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
         }
     }
     check_bridges(paths, &configuring, &machine, &copies_root(paths), false)?;
-    let bridged = BridgeCaller::new(paths)?;
-    let caller = flow::WithFallbacks {
-        inner: &bridged,
-        bindings: &user.allowed_bindings,
-    };
+    let caller = BridgeCaller::new(paths)?;
     let brief = configure::prompt(&name, current.as_deref().filter(|_| recalibrate), &feedback);
     eprintln!(
         "{APP_NAME}: {binding_name} is reviewing {name} to {}. It reads the whole \
@@ -2629,6 +2721,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             artifact: Some(&artifact),
             writes: false,
             repo: &s.tree,
+            label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
         for r in roles::read_ratings(&answer.text)? {
             let Some(i) = tag
@@ -2983,6 +3076,21 @@ mod tests {
         let said = diagnose(&paths, &repo, true);
         let f = fixes(&said);
         assert!(f.iter().any(|t| t.contains("isn't calibrated")), "{f:?}");
+        // What a person needs to judge a long call by, and a cap short
+        // enough to cut one off, said, not acted on.
+        assert!(
+            said.contains(&Said::Ok(
+                "the agent-x bridge lets a review's call run up to 10m 0s, and ends one \
+                 that's quiet for 20m 0s"
+                    .into()
+            )),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|s| matches!(s, Said::Note(t)
+                if t.starts_with("Binding fits ends its calls after 600 s"))),
+            "{said:?}"
+        );
         assert!(
             said.contains(&Said::Ok(
                 "tests.command runs in a copy, as a review runs it".into()
@@ -3302,9 +3410,38 @@ mod tests {
             artifact: None,
             writes: true,
             repo: Path::new("."),
+            label: "the Orchestrator, fixing".into(),
         };
         let err = caller.call(&call).err().unwrap();
         assert!(format!("{err:#}").contains("writes: true"), "{err:#}");
+    }
+
+    #[test]
+    fn a_call_asks_its_bridge_for_as_long_as_it_allows_not_its_default() {
+        // A review's call is never cut off while it works: with no cap of
+        // its binding's, it asks for the bridge's longest, since a bridge's
+        // default may be ten minutes.
+        let paths = paths();
+        let work = paths.config.parent().unwrap().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let user = bridge_and_bindings(&paths, &work);
+        let text = fs::read_to_string(&paths.config)
+            .unwrap()
+            .replace("max_timeout_secs = 600", "max_timeout_secs = 7200");
+        fs::write(&paths.config, text).unwrap();
+        let caller = BridgeCaller::new(&paths).unwrap();
+        let uncapped = config::Binding {
+            timeout: None,
+            ..user.allowed_bindings["edits"].clone()
+        };
+        assert_eq!(caller.asks_for(&uncapped, "agent-x"), Some(7200));
+        assert_eq!(
+            caller.asks_for(&user.allowed_bindings["fits"], "agent-x"),
+            Some(600)
+        );
+        assert_eq!(caller.asks_for(&uncapped, "no-such-bridge"), None);
+        drop(caller);
+        fs::remove_dir_all(paths.config.parent().unwrap()).unwrap();
     }
 
     #[test]

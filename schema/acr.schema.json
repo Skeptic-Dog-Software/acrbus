@@ -179,7 +179,7 @@
     "allowed_models": {
       "type": "array",
       "items": {"type": "string"},
-      "description": "The models a review of this repository may use, as patterns such as example/*, matched without regard to case. Every binding a review would call, fallbacks too, must name a model one of them matches, or the config is refused. Left out, any model the user's bindings name; set in the user's defaults, it holds every repository that doesn't set its own."
+      "description": "The models a review of this repository may use, as patterns such as example/*, matched without regard to case. Every binding a review would call must name a model one of them matches, or the config is refused. Left out, any model the user's bindings name; set in the user's defaults, it holds every repository that doesn't set its own."
     }
   },
   "$defs": {
