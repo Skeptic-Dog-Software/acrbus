@@ -443,7 +443,8 @@ fn described(standing: Option<&Standing>, bridge: &str, ran: Duration, now: i64)
 }
 
 /// A call's tokens: `32k in, 8.2k out, 88k from cache, $0.12`, where in
-/// is input not read from a cache.
+/// is input not read from a cache, then what its first turn read from the
+/// cache, where its agent says: `first turn 37k of 37k from cache`.
 fn spent(t: &LiveTokens) -> String {
     let cached = if t.cache_read > 0 {
         format!(", {} from cache", short(t.cache_read))
@@ -451,11 +452,32 @@ fn spent(t: &LiveTokens) -> String {
         String::new()
     };
     let usd = t.usd.map(|u| format!(", ${u:.2}")).unwrap_or_default();
+    let first = t
+        .first_turn
+        .filter(|f| f.prompt() > 0)
+        .map(|f| {
+            format!(
+                ", first turn {} of {} from cache",
+                tenths(f.cache_read_tokens),
+                tenths(f.prompt())
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{} in, {} out{cached}{usd}",
+        "{} in, {} out{cached}{usd}{first}",
         short(t.input + t.cache_write),
         short(t.output)
     )
+}
+
+/// A count to a tenth of a thousand, `36.8k`: what tells a first turn that
+/// read the whole shared prefix from one that read part of it.
+fn tenths(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    }
 }
 
 /// What a run used besides the tokens counted against its plan:
@@ -666,6 +688,7 @@ mod tests {
             cache_write: 0,
             output,
             usd: Some(0.5),
+            first_turn: None,
         };
         let p = Progress::with(
             Box::new(seen.clone()),
@@ -761,11 +784,31 @@ mod tests {
             cache_write: 0,
             output: 120,
             usd: Some(0.008),
+            first_turn: None,
         };
         p.end(t, None, Some(used));
         p.line("probes: no findings, nothing for the Judge");
         let spent = lock(&p.shared.state).spent;
         assert_eq!((spent.fresh, spent.cached), (3_120, 1_000));
+        // A reviewer whose first turn read the warmed prefix says so.
+        let r = p.start("correctness: reviewer 1", "flash", "pi", None);
+        p.end(
+            r,
+            None,
+            Some(LiveTokens {
+                input: 55_000,
+                cache_read: 2_300_000,
+                cache_write: 0,
+                output: 27_000,
+                usd: Some(0.09),
+                first_turn: Some(crate::proto::TurnUsage {
+                    input_tokens: 205,
+                    output_tokens: 104,
+                    cache_read_tokens: 36_812,
+                    cache_write_tokens: 0,
+                }),
+            }),
+        );
         let text = seen.text();
         assert!(
             text.contains("the Sizer, choosing a tier from the file list: answered after 0s, 3.0k in, 120 out, 1.0k from cache, $0.01"),
@@ -774,6 +817,19 @@ mod tests {
         assert!(
             text.contains("probes: no findings, nothing for the Judge"),
             "{text}"
+        );
+        assert!(
+            text.contains(
+                "correctness: reviewer 1: answered after 0s, 55k in, 27k out, 2.3M from cache, \
+                 $0.09, first turn 36.8k of 37.0k from cache"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains(
+                "list: answered after 0s, 3.0k in, 120 out, 1.0k from cache, $0.01, first"
+            ),
+            "no first turn, nothing said of one: {text}"
         );
     }
 }

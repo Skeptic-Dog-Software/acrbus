@@ -11,6 +11,11 @@
 //   OpenAI chat request that doesn't set its own. Each response's cached
 //   prompt tokens, where its provider says in a header, go to stderr, so a
 //   run's log shows its hits.
+// - ACRBUS_TURNS: set on every review's call. For each model call, stderr
+//   says what the prompt cache served, from pi's own usage: a provider such
+//   as Fireworks reports it in the response body, which pi reads, and never
+//   in a header. And, once a call, the effort the provider says it applied,
+//   where it echoes it, as Fireworks does in fireworks-conversation-options.
 // - ACRBUS_EFFORT: the thinking level the call asked for. pi rounds a level
 //   the model doesn't have to one it does, and stderr says so.
 // - ACRBUS_ALLOWED_TOOLS: the tools this call may use, comma-separated, when
@@ -28,8 +33,60 @@
 // The headers the key goes in: the provider's own, and the same through a
 // gateway that forwards only what's prefixed for it.
 const KEY_HEADERS = ["x-session-affinity", "x-bf-eh-x-session-affinity"];
-// Response headers that count the prompt tokens read from the cache.
+// Response headers that count the prompt tokens read from the cache, for a
+// provider that says it there.
 const CACHED_HEADERS = ["fireworks-cached-prompt-tokens", "x-cached-prompt-tokens"];
+// The response header in which Fireworks echoes the effort it applied.
+const OPTIONS_HEADER = "fireworks-conversation-options";
+
+// A count, as a whole number of tokens: 0 for anything that isn't one.
+function count(v) {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+}
+
+// The headers with their names in lower case, whatever pi passes.
+function lowered(headers) {
+  const out = {};
+  if (headers && typeof headers === "object") {
+    for (const [name, value] of Object.entries(headers)) out[name.toLowerCase()] = value;
+  }
+  return out;
+}
+
+// What the provider says it applied, from its options header: its
+// reasoning_effort, and its thinking mode and budget when it says them. The
+// header is JSON, or failing that read as name and value pairs. Only plain
+// words go into the log.
+function applied(headers) {
+  const raw = headers[OPTIONS_HEADER];
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+  const value = (name) => {
+    let v = null;
+    if (parsed && typeof parsed === "object" && parsed[name] !== undefined && parsed[name] !== null) {
+      v = String(parsed[name]);
+    } else {
+      const m = new RegExp(`${name}["']?\\s*[:=]\\s*["']?([A-Za-z0-9_.-]+)`).exec(raw);
+      v = m ? m[1] : null;
+    }
+    if (v === null) return null;
+    const plain = v.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 40);
+    return plain.length > 0 ? plain : null;
+  };
+  const effort = value("reasoning_effort");
+  if (!effort) return null;
+  const parts = [`reasoning_effort ${effort}`];
+  const mode = value("thinking_mode");
+  if (mode) parts.push(`thinking_mode ${mode}`);
+  const budget = value("thinking_budget_tokens");
+  if (budget) parts.push(`thinking_budget_tokens ${budget}`);
+  return parts.join(", ");
+}
 
 // What marks a handoff's answer, as its first line, for acrbus to read.
 const HANDOFF_MARK = "ACRBUS-HANDOFF";
@@ -42,10 +99,13 @@ const HANDOFF =
   '"handoff": {"checked": "<what you have checked, specifically: the files, functions, paths ' +
   'and claims>", "left": "<what is left to check, and where you were going next>"}.';
 
-// The prompt tokens one turn read: fresh, from the cache and written to it.
-function promptTokens(usage) {
-  if (!usage || typeof usage !== "object") return 0;
-  return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+// One model call's figures, from pi's own usage: what the turn log says,
+// and the size a relay checks, read once.
+function figures(usage) {
+  const fresh = count(usage.input);
+  const cached = count(usage.cacheRead);
+  const written = count(usage.cacheWrite);
+  return { fresh, cached, written, out: count(usage.output), prompt: fresh + cached + written };
 }
 
 // An assistant message with the handoff mark ahead of its text.
@@ -85,14 +145,49 @@ export default function acrbus(pi) {
       if (!openaiChat(payload, ctx?.model) || payload.user !== undefined) return undefined;
       return { ...payload, user: key };
     });
-    let turn = 0;
+  }
+  const turns = process.env.ACRBUS_TURNS === "1";
+  if (key || turns) {
+    let response = 0;
+    let said = false;
     pi.on("after_provider_response", (event) => {
-      turn += 1;
-      const headers = event?.headers ?? {};
+      response += 1;
+      const headers = lowered(event?.headers);
+      // A provider that counts its cache hits in a header: kept beside
+      // pi's own count, which every provider's body gives.
       const name = CACHED_HEADERS.find((n) => headers[n] !== undefined && headers[n] !== null);
       if (name) {
-        console.error(`acrbus cache: turn ${turn}: ${headers[name]} prompt tokens read from the cache (${name})`);
+        const n = String(headers[name]).replace(/[^0-9]/g, "").slice(0, 12);
+        console.error(`acrbus cache: response ${response}: ${n} prompt tokens read from the cache, by its ${name} header`);
       }
+      if (turns && !said) {
+        const what = applied(headers);
+        if (what) {
+          said = true;
+          console.error(`acrbus effort: the provider applied ${what}`);
+        }
+      }
+    });
+  }
+  const relayAt = Number.parseInt(process.env.ACRBUS_RELAY_TOKENS ?? "", 10);
+  const relays = Number.isFinite(relayAt) && relayAt > 0;
+  // The latest model call's prompt tokens, from the same reading the turn
+  // log gives: what a relay checks its size against.
+  let lastPrompt = 0;
+  if (turns || relays) {
+    let turn = 0;
+    pi.on("message_end", (event) => {
+      const message = event?.message;
+      if (!message || message.role !== "assistant" || !message.usage) return undefined;
+      turn += 1;
+      const f = figures(message.usage);
+      lastPrompt = f.prompt;
+      if (turns) {
+        console.error(
+          `acrbus cache: turn ${turn}: ${f.cached} of ${f.prompt} prompt tokens read from the cache (${f.fresh} fresh, ${f.written} written, ${f.out} out)`,
+        );
+      }
+      return undefined;
     });
   }
   const effort = process.env.ACRBUS_EFFORT;
@@ -121,14 +216,14 @@ export default function acrbus(pi) {
       };
     });
   }
-  const relayAt = Number.parseInt(process.env.ACRBUS_RELAY_TOKENS ?? "", 10);
-  if (Number.isFinite(relayAt) && relayAt > 0) {
+  if (relays) {
     let relaying = false;
     pi.on("turn_end", (event) => {
       if (relaying) return undefined;
       // A turn that called no tools is the answer: nothing to hand off.
       if (!Array.isArray(event?.toolResults) || event.toolResults.length === 0) return undefined;
-      const read = promptTokens(event?.message?.usage);
+      // The turn's own model call, as the turn log read it.
+      const read = lastPrompt;
       if (read < relayAt) return undefined;
       relaying = true;
       console.error(

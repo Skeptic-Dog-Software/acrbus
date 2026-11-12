@@ -61,6 +61,10 @@ pub struct Report<'a> {
     /// The calls broken into sessions, by role: relayed and scouted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<Sessions>,
+    /// The blockers a person deferred to a ticket, each with a draft to
+    /// file. Nothing is filed for them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tickets: Vec<Ticket>,
 }
 
 /// One role's calls broken into sessions, in a run: those that relayed and
@@ -149,6 +153,78 @@ pub fn session_lines(usage: &[Usage]) -> Vec<String> {
             ))
         })
         .collect()
+}
+
+/// A draft ticket for a blocker deferred to one: a title and a body, ready
+/// to file wherever the repository keeps its tickets.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Ticket {
+    pub finding: String,
+    pub lens: String,
+    pub round: u32,
+    pub title: String,
+    pub body: String,
+}
+
+/// The blockers deferred to a ticket in a run, each once, as its latest
+/// round has it, with its draft.
+pub fn tickets(run: &Run) -> Vec<Ticket> {
+    let mut out: Vec<Ticket> = Vec::new();
+    for lens in run.lenses.values() {
+        for round in lens.rounds.iter().rev() {
+            for f in &round.findings {
+                if f.state != FindingState::Deferred || out.iter().any(|t| t.finding == f.id) {
+                    continue;
+                }
+                out.push(ticket(run, &lens.id, round.round, f));
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.round, &a.finding).cmp(&(b.round, &b.finding)));
+    out
+}
+
+fn ticket(run: &Run, lens: &str, round: u32, f: &Finding) -> Ticket {
+    let at = match (&f.file, f.line) {
+        (Some(file), Some(line)) => format!("`{file}:{line}`"),
+        (Some(file), None) => format!("`{file}`"),
+        _ => "not tied to one place".to_string(),
+    };
+    let note = if f.note.trim().is_empty() {
+        "None given.".to_string()
+    } else {
+        f.note.trim().to_string()
+    };
+    let found = if f.detail.trim().is_empty() {
+        f.title.trim()
+    } else {
+        f.detail.trim()
+    };
+    // The Judge's reason, without what the person ruled, which the note
+    // and the opening already say.
+    let why = f
+        .reason
+        .replace("A person deferred it to a ticket.", "")
+        .trim()
+        .to_string();
+    let mut body = format!(
+        "Deferred from review {} (round {round}, lens {lens}): a {:?} blocker, real, and left \
+         for a follow-up rather than fixed in that change.\n\n\
+         **Where:** {at}\n\n\
+         **What was found:**\n\n{found}\n\n",
+        run.id, f.severity,
+    );
+    if !why.is_empty() {
+        body.push_str(&format!("**Why it blocked:**\n\n{why}\n\n"));
+    }
+    body.push_str(&format!("**Note from the review:**\n\n{note}\n"));
+    Ticket {
+        finding: f.id.clone(),
+        lens: lens.to_string(),
+        round,
+        title: f.title.trim().to_string(),
+        body,
+    }
 }
 
 /// How often one role's binding gave an answer the Sizer had to put in the
@@ -332,6 +408,69 @@ fn summed(round: Option<u32>, role: &'static str, calls: &[&Usage]) -> RoleUsage
     }
 }
 
+/// One call's first turn, by its agent's count: what it read from a prompt
+/// cache before it did anything else, which says whether a warm-up or an
+/// earlier call left the shared prefix where this one could read it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FirstTurn {
+    pub round: u32,
+    /// What the call was, as progress named it, or its role.
+    pub call: String,
+    pub run_id: String,
+    /// Read from a cache.
+    pub cached: u64,
+    /// The whole prompt: fresh, read from a cache and written to one.
+    pub prompt: u64,
+    pub output: u64,
+}
+
+impl FirstTurn {
+    pub fn line(&self) -> String {
+        let share = if self.prompt > 0 {
+            format!(" ({:.0}%)", self.cached as f64 * 100.0 / self.prompt as f64)
+        } else {
+            String::new()
+        };
+        format!(
+            "round {}, {}: first turn read {} of {} prompt tokens from the cache{share}",
+            self.round, self.call, self.cached, self.prompt
+        )
+    }
+}
+
+/// Each call's first turn, where its agent counted it, in the order made.
+pub fn first_turns(usage: &[Usage]) -> Vec<FirstTurn> {
+    usage
+        .iter()
+        .filter_map(|u| {
+            let f = u.first_turn?;
+            Some(FirstTurn {
+                round: u.round,
+                call: u
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", u.role).to_lowercase()),
+                run_id: u.run_id.clone(),
+                cached: f.cache_read_tokens,
+                prompt: f.prompt(),
+                output: f.output_tokens,
+            })
+        })
+        .collect()
+}
+
+/// Whether the cache-write figures say nothing: calls read from a cache,
+/// but none counted a write. Some providers never report writes, so a 0
+/// there is no evidence either way.
+pub fn writes_unreported(usage: &[Usage]) -> bool {
+    let measured: Vec<&Usage> = usage.iter().filter(|u| u.measured).collect();
+    measured.iter().any(|u| u.cache_read > 0) && measured.iter().all(|u| u.cache_write == 0)
+}
+
+/// What `acr usage` says under a run whose cache writes all read 0.
+pub const WRITES_UNREPORTED: &str = "(cache writes read 0 on every call: some providers \
+    don't report writes, so a 0 there says nothing either way)";
+
 /// The run's calls by round and role, then by role over every round if
 /// there was more than one.
 pub fn by_role(usage: &[Usage]) -> Vec<RoleUsage> {
@@ -405,6 +544,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         prefixes: &run.prefixes,
         repairs: repairs(&run.usage),
         sessions: sessions(&run.usage),
+        tickets: tickets(run),
     }
 }
 
@@ -471,6 +611,7 @@ fn finding_line(f: &Finding) -> String {
         FindingState::Open => "open",
         FindingState::Folded => "folded in",
         FindingState::Waived => "waived",
+        FindingState::Deferred => "deferred to a ticket",
         FindingState::Logged => "logged",
         FindingState::Dropped => "rejected",
     };
@@ -546,6 +687,49 @@ mod tests {
             "label": label, "fan_out": fan_out, "first": first,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn each_calls_first_turn_says_what_it_read_from_the_cache() {
+        let mut warm = call(
+            "reviewer",
+            1,
+            Some("correctness: reviewer 1"),
+            Some("reviewers"),
+            false,
+        );
+        warm.first_turn = Some(crate::proto::TurnUsage {
+            input_tokens: 205,
+            output_tokens: 104,
+            cache_read_tokens: 37_376,
+            cache_write_tokens: 0,
+        });
+        let unknown = call("judge", 1, Some("correctness: the Judge"), None, false);
+        let firsts = first_turns(&[warm, unknown]);
+        assert_eq!(firsts.len(), 1, "only a call its agent counted");
+        assert_eq!((firsts[0].cached, firsts[0].prompt), (37_376, 37_581));
+        assert_eq!(
+            firsts[0].line(),
+            "round 1, correctness: reviewer 1: first turn read 37376 of 37581 prompt tokens \
+             from the cache (99%)"
+        );
+    }
+
+    #[test]
+    fn cache_writes_that_all_read_zero_are_said_to_say_nothing() {
+        let mut read = call("reviewer", 1, Some("r"), None, false);
+        read.measured = true;
+        assert!(writes_unreported(std::slice::from_ref(&read)));
+        let mut wrote = read.clone();
+        wrote.cache_write = 4_000;
+        assert!(!writes_unreported(&[read.clone(), wrote]));
+        // Nothing read from a cache, or nothing counted: nothing to say.
+        let mut cold = read.clone();
+        cold.cache_read = 0;
+        assert!(!writes_unreported(&[cold]));
+        let mut guessed = read;
+        guessed.measured = false;
+        assert!(!writes_unreported(&[guessed]));
     }
 
     #[test]
