@@ -11,6 +11,7 @@ mod attach;
 mod bridge;
 mod bus;
 mod call;
+mod cleanup;
 pub mod cli;
 pub mod config;
 mod daemon;

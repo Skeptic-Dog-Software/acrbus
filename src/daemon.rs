@@ -72,6 +72,19 @@ pub fn run(paths: &Paths) -> Result<()> {
             }
         });
     }
+    {
+        // What bridges and reviews leave, which they keep to be looked at,
+        // goes here once it's old, and nowhere else.
+        let (bus, paths) = (bus.clone(), paths.clone());
+        thread::spawn(move || {
+            loop {
+                for line in crate::cleanup::sweep(&paths) {
+                    bus.event(line);
+                }
+                thread::sleep(crate::cleanup::EVERY);
+            }
+        });
+    }
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;

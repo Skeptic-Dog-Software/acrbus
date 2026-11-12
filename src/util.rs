@@ -229,6 +229,178 @@ pub fn ago(then: i64, now: i64) -> String {
     }
 }
 
+/// A UTC time as it starts a kept file's name, `20261112T134500Z`, so a
+/// listing sorts by time and the cleanup can tell a file's age by its name.
+pub fn stamp(ms: i64) -> String {
+    rfc3339(ms).replace(['-', ':'], "")
+}
+
+/// `name`, starting with the time now.
+pub fn stamped(name: &str) -> String {
+    format!("{}-{name}", stamp(now_ms()))
+}
+
+/// The time a name starts with, as `stamp` writes it.
+fn stamp_of(name: &str) -> Option<i64> {
+    let s = name.get(..16)?;
+    let b = s.as_bytes();
+    if b[8] != b'T' || b[15] != b'Z' || name.as_bytes().get(16).is_some_and(|&c| c != b'-') {
+        return None;
+    }
+    parse_rfc3339(&format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &s[..4],
+        &s[4..6],
+        &s[6..8],
+        &s[9..11],
+        &s[11..13],
+        &s[13..15]
+    ))
+}
+
+/// `name` without the time it starts with, if it has one.
+pub fn unstamped(name: &str) -> &str {
+    match stamp_of(name) {
+        Some(_) => name.get(17..).unwrap_or_default(),
+        None => name,
+    }
+}
+
+/// How old `path` is at `now`: by the time its name starts with, or, for
+/// one named before names had times, by when it last changed.
+pub fn age_at(path: &Path, now: SystemTime) -> Option<std::time::Duration> {
+    let then = match path
+        .file_name()
+        .and_then(|n| stamp_of(&n.to_string_lossy()))
+    {
+        Some(ms) => UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64),
+        None => fs::symlink_metadata(path).and_then(|m| m.modified()).ok()?,
+    };
+    now.duration_since(then).ok()
+}
+
+/// Whether `path` is `age` old or older. Not, if it can't be told.
+pub fn older_than(path: &Path, age: std::time::Duration) -> bool {
+    age_at(path, SystemTime::now()).is_some_and(|d| d >= age)
+}
+
+/// The system's own `name`, such as `tar`, from where it's always kept.
+fn system_tool(name: &str) -> String {
+    ["/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Packs the folder `dir` into `<dir>.tar.gz` beside it, holding the folder
+/// by its name, then removes the folder. Returns the archive. Should
+/// packing fail, the folder stays as it was.
+pub fn pack(dir: &Path) -> Result<std::path::PathBuf> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        bail!("{} can't be packed", dir.display());
+    };
+    let name = name.to_string_lossy();
+    let archive = parent.join(format!("{name}.tar.gz"));
+    // Its own, so a pack at the same time can't write over this one.
+    let part = parent.join(format!("{name}.tar.gz.part-{}", &new_id()[20..]));
+    let out = Command::new(system_tool("tar"))
+        .arg("-czf")
+        .arg(&part)
+        .arg("-C")
+        .arg(parent)
+        .arg(name.as_ref())
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&part);
+        bail!(
+            "packing {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    fs::rename(&part, &archive)?;
+    fs::remove_dir_all(dir)?;
+    Ok(archive)
+}
+
+/// One file from an archive `pack` made, by its path in the archive, which
+/// starts with the packed folder's name.
+pub fn packed_file(archive: &Path, member: &str) -> Result<Vec<u8>> {
+    let out = Command::new(system_tool("tar"))
+        .arg("-xzOf")
+        .arg(archive)
+        .arg(member)
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "{} has no {member}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// What an archive `pack` made holds: each path in it.
+#[cfg(test)]
+pub fn packed_names(archive: &Path) -> Result<Vec<String>> {
+    let out = Command::new(system_tool("tar"))
+        .arg("-tzf")
+        .arg(archive)
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "reading {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim_end_matches('/').to_string())
+        .collect())
+}
+
+/// Writes `bytes` to `path`, compressed with gzip.
+pub fn write_gz(path: &Path, bytes: &[u8]) -> Result<()> {
+    let file = File::create(path)?;
+    let mut child = Command::new(system_tool("gzip"))
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(file)
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin for gzip"))?
+        .write_all(bytes)?;
+    if !child.wait()?.success() {
+        bail!("compressing {}", path.display());
+    }
+    Ok(())
+}
+
+/// What `write_gz` wrote.
+pub fn read_gz(path: &Path) -> Result<Vec<u8>> {
+    let out = Command::new(system_tool("gzip"))
+        .arg("-dc")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "reading {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
 /// A log is cut back when it passes this, in bytes.
 pub const LOG_MAX: u64 = 1 << 20;
 /// What's kept of it: about the last this many bytes, from a line's start.
@@ -273,6 +445,51 @@ pub fn append_to_logs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_names_time_says_how_old_it_is() {
+        let ms = parse_rfc3339("2026-11-12T13:45:07Z").unwrap();
+        assert_eq!(stamp(ms), "20261112T134507Z");
+        let name = format!("{}-01ABC.tar.gz", stamp(ms));
+        assert_eq!(stamp_of(&name), Some(ms));
+        assert_eq!(unstamped(&name), "01ABC.tar.gz");
+        assert_eq!(unstamped("01ABC"), "01ABC", "a name from before");
+        assert_eq!(stamp_of("20261112T134507Zx"), None);
+        let now = UNIX_EPOCH + std::time::Duration::from_millis(ms as u64 + 90_000);
+        let age = age_at(Path::new(&format!("/nowhere/{name}")), now);
+        assert_eq!(age, Some(std::time::Duration::from_secs(90)));
+        assert!(stamped("x").ends_with("Z-x"));
+    }
+
+    #[test]
+    fn a_packed_folder_is_one_archive_its_files_read_from() {
+        let dir = std::env::temp_dir().join(format!("tb-pack-{}", &new_id()[14..]));
+        let run = dir.join("20261112T134507Z-01ABC");
+        fs::create_dir_all(run.join("1/session")).unwrap();
+        fs::write(run.join("stdout"), "the answer\n").unwrap();
+        fs::write(run.join("1/session/t.jsonl"), "{}\n").unwrap();
+        let archive = pack(&run).unwrap();
+        assert!(!run.exists(), "the folder is in the archive now");
+        assert_eq!(archive, dir.join("20261112T134507Z-01ABC.tar.gz"));
+        let name = "20261112T134507Z-01ABC";
+        assert_eq!(
+            packed_file(&archive, &format!("{name}/stdout")).unwrap(),
+            b"the answer\n"
+        );
+        let names = packed_names(&archive).unwrap();
+        assert!(
+            names.contains(&format!("{name}/1/session/t.jsonl")),
+            "{names:?}"
+        );
+        assert!(packed_file(&archive, &format!("{name}/nothing")).is_err());
+        // Compressed, a search for its words finds nothing.
+        let raw = fs::read(&archive).unwrap();
+        assert!(!raw.windows(6).any(|w| w == b"answer"));
+        let gz = dir.join("f.json.gz");
+        write_gz(&gz, b"a finding").unwrap();
+        assert_eq!(read_gz(&gz).unwrap(), b"a finding");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_long_log_keeps_its_last_whole_lines() {

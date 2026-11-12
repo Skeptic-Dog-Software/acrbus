@@ -18,7 +18,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -391,8 +391,8 @@ fn findings_dir(state: &Path) -> PathBuf {
     state.join("acr-findings")
 }
 
-/// Keeps a finished review's findings for feedback, the latest of each, and
-/// clears ones older than `FINDINGS_DAYS`.
+/// Keeps a finished review's findings for feedback, the latest of each. The
+/// daemon's cleanup clears ones older than `FINDINGS_DAYS`.
 pub fn keep_findings(state: &Path, run: &Run, at: i64) -> Result<()> {
     keep(
         state,
@@ -424,47 +424,65 @@ fn keep(
     }
     let dir = findings_dir(state);
     fs::create_dir_all(&dir)?;
-    prune(&dir, Duration::from_secs(FINDINGS_DAYS * 86_400));
     let record = KeptRun {
         run: run.to_string(),
         repo: repo.to_string(),
         at,
         findings,
     };
-    fs::write(
-        dir.join(format!("{run}.json")),
-        serde_json::to_string_pretty(&record)?,
-    )?;
+    // Compressed, so an agent that searches files doesn't come on them, and
+    // named for when they were first kept.
+    let path = kept_file(state, run)
+        .filter(|p| p.extension().is_some_and(|x| x == "gz"))
+        .unwrap_or_else(|| dir.join(crate::util::stamped(&format!("{run}.json.gz"))));
+    crate::util::write_gz(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
     Ok(())
 }
 
+/// The file a review's findings are kept in: compressed, or, from before
+/// they were, `<run>.json`.
+fn kept_file(state: &Path, run: &str) -> Option<PathBuf> {
+    fs::read_dir(findings_dir(state))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let name = crate::util::unstamped(&name);
+            name == format!("{run}.json.gz") || name == format!("{run}.json")
+        })
+}
+
 pub fn kept(state: &Path, run: &str) -> Result<KeptRun> {
-    let path = findings_dir(state).join(format!("{run}.json"));
-    let text = fs::read_to_string(&path).with_context(|| {
+    let path = kept_file(state, run).with_context(|| {
         format!(
             "no findings are kept for review {run}: a finished review's are, for \
              {FINDINGS_DAYS} days"
         )
     })?;
-    serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))
+    let bytes = if path.extension().is_some_and(|x| x == "gz") {
+        crate::util::read_gz(&path)?
+    } else {
+        fs::read(&path)?
+    };
+    serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
 }
 
-fn prune(dir: &Path, age: Duration) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|d| d > age);
-        if old {
-            let _ = fs::remove_file(entry.path());
+/// Clears findings kept for feedback past `FINDINGS_DAYS`. The daemon's
+/// hourly cleanup calls it. Returns how many went.
+pub(super) fn prune_findings(state: &Path) -> usize {
+    let age = Duration::from_secs(FINDINGS_DAYS * 86_400);
+    let mut gone = 0;
+    for entry in fs::read_dir(findings_dir(state))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if crate::util::older_than(&entry.path(), age) && fs::remove_file(entry.path()).is_ok() {
+            gone += 1;
         }
     }
+    gone
 }
 
 // ---------------------------------------------------------------- feedback

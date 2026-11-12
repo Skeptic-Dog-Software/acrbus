@@ -82,6 +82,7 @@ fn env_var_for(app: &App, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+#[derive(Clone)]
 pub struct Paths {
     /// Database, socket and log. Kept `0700`.
     pub state: PathBuf,

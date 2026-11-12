@@ -78,8 +78,10 @@ pub struct RunOptions {
     /// How hard the agent thinks, such as `high`, in the agent's own words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// False: keep no log of the run once it's answered, for a caller that
-    /// keeps its own record and leaves nothing behind.
+    /// True: also copy a Claude Code agent's transcripts into the run's log,
+    /// for a trial. A bridge keeps every run's log and folder either way,
+    /// until its daemon's cleanup clears them, so false asks for nothing
+    /// less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<bool>,
     /// Part of an ACR review, which runs on one machine: a bridge takes it

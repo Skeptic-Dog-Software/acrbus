@@ -1343,7 +1343,7 @@ fn gate_round(
         Some(head) => format!("the change from {} to {head}", run.base),
         None => format!("the working tree against {}", run.base),
     };
-    let dir = Copies(Some(root.join("gate")));
+    let dir = Copies::fresh(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
     let proposed = ask(
@@ -1492,7 +1492,7 @@ fn write_tests(
     let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
     // The code after the fixes and the new tests, in a copy, so running the
     // tests leaves nothing in the checkout.
-    let after = Copies(
+    let after = Copies::fresh(
         s.copies
             .as_ref()
             .map(|root| root.join(format!("{}-r{}-after", run.id, run.round))),
@@ -1565,38 +1565,35 @@ fn write_tests(
     (pins, written.done)
 }
 
-/// A round's reviewer copies, removed when it's dropped.
+/// Where a round's copies go. Each is named afresh, starting with the time
+/// it's made, so a copy never lands on one an earlier round or a resumed one
+/// left, since they stay, to be looked at, until the daemon's cleanup clears
+/// them. They're left unpacked: each is a clone of the repository that costs
+/// next to nothing on disk, and what a reviewer did in it is in its packed
+/// session.
 struct Copies(Option<PathBuf>);
 
-impl Drop for Copies {
-    fn drop(&mut self) {
-        if let Some(dir) = &self.0 {
-            let _ = fs::remove_dir_all(dir);
-        }
+impl Copies {
+    fn fresh(dir: Option<PathBuf>) -> Copies {
+        Copies(dir.map(|dir| {
+            let name = dir.file_name().unwrap_or_default().to_string_lossy();
+            let name = format!("{name}-{}", &crate::util::new_id()[20..]);
+            dir.with_file_name(crate::util::stamped(&name))
+        }))
     }
 }
 
-/// How long a reviewer's copy may outlive its round: only one whose review
-/// was killed is left past it.
-const COPY_HOURS: u64 = 24;
-
-/// Removes the copies of killed reviews.
-fn prune_copies(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    let limit = std::time::Duration::from_secs(COPY_HOURS * 3600);
-    for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > limit);
-        if old {
-            let _ = fs::remove_dir_all(entry.path());
+/// Removes copies left `cleanup::KEEP` ago, under `root`. Returns how many.
+pub(super) fn prune_copies(root: &Path) -> usize {
+    let mut gone = 0;
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        if crate::util::older_than(&entry.path(), crate::cleanup::KEEP)
+            && fs::remove_dir_all(entry.path()).is_ok()
+        {
+            gone += 1;
         }
     }
+    gone
 }
 
 /// Which lenses and escalations an Orchestrator's answer picks. One written
@@ -1902,16 +1899,13 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     }
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
-    // This round's copies, gone when it ends, however it ends, made from
-    // one copy set up once: the package install and a first build.
-    let round_dir = Copies(
+    // This round's copies, made from one copy set up once: the package
+    // install and a first build. They stay when it ends, to be looked at.
+    let round_dir = Copies::fresh(
         s.copies
             .as_ref()
             .map(|root| root.join(format!("{}-r{}", run.id, run.round))),
     );
-    if let Some(root) = &s.copies {
-        prune_copies(root);
-    }
     if cfg.tests.setup.is_some() && round_dir.0.is_some() {
         caller.note(&format!(
             "round {}: setting up a copy for the round's reviewers (tests.setup)",
@@ -2266,7 +2260,7 @@ fn fix(
         roles::fix_prompt(&list(&folded))
     };
     // The code as it is before the fixes, for the pins to fail on.
-    let before = Copies(
+    let before = Copies::fresh(
         s.copies
             .as_ref()
             .filter(|_| writing)
@@ -3227,7 +3221,29 @@ lenses:
     }
 
     #[test]
-    fn a_finished_review_is_noted_once_and_tidied() {
+    fn each_copy_gets_a_folder_no_earlier_copy_left() {
+        let root = Path::new("/state/acr-copies/r1-r2");
+        let (a, b) = (
+            Copies::fresh(Some(root.join("gate"))),
+            Copies::fresh(Some(root.join("gate"))),
+        );
+        let (a, b) = (a.0.unwrap(), b.0.unwrap());
+        assert_ne!(a, b);
+        for dir in [&a, &b] {
+            assert_eq!(dir.parent(), Some(root));
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(crate::util::unstamped(&name).starts_with("gate-"), "{name}");
+            assert_ne!(
+                crate::util::unstamped(&name),
+                name,
+                "it starts with its time"
+            );
+        }
+        assert!(Copies::fresh(None).0.is_none());
+    }
+
+    #[test]
+    fn a_finished_review_is_noted_once_and_kept_to_be_looked_at() {
         let cfg = plain("exception", 3, 1);
         let (run, _) = go(&cfg, &["a.src"], &Fake::new(defect_in("alpha", 1)));
         let home = std::env::temp_dir().join(format!("tb-done-{}", &new_id()[14..]));
@@ -3241,7 +3257,26 @@ lenses:
         fs::write(review.join("run.json"), "{}").unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
-        assert!(!review.exists(), "a finished review leaves nothing behind");
+        // Kept, packed once, under the time it finished.
+        let kept = super::super::keep::kept(&paths, &run.id).unwrap();
+        let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+        let base = name.trim_end_matches(".tar.gz");
+        assert_eq!(
+            crate::util::packed_file(&kept, &format!("{base}/round-1.diff")).unwrap(),
+            b"+x"
+        );
+        assert!(!review.exists());
+        let archives = fs::read_dir(super::super::keep::dir(&paths))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tar.gz")
+            })
+            .count();
+        assert_eq!(archives, 1, "packed once");
         let noted = super::super::keep::history(&paths, &run.repo);
         assert_eq!(noted.len(), 1, "noted once");
         assert_eq!(noted[0].lenses["alpha"], 2);
