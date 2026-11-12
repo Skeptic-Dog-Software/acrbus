@@ -180,13 +180,14 @@ defaults:
 or any other agent CLI works the same way. Without a `configurer`, the
 Judge's binding configures.
 
-A binding's `timeout` is its role's time budget. Give a binding a
-`fallback`, another binding, and a call on it that runs out of time is
-tried once more there, on a faster model say, rather than holding the
-review; what it used is counted against the fallback. A repository's
-review config can set `allowed_models`, patterns such as `vendor/*`: every
-binding its reviews would call, fallbacks too, must name a model one
-matches, or the config is refused. Set in `defaults`, it holds every
+Calls have no time budget: a call runs until it answers, and its bridge
+ends one that stalls (`idle_secs`). A call asks its bridge for as long as
+the bridge allows, so a binding's `timeout`, if set, is only a cap no call
+should reach. While a review runs, it says on stderr, and in
+`progress.log` in its folder, what each call is doing, at least once a
+minute. A repository's review config can set `allowed_models`, patterns
+such as `vendor/*`: every binding its reviews would call must name a model
+one matches, or the config is refused. Set in `defaults`, it holds every
 repository that doesn't set its own.
 
 ## Bridges
@@ -213,7 +214,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 | `home`, `path` | Its `HOME` and `PATH`. Required. `home` can't be your own. |
 | `session` | `"fresh"`, the default, gives every request a new session. `"per-sender"` keeps one conversation with each sender. |
 | `max_concurrent` | The most runs at once. Default 1. |
-| `timeout_secs` | How long a run can take. Default 600. |
+| `timeout_secs` | How long a run can take. Default 600. A review's call asks for as long as the bridge allows, `max_timeout_secs` or this, so give a review's bridge hours: `acrbus setup acr` writes 14400. |
 | `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. Either way, `acrbus bridge status` shows when each running request last used CPU or changed a file, which tells a slow run from a stalled one. |
 | `env`, `secrets` | More environment, and variables read from files only you can read. |
 | `attachments` | `"path"`, the default, tells the agent where each attachment is. `"inline"` puts each one's text in its message, for an agent that can read only its working directory, since attachments are kept outside it. |

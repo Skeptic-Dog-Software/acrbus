@@ -202,6 +202,7 @@ pub fn propose(
             // its own clone, which goes when it's done.
             writes: false,
             repo: clone,
+            label: "the configurer".to_string(),
         })
     };
     let answer = call(brief)?;
@@ -695,7 +696,6 @@ mod tests {
                 text,
                 run_id: "r".into(),
                 usage: None,
-                via: None,
             })
         }
     }

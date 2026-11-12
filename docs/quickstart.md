@@ -163,6 +163,13 @@ acrbus acr run --repo <path> --base <base> --head <head>
 - **`plan`** shows the tier, the lenses and an estimate. The estimate counts
   only the text ACR sends and reads back. What agents' tools read adds more,
   often several times as much, so treat it as a floor.
+- **While it runs,** it says what it's doing on stderr, at least once a
+  minute: each round and stage as it starts, each call as it starts and
+  ends, and every call still at work, with how long it has run and when its
+  bridge last saw it use CPU or change a file. The same lines go to
+  `progress.log` in the review's folder, for a review started in the
+  background. A call that has gone quiet says so, and when its bridge will
+  end it. Nothing cuts a call off while it works.
 
 `run` prints the review as JSON, and on stderr what to do next. Its exit
 code says how it ended:
@@ -299,9 +306,11 @@ Things that matter for an agent other than Claude Code:
   can read only its working directory, as omp can, needs `attachments =
   "inline"` in its bridge, which puts each attachment's text in its
   message. Without it, every role on that agent fails to read the change.
-- **Give slow models a budget and a fallback.** A binding's `timeout` is its
-  role's time budget. With `fallback: <another binding>`, a call that runs
-  out of time is tried once more there, under the fallback's own timeout.
+- **Let calls run.** A review never cuts a call off while it works: the call
+  asks for as long as its bridge allows, so set `timeout_secs` in hours, as
+  above, and the bridge ends a call that stalls (`idle_secs`, 20 minutes
+  unless set). Leave `timeout` out of the binding, or make it a cap no call
+  should reach.
 - **Run the doctor.** It checks every binding against the bridge, with the
   repository as the working directory.
 
@@ -318,7 +327,9 @@ Things that matter for an agent other than Claude Code:
 | the doctor: the bridge's crate cache lacks the crates | Run the `cargo fetch` it gives, once, with the network. |
 | exit 3 or 4 | The review is waiting for you: see the gates in step 8. |
 | exit 1 | Its last line says what's left: fix it and review again. |
-| a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding, or a `fallback`. |
+| a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
+| a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, and when it last did anything. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
+| a call "timed out" | It ran as long as its bridge allows. Raise the bridge's `timeout_secs` and `max_timeout_secs`, and restart it. |
 
 [Setting up ACR review for a repository](acr-repo-setup.md) is the reference
 behind all this: what each part of a config means, for reading a proposal,

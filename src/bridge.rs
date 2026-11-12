@@ -1265,6 +1265,53 @@ impl Report {
     }
 }
 
+/// Where a request stands on a bridge, as its own report says, for a
+/// person following a review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// It's running: since when, and when its process tree last used CPU
+    /// or changed a file, in Unix milliseconds. The bridge ends it once it
+    /// has been quiet for `idle_secs`, if that isn't 0.
+    Running {
+        since: i64,
+        active: Option<i64>,
+        idle_secs: u64,
+    },
+    /// The bridge is up but isn't running it: it's waiting for a free
+    /// slot, or has just finished.
+    Waiting { max_concurrent: usize },
+    /// The bridge isn't running at all.
+    Down,
+}
+
+/// Where request `id` stands on bridge `agent`.
+pub fn standing(paths: &Paths, agent: &str, id: &str) -> Standing {
+    let settings = load(paths, agent).ok();
+    match read_report(paths, agent).filter(Report::alive) {
+        None => Standing::Down,
+        Some(r) => match r.running.get(id) {
+            Some(run) => Standing::Running {
+                since: run.since,
+                active: run.active,
+                idle_secs: settings.as_ref().map_or_else(default_idle, |s| s.idle_secs),
+            },
+            None => Standing::Waiting {
+                max_concurrent: settings
+                    .as_ref()
+                    .map_or_else(default_max_concurrent, |s| s.max_concurrent),
+            },
+        },
+    }
+}
+
+/// The longest a request to bridge `agent` may run: what a review's call
+/// asks for when its binding sets no cap, so that nothing cuts it off while
+/// it works. None if the bridge's settings can't be read.
+pub fn longest(paths: &Paths, agent: &str) -> Option<u64> {
+    let s = load(paths, agent).ok()?;
+    Some(s.options.max_timeout_secs.unwrap_or(s.timeout_secs))
+}
+
 pub fn state_dir(paths: &Paths, agent: &str) -> PathBuf {
     paths.state.join("bridge").join(agent)
 }

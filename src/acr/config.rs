@@ -503,7 +503,10 @@ pub struct Binding {
     /// named, as some headless agents do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// Seconds a call can take.
+    /// The most seconds a call may run, as a cap for one that never ends.
+    /// Left out, the bridge's own longest. It's not a budget: a call is
+    /// never cut off while it works, and one that stalls is ended by its
+    /// bridge's idle check, so a timeout set short only loses work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     /// It may apply an Orchestrator's fixes, in the repository under review.
@@ -523,12 +526,15 @@ pub struct Binding {
     /// never in dollars, whatever a price or the agent says.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subscription: bool,
-    /// Another binding, to try a call on once when this one runs out of
-    /// time: its `timeout` is the role's budget, and past it the role goes
-    /// on elsewhere, on a faster model say, rather than waiting on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// No longer used: read so that a config from before still loads. A
+    /// call that ran out of time was tried once more on it, from scratch,
+    /// which lost the work done and cut off calls that were still working.
+    #[serde(default, skip_serializing)]
     pub fallback: Option<String>,
 }
+
+/// A binding's `timeout` under this is said to be one, by `time_notes`.
+const SHORT_CAP: u64 = 3600;
 
 /// The tools that can change files: a shell, and the writing ones.
 const CHANGING_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
@@ -930,15 +936,8 @@ impl Config {
             .values()
             .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()));
         for name in chosen {
-            let Some(b) = self.allowed_bindings.get(name) else {
+            if !self.allowed_bindings.contains_key(name) {
                 bail!("binding {name} isn't in your allowed_bindings");
-            };
-            match &b.fallback {
-                Some(f) if f == name => bail!("binding {name} is its own fallback"),
-                Some(f) if !self.allowed_bindings.contains_key(f) => {
-                    bail!("binding {name}'s fallback, {f}, isn't in your allowed_bindings")
-                }
-                _ => {}
             }
         }
         for role in Role::ALL.into_iter().filter(|r| r.read_only()) {
@@ -969,8 +968,8 @@ impl Config {
         Ok(())
     }
 
-    /// Each binding a role or lens names, and each one's fallback, once,
-    /// with its name: every binding a review could call.
+    /// Each binding a role or lens names, once, with its name: every
+    /// binding a review could call.
     pub fn chosen_bindings(&self) -> Vec<(&str, &Binding)> {
         let mut out: Vec<(&str, &Binding)> = Vec::new();
         let names = self
@@ -984,15 +983,31 @@ impl Config {
                 out.push((name, b));
             }
         }
-        let fallbacks: Vec<&String> = out
-            .iter()
-            .filter_map(|(_, b)| b.fallback.as_ref())
-            .collect();
-        for name in fallbacks {
-            if let Some(b) = self.allowed_bindings.get(name)
-                && !out.iter().any(|(n, _)| *n == name.as_str())
-            {
-                out.push((name, b));
+        out
+    }
+
+    /// What a review's bindings set that would cut off its calls, said so
+    /// that a person can decide: a time budget, or a fallback from before.
+    pub fn time_notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, b) in self.chosen_bindings() {
+            if b.fallback.is_some() {
+                out.push(format!(
+                    "Binding {name} names a fallback, which {APP_NAME} no longer uses: a call \
+                     isn't cut off while it works, and its bridge ends one that stalls. You can \
+                     remove it."
+                ));
+            }
+            // A cap of hours is the safety net it should be. One shorter
+            // than that is worth a person's look: it's what cut off
+            // reviewers that were still working.
+            if let Some(secs) = b.timeout.filter(|s| *s < SHORT_CAP) {
+                out.push(format!(
+                    "Binding {name} ends its calls after {secs} s, even while they work, and \
+                     a reviewer on a large change can need longer. Leave `timeout` out, or \
+                     make it a cap no call should reach: its bridge's idle check ends a call \
+                     that stalls."
+                ));
             }
         }
         out
@@ -1285,13 +1300,12 @@ mod tests {
             resolve(&user, repo, &Flags::default())
         };
         let refused = |extra: &str| format!("{:#}", with(extra).unwrap_err());
-        // Every binding, fallbacks too, within what's allowed, in any case.
+        // Every binding within what's allowed, in any case.
         with("allowed_models: ['vendor-b/*']\n").unwrap();
         with("allowed_models: ['VENDOR-B/*']\n").unwrap();
-        // A fallback outside it is refused like any other binding.
-        let err = refused("allowed_models: ['vendor-b/fast']\n");
-        assert!(err.contains("binding lean uses vendor-b/lean"), "{err}");
-        // So is a role bound outside it, or to a binding with no model.
+        // A fallback from before is never called, so it isn't held to it.
+        with("allowed_models: ['vendor-b/fast']\n").unwrap();
+        // A role bound outside it is refused, or to a binding with no model.
         let err = refused("allowed_models: ['vendor-b/*']\nbindings: {judge: open}\n");
         assert!(err.contains("binding open uses vendor-a/big"), "{err}");
         let err = refused("allowed_models: ['vendor-b/*']\nbindings: {judge: bare}\n");
@@ -1308,17 +1322,39 @@ mod tests {
     }
 
     #[test]
-    fn a_fallback_is_a_binding_and_not_itself() {
+    fn a_config_with_time_budgets_still_loads_and_says_what_they_do() {
         let check = |text: &str| {
             let user = parse_user(text).unwrap();
             resolve(&user, parse_repo(SMALL).unwrap(), &Flags::default())
-                .and_then(|cfg| cfg.check_bindings())
+                .and_then(|cfg| cfg.check_bindings().map(|_| cfg))
         };
-        check(MODELS_USER).unwrap();
-        let err = check(&MODELS_USER.replace("fallback: lean", "fallback: gone")).unwrap_err();
-        assert!(format!("{err:#}").contains("fallback, gone, isn't in your allowed_bindings"));
-        let err = check(&MODELS_USER.replace("fallback: lean", "fallback: local")).unwrap_err();
-        assert!(format!("{err:#}").contains("binding local is its own fallback"));
+        // A fallback is read, even one to nowhere, and never checked or kept.
+        let cfg = check(&MODELS_USER.replace("fallback: lean", "fallback: gone")).unwrap();
+        let notes = cfg.time_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Binding local names a fallback")),
+            "{notes:?}"
+        );
+        let stored = serde_json::to_string(&cfg).unwrap();
+        assert!(!stored.contains("fallback"), "{stored}");
+        // A timeout still caps a call, and is said to.
+        let cfg = check(&MODELS_USER.replace("fallback: lean", "timeout: 1500")).unwrap();
+        let notes = cfg.time_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Binding local ends its calls after 1500 s")),
+            "{notes:?}"
+        );
+        assert_eq!(cfg.allowed_bindings["local"].timeout, Some(1500));
+        // A cap of hours is the safety net it should be, and goes unsaid.
+        let cfg = check(&MODELS_USER.replace("fallback: lean", "timeout: 14400")).unwrap();
+        assert!(cfg.time_notes().is_empty(), "{:?}", cfg.time_notes());
+        // With neither, there's nothing to say.
+        let plain = MODELS_USER.replace(", fallback: lean", "");
+        assert!(check(&plain).unwrap().time_notes().is_empty());
     }
 
     #[test]

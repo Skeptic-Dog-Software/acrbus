@@ -10,19 +10,16 @@ allowed_bindings:
     agent: models@my-mac
     model: example/small-model
     tools: [read, grep, glob]
-    timeout: 14400   # 4 hours: a cap no review should ever reach
   medium:          # reviewers; add bash, write and edit for probes, which are on
     agent: models@my-mac  # by default and run in a copy of each reviewer's own
     model: example/medium-model
     effort: high
     tools: [read, grep, glob]
-    timeout: 14400
   large:
     agent: models@my-mac
     model: example/large-model
     effort: medium
     tools: [read, grep, glob]
-    timeout: 14400
     writes: true    # the Orchestrator may apply fixes, in the repository
 defaults:
   human_gate: exception
