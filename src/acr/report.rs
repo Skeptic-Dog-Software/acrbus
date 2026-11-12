@@ -58,6 +58,97 @@ pub struct Report<'a> {
     /// Whose answers the Sizer had to put in the form asked, and how often.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub repairs: Vec<Repairs>,
+    /// The calls broken into sessions, by role: relayed and scouted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<Sessions>,
+}
+
+/// One role's calls broken into sessions, in a run: those that relayed and
+/// the sessions they took, and the scouts and the checks of what they
+/// suspected. Each session is also a call of its own in `by_role`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Sessions {
+    pub role: Role,
+    /// Calls that handed off at least once.
+    pub relayed: usize,
+    /// The sessions of every relayed call, scouts' and checks' included.
+    pub legs: usize,
+    /// Reviewers that scouted, and the suspicions they had checked.
+    pub scouts: usize,
+    pub verifies: usize,
+    /// Every one of those sessions' tokens, and dollars where priced.
+    pub tokens: u64,
+    pub usd: Option<f64>,
+}
+
+impl Sessions {
+    pub fn line(&self) -> String {
+        let role = format!("{:?}", self.role).to_lowercase();
+        let usd = self.usd.map_or_else(String::new, |d| format!(", ${d:.2}"));
+        format!(
+            "sessions: {role}: {} call(s) relayed, {} session(s) in all; {} scout(s), {} \
+             suspicion(s) checked; {} tokens{usd}",
+            self.relayed, self.legs, self.scouts, self.verifies, self.tokens
+        )
+    }
+}
+
+/// The run's calls broken into sessions, by role, from each call's part.
+pub fn sessions(usage: &[Usage]) -> Vec<Sessions> {
+    let mut by: BTreeMap<Role, Vec<&Usage>> = BTreeMap::new();
+    for u in usage.iter().filter(|u| u.part.is_some()) {
+        by.entry(u.role).or_default().push(u);
+    }
+    by.into_iter()
+        .map(|(role, calls)| {
+            let part = |u: &&Usage| u.part.clone().unwrap_or_default();
+            let first_leg = |p: &str| p.ends_with("leg 1");
+            let owned: Vec<Usage> = calls.iter().map(|u| (*u).clone()).collect();
+            Sessions {
+                role,
+                relayed: calls.iter().filter(|u| first_leg(&part(u))).count(),
+                legs: calls.iter().filter(|u| part(u).contains("leg ")).count(),
+                scouts: calls
+                    .iter()
+                    .filter(|u| {
+                        let p = part(u);
+                        p == "scout" || p == "scout, leg 1"
+                    })
+                    .count(),
+                verifies: calls
+                    .iter()
+                    .filter(|u| {
+                        let p = part(u);
+                        p.starts_with("verify") && (!p.contains(", leg ") || first_leg(&p))
+                    })
+                    .count(),
+                tokens: calls.iter().map(|u| u.tokens()).sum(),
+                usd: super::flow::dollars(&owned),
+            }
+        })
+        .collect()
+}
+
+/// Each session of a call broken up: its label, its part, and what it used.
+pub fn session_lines(usage: &[Usage]) -> Vec<String> {
+    usage
+        .iter()
+        .filter_map(|u| {
+            let part = u.part.as_deref()?;
+            let usd = u.usd.map_or_else(String::new, |d| format!(", ${d:.3}"));
+            let secs = u
+                .secs
+                .map_or_else(String::new, |s| format!(", {}", span(s)));
+            Some(format!(
+                "  round {}: {} [{part}]: {} fresh, {} cached, {} out{usd}{secs}",
+                u.round,
+                u.label.as_deref().unwrap_or("a call"),
+                u.tokens_in + u.cache_write,
+                u.cache_read,
+                u.tokens_out
+            ))
+        })
+        .collect()
 }
 
 /// How often one role's binding gave an answer the Sizer had to put in the
@@ -313,6 +404,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         facts: &run.facts,
         prefixes: &run.prefixes,
         repairs: repairs(&run.usage),
+        sessions: sessions(&run.usage),
     }
 }
 

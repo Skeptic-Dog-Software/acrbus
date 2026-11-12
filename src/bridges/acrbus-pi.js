@@ -17,12 +17,48 @@
 //   every role on the bridge is given the same tool definitions so their
 //   prompts share a cached prefix. A call to any other tool is refused, and
 //   says so. It fails closed: a list it can't read refuses every tool.
+// - ACRBUS_RELAY_TOKENS: past this many prompt tokens in one turn that goes
+//   on to call tools, the call hands off. It's told to stop and answer with
+//   everything it would report so far, what it has checked and what's left;
+//   its tools are refused from then on; and its answer is marked, so acrbus
+//   starts a fresh session from the handoff instead of taking it for a
+//   finished review. A turn that calls no tools is the answer itself, and
+//   never hands off.
 
 // The headers the key goes in: the provider's own, and the same through a
 // gateway that forwards only what's prefixed for it.
 const KEY_HEADERS = ["x-session-affinity", "x-bf-eh-x-session-affinity"];
 // Response headers that count the prompt tokens read from the cache.
 const CACHED_HEADERS = ["fireworks-cached-prompt-tokens", "x-cached-prompt-tokens"];
+
+// What marks a handoff's answer, as its first line, for acrbus to read.
+const HANDOFF_MARK = "ACRBUS-HANDOFF";
+// What a call past its size is told.
+const HANDOFF =
+  "You've used most of the room one session has, so this session ends here, and a fresh one " +
+  "carries on from what you hand it. Stop investigating, and don't call any more tools. " +
+  "Answer now with only the JSON your instructions describe, holding everything your answer " +
+  "would hold so far, in full, exactly as you'd report it, and one more field: " +
+  '"handoff": {"checked": "<what you have checked, specifically: the files, functions, paths ' +
+  'and claims>", "left": "<what is left to check, and where you were going next>"}.';
+
+// The prompt tokens one turn read: fresh, from the cache and written to it.
+function promptTokens(usage) {
+  if (!usage || typeof usage !== "object") return 0;
+  return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+}
+
+// An assistant message with the handoff mark ahead of its text.
+function marked(message) {
+  const content = Array.isArray(message.content) ? message.content : [];
+  const at = content.findIndex((b) => b && b.type === "text");
+  if (at >= 0 && String(content[at].text ?? "").startsWith(HANDOFF_MARK)) return message;
+  const next =
+    at >= 0
+      ? content.map((b, i) => (i === at ? { ...b, text: `${HANDOFF_MARK}\n${b.text ?? ""}` } : b))
+      : [...content, { type: "text", text: `${HANDOFF_MARK}\n` }];
+  return { ...message, content: next };
+}
 
 // An OpenAI chat completions request, which takes `user`: by the model's API
 // when pi says, otherwise by its shape, so no other API's request gets a
@@ -83,6 +119,39 @@ export default function acrbus(pi) {
         block: true,
         reason: `This role may not use ${event.toolName}. The tools it may use: ${may}.`,
       };
+    });
+  }
+  const relayAt = Number.parseInt(process.env.ACRBUS_RELAY_TOKENS ?? "", 10);
+  if (Number.isFinite(relayAt) && relayAt > 0) {
+    let relaying = false;
+    pi.on("turn_end", (event) => {
+      if (relaying) return undefined;
+      // A turn that called no tools is the answer: nothing to hand off.
+      if (!Array.isArray(event?.toolResults) || event.toolResults.length === 0) return undefined;
+      const read = promptTokens(event?.message?.usage);
+      if (read < relayAt) return undefined;
+      relaying = true;
+      console.error(
+        `acrbus relay: turn ${event.turnIndex ?? "?"} read ${read} prompt tokens, past ${relayAt}: handing off`,
+      );
+      return {
+        entries: [
+          ...(Array.isArray(event.entries) ? event.entries : []),
+          { type: "custom_message", customType: "acrbus-relay", content: HANDOFF, display: false },
+        ],
+        continue: true,
+      };
+    });
+    pi.on("tool_call", async () => {
+      if (!relaying) return undefined;
+      return {
+        block: true,
+        reason: "This session is out of room: write your handoff now, as the last message asks.",
+      };
+    });
+    pi.on("message_end", (event) => {
+      if (!relaying || event?.message?.role !== "assistant") return undefined;
+      return { message: marked(event.message) };
     });
   }
 }

@@ -113,6 +113,18 @@ refreshes a prefix still in use before it could be evicted.
 The report gives each role's calls, fresh and cached tokens, dollars and
 times, and how many bytes each set of parallel calls shared.
 
+## Long calls can run in shorter sessions
+
+Every turn of a session rereads everything it has read, so a long call's cost
+grows faster than its turns. Two settings, off by default, break one up:
+past a size a session hands off what it found, checked and left to a fresh one
+that starts from the cached opening, and a lens can scout first, listing what
+it suspects, then check each suspicion in a short session of its own. A
+handoff that can't be read, or a suspicion that can't be checked, fails the
+call rather than passing it. [Long calls in shorter
+sessions](acr-repo-setup.md#5c-long-calls-in-shorter-sessions) has the
+settings and how to measure them.
+
 ## It survives its agents, and says what they're doing
 
 Each headless run gets an environment of its own, and a watch for going
