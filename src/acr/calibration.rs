@@ -65,6 +65,14 @@ pub struct Record {
     pub feedback_folded_at: Option<i64>,
 }
 
+/// What it means that a repository was calibrated on an earlier Judge, said
+/// wherever that's noted. The stamp gates nothing a review does: every
+/// review runs the current Judge, and accepting the config again only
+/// records the Judge it was accepted on.
+pub const ON_AN_EARLIER_JUDGE: &str = "Reviews aren't weaker meanwhile: each one uses the \
+     current Judge, whatever the config was accepted on, and accepting the config again only \
+     records that it still fits that Judge, which clears this note.";
+
 /// Where a repository stands for `acr run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
@@ -180,11 +188,14 @@ pub fn report(
 ) -> String {
     let stands = match standing(record, now) {
         Standing::Calibrated => "calibrated".to_string(),
-        Standing::JudgeChanged => "calibrated, but on an earlier Judge: recalibrate soon".into(),
+        Standing::JudgeChanged => "calibrated, but on an earlier Judge".into(),
         Standing::ConfigChanged => "not calibrated: its config has changed since".into(),
         Standing::Never => "not calibrated".into(),
     };
     let mut out = format!("{name}: {stands}.");
+    if standing(record, now) == Standing::JudgeChanged {
+        out.push_str(&format!("\n{ON_AN_EARLIER_JUDGE}"));
+    }
     if let Some(a) = &record.accepted {
         out.push_str(&format!(
             "\nIts config was last accepted {}.",
@@ -210,6 +221,30 @@ pub fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_earlier_judge_says_reviews_are_not_weaker_and_what_accepting_does() {
+        let mut record = Record::default();
+        accept_into(&mut record, fp("c1", "j1"));
+        let text = report("app", &record, &fp("c1", "j2"), 0, None);
+        assert!(
+            text.contains("calibrated, but on an earlier Judge"),
+            "{text}"
+        );
+        assert!(text.contains("aren't weaker"), "{text}");
+        assert!(text.contains("only records that it still fits"), "{text}");
+        // Calibrated on this Judge, it says neither.
+        let text = report("app", &record, &fp("c1", "j1"), 0, None);
+        assert!(!text.contains("aren't weaker"), "{text}");
+    }
+
+    fn accept_into(record: &mut Record, fingerprint: Fingerprint) {
+        record.accepted = Some(Accepted {
+            at: 0,
+            fingerprint,
+            runs: 0,
+        });
+    }
 
     fn fp(config: &str, judge: &str) -> Fingerprint {
         Fingerprint {

@@ -55,6 +55,71 @@ pub struct Report<'a> {
     /// What each fan-out's calls, and each round with the last, share at the
     /// head of what they send.
     pub prefixes: &'a [Prefix],
+    /// Whose answers the Sizer had to put in the form asked, and how often.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<Repairs>,
+}
+
+/// How often one role's binding gave an answer the Sizer had to put in the
+/// form asked, in a run: a model that misses the format often costs a call
+/// each time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Repairs {
+    pub role: Role,
+    pub binding: String,
+    pub model: Option<String>,
+    /// Its answers the Sizer put in form.
+    pub repairs: usize,
+    /// Its calls in all, repairs not counted.
+    pub calls: usize,
+}
+
+impl Repairs {
+    pub fn share(&self) -> f64 {
+        if self.calls == 0 {
+            return 0.0;
+        }
+        self.repairs as f64 / self.calls as f64
+    }
+
+    /// One line of it, for a person.
+    pub fn line(&self) -> String {
+        let role = format!("{:?}", self.role).to_lowercase();
+        let model = self
+            .model
+            .as_deref()
+            .map_or_else(String::new, |m| format!(", {m}"));
+        format!(
+            "format repairs: the Sizer put {} of {} {role} answer(s) from {}{model} in form",
+            self.repairs, self.calls, self.binding
+        )
+    }
+}
+
+/// The run's format repairs, by the role, binding and model whose answers
+/// needed them.
+pub fn repairs(usage: &[Usage]) -> Vec<Repairs> {
+    let mut by: BTreeMap<super::flow::Repaired, usize> = BTreeMap::new();
+    for r in usage.iter().filter_map(|u| u.repaired.as_ref()) {
+        *by.entry(r.clone()).or_default() += 1;
+    }
+    by.into_iter()
+        .map(|(r, repairs)| Repairs {
+            calls: usage
+                .iter()
+                .filter(|u| {
+                    u.repaired.is_none()
+                        && u.role == r.role
+                        && u.binding == r.binding
+                        && u.fan_out.as_deref() != Some("keep-alive")
+                })
+                .count(),
+            role: r.role,
+            binding: r.binding,
+            model: r.model,
+            repairs,
+        })
+        .collect()
 }
 
 /// One role's calls in a round, or in the whole run: what a review's cost
@@ -247,6 +312,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         by_role: by_role(&run.usage),
         facts: &run.facts,
         prefixes: &run.prefixes,
+        repairs: repairs(&run.usage),
     }
 }
 

@@ -62,7 +62,9 @@ pub struct Target {
     /// repository's own `.acr/config.yaml`, from `--base`.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// The change's head. Left out, the working tree.
+    /// The change's head. The review reads a copy of it, so the checkout can
+    /// be on any branch meanwhile; fixes go into the checkout, which must
+    /// hold it by then. Left out, the working tree.
     #[arg(long)]
     head: Option<String>,
     #[arg(long, value_parser = parse_gate)]
@@ -81,6 +83,8 @@ pub struct Target {
     description: Option<PathBuf>,
     /// The pull request whose title and description say what the change is
     /// for, read with `gh`. `--post-pr` reads its own when this is left out.
+    /// Each round's shared facts carry its title, description, review
+    /// comments and the issues it links.
     #[arg(long, value_name = "NUMBER")]
     pr: Option<u64>,
     /// The building session's brief for round 1's reviewers: a YAML file
@@ -359,9 +363,10 @@ pub enum AcrCmd {
         text: bool,
     },
     /// A review's calls summed by round and role: fresh, cached and output
-    /// tokens, dollars and times, and what each fan-out's calls shared at
-    /// the head. For any review this bus kept, at work or finished, so two
-    /// can be set side by side. `--json` for the rows as the report has them.
+    /// tokens, dollars and times, what each fan-out's calls shared at the
+    /// head, and whose answers the Sizer had to put in form. For any review
+    /// this bus kept, at work or finished, so two can be set side by side.
+    /// `--json` for the rows as the report has them.
     Usage {
         run_id: String,
         #[arg(long)]
@@ -972,8 +977,10 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
             match calibration::standing(&record, &now) {
                 calibration::Standing::Calibrated => out.push(Said::Ok(format!("{name} is calibrated"))),
                 calibration::Standing::JudgeChanged => out.push(Said::Note(format!(
-                    "{name} is calibrated, but on an earlier Judge: `{APP_NAME} acr calibration \
-                     --repo {shown} --accept` when you've read its config again"
+                    "{name} is calibrated, but on an earlier Judge: its binding, prompt or \
+                     rules have changed since its config was accepted. {} `{APP_NAME} acr \
+                     calibration --repo {shown} --accept` when you've read its config again",
+                    calibration::ON_AN_EARLIER_JUDGE
                 ))),
                 calibration::Standing::ConfigChanged | calibration::Standing::Never => {
                     out.push(Said::Fix(format!(
@@ -2029,6 +2036,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     for line in summary.by_role.iter().map(report::RoleUsage::line) {
         eprintln!("{APP_NAME}: {line}");
     }
+    for r in &summary.repairs {
+        eprintln!("{APP_NAME}: {}", r.line());
+    }
     for p in &run.prefixes {
         eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
     }
@@ -2338,8 +2348,54 @@ fn setting<'a>(
         converge: false,
         stop_on_failure: false,
         copies: Some(copies_root(paths)),
+        head_copy: None,
+        pr: None,
         builder_brief: None,
     })
+}
+
+/// A copy of `commit` for review `id` to read, under the copies, where it
+/// stays until the daemon's cleanup clears it, as a round's copies do. Every
+/// bridge the review's roles go through may work there, since every role
+/// reads the change there, not only the reviewers that change files.
+fn head_copy(paths: &Paths, cfg: &Config, id: &str, repo: &Path, commit: &str) -> Result<PathBuf> {
+    let name = repo
+        .file_name()
+        .map_or_else(|| "repo".into(), |n| n.to_owned());
+    let dir = flow::fresh_copy_dir(copies_root(paths).join(format!("{id}-head")));
+    let copy = dir.join(name);
+    change::copy_at(repo, commit, &copy).with_context(|| {
+        format!(
+            "making a copy of {} to review",
+            &commit[..12.min(commit.len())]
+        )
+    })?;
+    for bridge in reading_bridges(cfg)? {
+        crate::setup::acr_dir(paths, &copies_root(paths), &bridge)?;
+    }
+    Ok(copy)
+}
+
+/// The local bridges a review's roles go through: every reviewer's, and
+/// the Judge's, the Sizer's and the Orchestrator's, each once.
+fn reading_bridges(cfg: &Config) -> Result<Vec<String>> {
+    let mut bindings = Vec::new();
+    for lens in &cfg.lenses {
+        bindings.push(cfg.binding(Role::Reviewer, Some(lens))?);
+    }
+    for role in [Role::Judge, Role::Sizer, Role::Orchestrator] {
+        if let Ok(b) = cfg.binding(role, None) {
+            bindings.push(b);
+        }
+    }
+    let mut bridges: Vec<String> = Vec::new();
+    for b in bindings {
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
+        if !bridges.contains(&bridge) {
+            bridges.push(bridge);
+        }
+    }
+    Ok(bridges)
 }
 
 /// What earlier reviews of `repo` say, from ACR's history.
@@ -2585,7 +2641,8 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 eprintln!("{note}");
             }
             check_machine(paths, &cfg, &target.repo, false)?;
-            change::checked_out(
+            // The commit under review resolves before anything is made.
+            let commit = change::reviewed_commit(
                 &target.repo,
                 &target.base,
                 target.head.as_deref(),
@@ -2597,6 +2654,12 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             claim(paths, &name, &target, post_pr, &id)?;
             let mut s = setting(paths, &cfg, &id, Some(list))?;
             s.description = description;
+            s.pr = target.pr.or(post_pr);
+            // A review of a commit reads a copy of it, so the checkout can be
+            // on any branch, with any changes, while it runs.
+            if let Some(commit) = &commit {
+                s.head_copy = Some(head_copy(paths, &cfg, &id, &target.repo, commit)?);
+            }
             s.builder_brief = target
                 .brief
                 .as_deref()
@@ -2629,10 +2692,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
         AcrCmd::Usage { run_id, json } => {
             let run = kept_run(paths, &run_id)?;
             let rows = report::by_role(&run.usage);
+            let repairs = report::repairs(&run.usage);
             if json {
                 let out = serde_json::json!({
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
-                    "prefixes": run.prefixes,
+                    "prefixes": run.prefixes, "repairs": repairs,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -2641,6 +2705,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for p in &run.prefixes {
                     println!("round {}: {}", p.round, p.line());
+                }
+                for r in &repairs {
+                    println!("{}", r.line());
                 }
                 if run.usage.iter().any(|u| u.label.is_none()) {
                     println!(
@@ -2720,15 +2787,30 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                      {run_id}` lists its findings."
                 );
             } else {
-                // Until a fix, the review is of its head, which must be
-                // checked out.
-                if !fixing && run.lenses.values().all(|l| l.done.is_empty()) {
-                    change::checked_out(
-                        &run.repo,
-                        &run.base,
-                        run.head.as_deref(),
-                        cfg.review_scope,
-                    )?;
+                // Until a fix, the review is of its head: a copy of it, made
+                // again if the cleanup took it, or, for a review saved
+                // before reviews read a copy, the checkout, which then must
+                // hold it.
+                if !fixing && !run.fixed() {
+                    match &run.head_copy {
+                        Some(copy) if !copy.exists() => {
+                            let commit = change::reviewed_commit(
+                                &run.repo,
+                                &run.base,
+                                run.head.as_deref(),
+                                cfg.review_scope,
+                            )?
+                            .context("a review with a copy of its commit has a head")?;
+                            change::copy_at(&run.repo, &commit, copy)?;
+                        }
+                        Some(_) => {}
+                        None => change::checked_out(
+                            &run.repo,
+                            &run.base,
+                            run.head.as_deref(),
+                            cfg.review_scope,
+                        )?,
+                    }
                 }
                 check_machine(paths, &cfg, &run.repo, true)?;
             }
@@ -3970,8 +4052,9 @@ fn calibrated(
         Standing::Calibrated => Ok((!feedback.is_empty()).then(|| format!("Note:{feedback}"))),
         Standing::JudgeChanged => Ok(Some(format!(
             "Note: the Judge (its binding, prompt or rules) has changed since {name}'s config was \
-             accepted. Check its config still fits, then accept it again with `{APP_NAME} acr \
-             calibration --accept`.{feedback}"
+             accepted. {} Check its config still fits, then accept it again with `{APP_NAME} acr \
+             calibration --accept`.{feedback}",
+            calibration::ON_AN_EARLIER_JUDGE
         ))),
         _ if anyway => Ok(Some(format!(
             "Note: {name}'s config isn't one accepted for it, so it hasn't been checked for \

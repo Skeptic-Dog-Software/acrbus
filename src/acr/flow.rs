@@ -381,7 +381,34 @@ pub struct Usage {
     /// It was its fan-out's first call.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub first: bool,
+    /// It put another call's answer in the form asked: the Sizer's repair
+    /// of an answer that couldn't be read as it came.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repaired: Option<Repaired>,
 }
+
+/// Whose answer a repair put in form: its role, binding and model.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Repaired {
+    pub role: Role,
+    pub binding: String,
+    pub model: Option<String>,
+}
+
+impl Repaired {
+    fn of(call: &Call) -> Repaired {
+        Repaired {
+            role: call.role,
+            binding: call.binding_name.to_string(),
+            model: call.binding.model.clone(),
+        }
+    }
+}
+
+/// The share of a binding's calls whose answers needed a repair, above
+/// which progress says so, once there are at least `REPAIR_WARN_MIN`.
+pub const REPAIR_WARN_SHARE: f64 = 0.2;
+pub const REPAIR_WARN_MIN: usize = 2;
 
 impl Usage {
     pub fn tokens(&self) -> u64 {
@@ -462,6 +489,33 @@ pub struct Run {
     /// head of what they send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefixes: Vec<super::facts::Prefix>,
+    /// A copy of the commit under review, which the review reads until its
+    /// first fix, so the checkout can be on any branch meanwhile. None for a
+    /// review of the working tree, and for one saved before reviews read a
+    /// copy: those read the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_copy: Option<PathBuf>,
+    /// The change's pull request, whose words each round's facts carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
+}
+
+impl Run {
+    /// Whether a fix has gone in. From then on the review is of the
+    /// checkout's working tree, where the fixes are.
+    pub fn fixed(&self) -> bool {
+        self.lenses.values().any(|l| !l.done.is_empty())
+    }
+
+    /// Where the review reads the change: the copy of its commit until the
+    /// first fix, and the checkout from then on, or throughout when there's
+    /// no copy.
+    pub fn reading(&self) -> &Path {
+        match &self.head_copy {
+            Some(copy) if !self.fixed() => copy,
+            _ => &self.repo,
+        }
+    }
 }
 
 /// A synthesis between rounds of a review to convergence: what the
@@ -531,6 +585,11 @@ pub struct Setting<'a> {
     /// checkout of its own, for the round. Without it, every reviewer works
     /// in the checkout.
     pub copies: Option<PathBuf>,
+    /// A copy of the commit under review, made for a new run with `--head`:
+    /// see `Run::head_copy`.
+    pub head_copy: Option<PathBuf>,
+    /// The change's pull request, for a new run: see `Run::pr`.
+    pub pr: Option<u64>,
     /// The building session's brief for round 1's reviewers, if it wrote
     /// one. Later rounds are briefed by the steelman, which holds the
     /// change's context by then.
@@ -569,6 +628,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         label: Some(call.label.clone()),
         fan_out: None,
         first: false,
+        repaired: None,
     };
     match &answer.usage {
         Some(counted) => {
@@ -651,7 +711,7 @@ fn ask(
     artifact: Option<&Path>,
 ) -> Result<String> {
     let name = s.cfg.binding_name(role, None)?;
-    let repo = run.repo.clone();
+    let repo = run.reading().to_path_buf();
     let call = Call {
         role,
         binding_name: name,
@@ -679,7 +739,7 @@ fn ask_bare(
     prompt: &str,
 ) -> Result<String> {
     let name = s.cfg.binding_name(role, None)?;
-    let repo = run.repo.clone();
+    let repo = run.reading().to_path_buf();
     let call = Call {
         role,
         binding_name: name,
@@ -730,7 +790,7 @@ fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result
     // What earlier commits and the docs say is said about the change too;
     // where its tests and callers are is a lead, after it.
     if s.cfg.stages.contains(&Kind::Context) {
-        let pack = stages::context_pack(&run.repo, &run.base, change);
+        let pack = stages::context_pack(run.reading(), &run.base, change);
         intent.push_str(&pack.said);
         intent.push_str(&pack.leads);
     }
@@ -1001,6 +1061,8 @@ pub fn start(
         },
         rescope: false,
         fixing: None,
+        head_copy: s.head_copy.clone(),
+        pr: s.pr,
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -1264,7 +1326,7 @@ fn attack(
         .tests
         .command
         .clone()
-        .or_else(|| stages::test_command(&run.repo));
+        .or_else(|| stages::test_command(run.reading()));
     let mut asks: Vec<(&Lens, Brief, String)> = Vec::new();
     for id in &open {
         let lens = lens_of(cfg, id)?;
@@ -1298,7 +1360,7 @@ fn attack(
                         .with_context(|| format!("making {}'s reviewer a copy", lens.id))?;
                     copy
                 }
-                _ => run.repo.clone(),
+                _ => run.reading().to_path_buf(),
             };
             let brief = match stage {
                 None
@@ -1395,8 +1457,10 @@ fn attack(
     type Done = (Option<Usage>, Vec<Raw>, Option<String>);
     // A reviewer's findings, said at once when its answer can't be read,
     // rather than only when the round ends.
+    let repairs: std::sync::Mutex<Vec<Usage>> = Default::default();
+    let repairs = &repairs;
     let read = |text: &str, call: &Call| -> Result<Vec<Raw>> {
-        findings_of(caller, cfg, text, call).inspect_err(|e| {
+        findings_of(caller, cfg, text, call, repairs).inspect_err(|e| {
             caller.say(&format!(
                 "{}: its answer couldn't be read: {e:#}",
                 call.label
@@ -1503,7 +1567,7 @@ fn attack(
     };
     let judge_name = cfg.binding_name(Role::Judge, None)?;
     let judge = cfg.binding(Role::Judge, None)?;
-    let main_path = run.repo.clone();
+    let main_path = run.reading().to_path_buf();
     let main: &Path = &main_path;
     let (warm_reviewers, warm_judges, stop) = (&warm_reviewers, &warm_judges, &stop);
     let (kept_alive, judge_prompts) = (&kept_alive, &judge_prompts);
@@ -1642,7 +1706,7 @@ fn attack(
         _ => Vec::new(),
     };
     let (review, rule, board, alive) = (&review, &rule, &board, &alive);
-    let main_repo = run.repo.clone();
+    let main_repo = run.reading().to_path_buf();
     let main_repo = &main_repo;
     // Every lens and every reviewer at once, once the first has warmed the
     // cache, and each lens's Judge as soon as its own reviewers are done:
@@ -1722,6 +1786,10 @@ fn attack(
         u.round = run.round;
         run.usage.push(u);
     }
+    for mut u in std::mem::take(&mut *lock_vec(repairs)) {
+        u.round = run.round;
+        run.usage.push(u);
+    }
     let prompts = std::mem::take(&mut *lock_vec(judge_prompts));
     if head > 0 && prompts.len() > 1 {
         let texts: Vec<&str> = prompts.iter().map(String::as_str).collect();
@@ -1751,6 +1819,8 @@ fn attack(
         }
         judgments.insert(lens.id.clone(), judged);
     }
+    // Once the round's calls are all in, so each repair is set against them.
+    warn_repairs(run, caller);
     Ok((by_lens, judgments, notes))
 }
 
@@ -2034,7 +2104,7 @@ fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> Warm {
              run the tests. {tail}\n\n"
         )
     };
-    let ran = super::change::copy_of(&run.repo, &copy)
+    let ran = super::change::copy_of(run.reading(), &copy)
         .and_then(|_| stages::run_setup(&copy, setup, limit, &log));
     match ran {
         Ok(r) if r.passed == Some(true) => Warm {
@@ -2131,7 +2201,7 @@ fn gate_round(
         .tests
         .command
         .clone()
-        .or_else(|| stages::test_command(&run.repo))
+        .or_else(|| stages::test_command(run.reading()))
     else {
         round.failures.push(
             "the test gate can't tell how this repository's tests run: set tests.command in \
@@ -2385,6 +2455,12 @@ impl Copies {
     }
 }
 
+/// A fresh place for a copy under `dir`, named for the time it's made, as
+/// a round's copies are: see [`Copies`].
+pub(super) fn fresh_copy_dir(dir: PathBuf) -> PathBuf {
+    Copies::fresh(Some(dir)).0.expect("given a folder")
+}
+
 /// Removes copies left `cleanup::KEEP` ago, under `root`. Returns how many.
 pub(super) fn prune_copies(root: &Path) -> usize {
     let mut gone = 0;
@@ -2425,11 +2501,44 @@ fn selected_of(
     let ids: Vec<&str> = described.iter().map(|(id, _)| *id).collect();
     let prompt = roles::reformat_selected_prompt(text, &ids, escalating);
     let what = "the Sizer, putting the lens choice in form";
-    ask(run, s, caller, Role::Sizer, what, &prompt, None)
-        .and_then(|text| read(&text))
-        .with_context(|| {
-            format!("{unread:#}, and putting its answer in the form asked didn't work either")
-        })
+    let repaired = ask(run, s, caller, Role::Sizer, what, &prompt, None);
+    if repaired.is_ok() {
+        mark_repair(run, s.cfg, Role::Orchestrator);
+    }
+    repaired.and_then(|text| read(&text)).with_context(|| {
+        format!("{unread:#}, and putting its answer in the form asked didn't work either")
+    })
+}
+
+/// Marks the call just recorded, the Sizer's, as a repair of an answer by
+/// `of`'s binding.
+fn mark_repair(run: &mut Run, cfg: &Config, of: Role) {
+    let (Ok(binding), Ok(b)) = (cfg.binding_name(of, None), cfg.binding(of, None)) else {
+        return;
+    };
+    if let Some(u) = run.usage.last_mut() {
+        u.repaired = Some(Repaired {
+            role: of,
+            binding: binding.to_string(),
+            model: b.model.clone(),
+        });
+    }
+}
+
+/// Says when a binding's answers keep needing the Sizer to put them in
+/// form: a model that misses the format often costs a call each time, and
+/// may miss what's in it too.
+fn warn_repairs(run: &Run, caller: &dyn Caller) {
+    for r in super::report::repairs(&run.usage) {
+        if r.repairs >= REPAIR_WARN_MIN && r.share() > REPAIR_WARN_SHARE {
+            caller.say(&format!(
+                "round {}: {}. Its format instructions may need tightening, or its model \
+                 may suit another role better",
+                run.round,
+                r.line()
+            ));
+        }
+    }
 }
 
 /// The briefs in a briefer's answer. One written in prose is put in form
@@ -2447,7 +2556,11 @@ fn briefs_of(
     };
     let prompt = stages::reformat_briefs_prompt(text, lenses);
     let what = "the Sizer, putting briefs in form";
-    ask(run, s, caller, Role::Sizer, what, &prompt, None)
+    let repaired = ask(run, s, caller, Role::Sizer, what, &prompt, None);
+    if repaired.is_ok() {
+        mark_repair(run, s.cfg, Role::Orchestrator);
+    }
+    repaired
         .and_then(|text| stages::read_briefs(&text))
         .with_context(|| {
             format!("{unread:#}, and putting its briefs in the form asked didn't work either")
@@ -2457,14 +2570,21 @@ fn briefs_of(
 /// A reviewer's findings. One that reported in prose, not the JSON asked
 /// for, has its report put in that form by a quick call with the Sizer's
 /// binding, adding and dropping nothing: a review isn't thrown away over its
-/// format. A report that still can't be read is a failure, as before.
-fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> Result<Vec<Raw>> {
+/// format. A report that still can't be read is a failure, as before. The
+/// repair's call goes in `repairs`, marked as one, to be counted.
+fn findings_of(
+    caller: &dyn Caller,
+    cfg: &Config,
+    text: &str,
+    asked: &Call,
+    repairs: &std::sync::Mutex<Vec<Usage>>,
+) -> Result<Vec<Raw>> {
     let unread = match roles::read_findings(text) {
         Ok(found) => return Ok(found),
         Err(e) => e,
     };
     let prompt = roles::reformat_prompt(text);
-    let answer = caller.call(&Call {
+    let call = Call {
         role: Role::Sizer,
         binding_name: cfg.binding_name(Role::Sizer, None)?,
         binding: cfg.binding(Role::Sizer, None)?,
@@ -2474,7 +2594,11 @@ fn findings_of(caller: &dyn Caller, cfg: &Config, text: &str, asked: &Call) -> R
         no_tools: false,
         repo: asked.repo,
         label: format!("{}, put in form by the Sizer", asked.label),
-    })?;
+    };
+    let answer = caller.call(&call)?;
+    let mut spent = usage(cfg, &call, prompt.len(), &answer);
+    spent.repaired = Some(Repaired::of(asked));
+    lock_vec(repairs).push(spent);
     roles::read_findings(&answer.text).with_context(|| {
         format!("{unread:#}, and putting its report in the form asked didn't work either")
     })
@@ -2709,8 +2833,38 @@ fn share_facts(
     let prior = (run.round > 1)
         .then(|| facts::kept(&s.work_dir, run.round - 1))
         .flatten();
-    let built = facts::Facts::build(&run.repo, change, run.round, prior.as_ref().map(|(f, _)| f));
-    let text = built.render(run.round, Some(gate));
+    let built = facts::Facts::build(
+        run.reading(),
+        change,
+        run.round,
+        prior.as_ref().map(|(f, _)| f),
+    );
+    // The pull request's words, fetched again each round, since its
+    // comments can grow. gh runs in the checkout, whose remote names the
+    // repository.
+    let pr = match run.pr {
+        None => {
+            if run.round == 1 {
+                caller.say(&format!(
+                    "round {}: the facts carry no pull request's words: the review names no \
+                     pull request (--pr)",
+                    run.round
+                ));
+            }
+            None
+        }
+        Some(n) => match facts::fetch_pr(&run.repo, n) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                caller.say(&format!(
+                    "round {}: the facts carry no pull request's words: {e:#}",
+                    run.round
+                ));
+                None
+            }
+        },
+    };
+    let text = built.render_with(run.round, Some(gate), pr.as_ref());
     let path = facts::keep(&s.work_dir, run.round, &built, &text)?;
     if let Some((_, before)) = &prior {
         let p = facts::Prefix::new(
@@ -2721,8 +2875,16 @@ fn share_facts(
         caller.say(&format!("round {}: {}", run.round, p.line()));
         run.prefixes.push(p);
     }
+    let with_pr = pr.as_ref().map_or_else(String::new, |p| {
+        format!(
+            ", with pull request #{}'s words and {} issue(s)",
+            p.number,
+            p.issues.len()
+        )
+    });
     caller.say(&format!(
-        "round {}: the facts: {} file(s), {} bytes, ahead of every reviewer's and Judge's own text",
+        "round {}: the facts: {} file(s){with_pr}, {} bytes, ahead of every reviewer's and \
+         Judge's own text",
         run.round,
         built.files.len(),
         text.len()
@@ -2803,8 +2965,8 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     if run.round > 1 {
         choose_lenses(run, s, change, caller, &artifacts.diff)?;
     }
-    // Only an Orchestrator may change the checkout.
-    let before = caller.fingerprint(&run.repo);
+    // Only an Orchestrator may change what the review reads.
+    let before = caller.fingerprint(run.reading());
     // This round's copies, made from one copy set up once: the package
     // install and a first build. They stay when it ends, to be looked at.
     let round_dir = Copies::fresh(
@@ -2821,7 +2983,10 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     let warm = warm_copy(run, s, round_dir.0.as_deref());
     caller.say(&format!("round {}: {}", run.round, warm.said));
     let warm_note = warm.note.clone();
-    let source = warm.copy.clone().unwrap_or_else(|| run.repo.clone());
+    let source = warm
+        .copy
+        .clone()
+        .unwrap_or_else(|| run.reading().to_path_buf());
     let copying = Copying {
         dir: round_dir.0.as_deref(),
         source: &source,
@@ -2935,7 +3100,7 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
         .iter()
         .map(|(id, ..)| judgments.remove(id).flatten())
         .collect();
-    let changed = before.is_some() && caller.fingerprint(&run.repo) != before;
+    let changed = before.is_some() && caller.fingerprint(run.reading()) != before;
     let lines = stages::changed_lines(&change.diff);
     for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
         match judged {
@@ -3157,6 +3322,34 @@ fn settle(run: &mut Run, cfg: &Config) {
             }
         }
         run.stage = Stage::Fix;
+    }
+}
+
+/// Whether the first fix can go in. A review that read a copy of its
+/// commit has its fixes go into the checkout all the same, where its
+/// builder works, so the checkout must hold that commit, with nothing on
+/// top, by then. Until it does, a person is asked to check it out.
+fn ready_to_fix(run: &mut Run, s: &Setting) -> bool {
+    if run.head_copy.is_none() || run.fixed() {
+        return true;
+    }
+    match super::change::checked_out(
+        &run.repo,
+        &run.base,
+        run.head.as_deref(),
+        s.cfg.review_scope,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            escalate(
+                run,
+                format!(
+                    "The review read a copy of its commit, but its fixes go into the checkout: \
+                     {e:#} Then go on."
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -3577,9 +3770,19 @@ fn step(
             return Ok(false);
         }
         Stage::Fix if run.fixer == Fixer::Session => run.stage = Stage::Fixing,
-        Stage::Fix => fix(run, s, caller, reload)?,
+        Stage::Fix => {
+            if !ready_to_fix(run, s) {
+                pause(run, Gate::Escalation);
+                return Ok(false);
+            }
+            fix(run, s, caller, reload)?
+        }
         Stage::Fixing => {
             if run.fixing.is_none() {
+                if !ready_to_fix(run, s) {
+                    pause(run, Gate::Escalation);
+                    return Ok(false);
+                }
                 run.fixing = Some(Fixing {
                     from: caller.snapshot(&run.repo),
                 });
@@ -4028,6 +4231,8 @@ lenses:
             converge: false,
             stop_on_failure: false,
             copies: None,
+            head_copy: None,
+            pr: None,
             builder_brief: None,
         }
     }
@@ -4835,6 +5040,14 @@ lenses:
                 })
             });
             let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert!(
+                run.usage.iter().any(|u| u.role == Role::Sizer
+                    && u.repaired
+                        .as_ref()
+                        .is_some_and(|r| r.role == Role::Orchestrator)),
+                "{form}: {:?}",
+                run.usage
+            );
             let reasons: Vec<&str> = run.escalations.iter().map(|e| e.reason.as_str()).collect();
             if picked {
                 assert!(run.lenses.contains_key("gamma"), "{form}");
@@ -5294,6 +5507,117 @@ lenses:
     }
 
     #[test]
+    fn a_binding_whose_answers_keep_needing_repair_is_said_in_progress() {
+        let cfg = plain("exception", 3, 1);
+        let fake = Fake::new(|role, prompt: &str| match role {
+            Role::Reviewer => Ok("No findings, in prose.".into()),
+            Role::Sizer if prompt.contains("A reviewer wrote this report") => Ok(CLEAN.into()),
+            _ => Ok(NOTHING.into()),
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let counted = super::super::report::repairs(&run.usage);
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].repairs, counted[0].calls, "{counted:?}");
+        assert!(counted[0].repairs >= REPAIR_WARN_MIN);
+        let told = fake.told.lock().unwrap();
+        assert!(
+            told.iter()
+                .any(|t| t.contains("format repairs") && t.contains("format instructions")),
+            "{told:?}"
+        );
+    }
+
+    #[test]
+    fn a_review_reads_a_copy_of_its_commit_until_the_first_fix() {
+        let cfg = plain("exception", 2, 1);
+        let fake = Fake::new(|role, _: &str| match role {
+            Role::Reviewer => Ok(CLEAN.into()),
+            _ => Ok(NOTHING.into()),
+        });
+        let copy = std::env::temp_dir().join(format!("tb-acr-head-copy-{}", new_id()));
+        fs::create_dir_all(&copy).unwrap();
+        let mut s = setting(&cfg);
+        s.head_copy = Some(copy.clone());
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", Some("change"), &s, &c, &fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        assert_eq!(run.head_copy.as_deref(), Some(copy.as_path()));
+        // Every call worked in the copy, none in the checkout.
+        {
+            let repos = fake.repos.lock().unwrap();
+            assert!(
+                repos.iter().any(|(r, ..)| *r == Role::Reviewer),
+                "{repos:?}"
+            );
+            for (role, repo, _) in repos.iter() {
+                assert_eq!(repo, &copy, "{role:?} worked in {}", repo.display());
+            }
+        }
+        // After a fix, the review is of the checkout, where the fixes are.
+        assert_eq!(run.reading(), copy.as_path());
+        run.lenses
+            .values_mut()
+            .next()
+            .unwrap()
+            .done
+            .push("fixed".into());
+        assert_eq!(run.reading(), run.repo.as_path());
+        // Without a copy, it reads the checkout throughout.
+        run.head_copy = None;
+        run.lenses.values_mut().for_each(|l| l.done.clear());
+        assert_eq!(run.reading(), run.repo.as_path());
+        fs::remove_dir_all(&copy).ok();
+    }
+
+    #[test]
+    fn fixes_go_into_the_checkout_which_must_hold_the_reviewed_commit_first() {
+        use super::super::change::tests::{branch, commit, repo_with};
+        let cfg = plain("exception", 1, 1);
+        let s = setting(&cfg);
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        branch(&dir, "change");
+        commit(&dir, &[("a.txt", "two\n")], "two");
+        let checkout = |r: &str| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["checkout", "-q", r])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        checkout("main");
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r", "repo": dir, "base": "main", "head": "change",
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "fix",
+            "status": "running", "waiting": null, "lenses": {}, "escalations": [],
+            "disagreements": [], "usage": [], "head_copy": "/elsewhere/copy"
+        }))
+        .unwrap();
+        // The checkout is on another branch: a person is asked to check it out.
+        assert!(!ready_to_fix(&mut run, &s));
+        let said = run
+            .escalations
+            .last()
+            .map(|e| e.reason.clone())
+            .unwrap_or_default();
+        assert!(said.contains("its fixes go into the checkout"), "{said}");
+        assert!(
+            said.contains("change has to be what's checked out"),
+            "{said}"
+        );
+        // Checked out, the fixes can go in.
+        checkout("change");
+        assert!(ready_to_fix(&mut run, &s));
+        // A review that read the checkout all along was checked when it started.
+        checkout("main");
+        run.head_copy = None;
+        assert!(ready_to_fix(&mut run, &s));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_reviewer_that_reports_in_prose_is_put_in_form_not_failed() {
         let cfg = plain("exception", 3, 1);
         let prose = "Every scenario passed, so I have no findings.";
@@ -5316,6 +5640,39 @@ lenses:
         assert_eq!(run.status, Status::Confirmed);
         assert!(failures(&run).is_empty(), "{:?}", failures(&run));
         assert_eq!(*reformats.lock().unwrap(), 1);
+        // The repair is a call like any other, counted against the reviewer
+        // whose answer it put in form.
+        let repairs: Vec<&Usage> = run.usage.iter().filter(|u| u.repaired.is_some()).collect();
+        assert_eq!(repairs.len(), 1, "{:?}", run.usage);
+        assert_eq!(repairs[0].role, Role::Sizer);
+        assert!(
+            repairs[0]
+                .label
+                .as_deref()
+                .unwrap()
+                .ends_with("put in form by the Sizer")
+        );
+        let of = repairs[0].repaired.as_ref().unwrap();
+        assert_eq!(of.role, Role::Reviewer);
+        let counted = super::super::report::repairs(&run.usage);
+        let reviewer_calls = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Reviewer && u.binding == of.binding)
+            .count();
+        assert_eq!(counted.len(), 1);
+        assert_eq!((counted[0].repairs, counted[0].calls), (1, reviewer_calls));
+        // One in several isn't worth a word.
+        assert!(
+            !fake
+                .told
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.contains("format repairs")),
+            "{:?}",
+            fake.told.lock().unwrap()
+        );
         // A report that can't be put in form is still a failure.
         let fake = put_in_form("unreadable");
         let (run, _) = go(&cfg, &["a.src"], &fake);

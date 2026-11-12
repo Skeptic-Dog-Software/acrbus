@@ -278,13 +278,16 @@ since by then it holds the change's context.
 - **Shared facts.** Each round, acrbus maps the change with tools,
   not models: for each changed file, its definitions the change touches,
   where they're referenced (`git grep`), the tests that name them, and its
-  hunks; then the test gate's results. Every reviewer and Judge gets the
-  map in its system prompt, after ACR's own and before its own text, so
-  the provider's prompt cache serves it to all of a role's calls but the
-  first. Files a fix left alone come first, as they were, and those it
-  changed after them, so a round shares the last one's cached prefix up to
-  the first file a fix touched; the round's number and the gate's results
-  come last. The map is kept in the review's folder, as
+  hunks; then the test gate's results. With `--pr`, it carries the pull
+  request's words too, fetched with `gh` each round: its title,
+  description and the issues it links, ahead of the files, and its review
+  comments, which can grow, after the round's number. Every reviewer and
+  Judge gets the map in its system prompt, after ACR's own and before its
+  own text, so the provider's prompt cache serves it to all of a role's
+  calls but the first. Files a fix left alone come first, as they were,
+  and those it changed after them, so a round shares the last one's cached
+  prefix up to the first file a fix touched; the round's number, the
+  review comments and the gate's results come last. The map is kept in the review's folder, as
   `round-<n>.facts.md`. It goes to no call unless every agent the
   reviewers and the Judge are bound to can take it: pi reads it from a
   file; Claude Code and omp take it in the same argument as ACR's prompt,
