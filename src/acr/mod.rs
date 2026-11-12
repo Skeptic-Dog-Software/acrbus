@@ -189,6 +189,12 @@ pub enum AcrCmd {
         /// verdicts against the per-dimension ones and the key's.
         #[arg(long)]
         per_finding: bool,
+        /// Also try a first-pass Judge on this binding, as
+        /// `savings.first_pass_judge` would: its verdicts where it settles a
+        /// dimension, the Judge's where it sends it on, set against the key's.
+        /// Left out, the repository's `savings.first_pass_judge`, if any.
+        #[arg(long, value_name = "BINDING")]
+        first_pass: Option<String>,
     },
     /// Configure a repository's review from what's in it. The configurer, a
     /// strong model, reviews the whole repository, in a clone of its own, and
@@ -3194,9 +3200,10 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             keys,
             out,
             per_finding,
+            first_pass,
         } => {
             for key in keys {
-                let result = calibrate(paths, &key, per_finding)?;
+                let result = calibrate(paths, &key, per_finding, first_pass.as_deref())?;
                 println!(
                     "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
                     result["key"].as_str().unwrap_or_default(),
@@ -3217,6 +3224,22 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                         each["unrated"],
                         each["same_as_per_dimension"],
                         each["compared"],
+                    );
+                }
+                if let Some(each) = result.get("first_pass") {
+                    println!(
+                        "  with a first pass on {}: blockers agreed {}, missed {}, overrated {}; \
+                         non-blockers agreed {}; unrated {}; it settled {} of {} dimensions, \
+                         and sent {} on to the Judge",
+                        each["binding"].as_str().unwrap_or_default(),
+                        each["agreed_blockers"],
+                        each["missed_blockers"],
+                        each["overrated"],
+                        each["agreed_non_blockers"],
+                        each["unrated"],
+                        each["settled"],
+                        each["dimensions"],
+                        each["sent_on"],
                     );
                 }
                 if let Some(out) = &out {
@@ -3986,7 +4009,12 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     Ok(())
 }
 
-fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_json::Value> {
+fn calibrate(
+    paths: &Paths,
+    key_path: &Path,
+    per_finding: bool,
+    first_pass: Option<&str>,
+) -> Result<serde_json::Value> {
     use serde_json::json;
     let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
     if key.findings.is_empty() {
@@ -4038,6 +4066,21 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
     dimensions.sort();
     dimensions.dedup();
     let judge_name = cfg.binding_name(Role::Judge, None)?;
+    // The first pass to try, if any: named here, or the repository's.
+    let first_name = first_pass
+        .map(str::to_string)
+        .or_else(|| cfg.savings.first_pass_judge.clone());
+    let first = match &first_name {
+        Some(name) => Some((
+            name.as_str(),
+            cfg.allowed_bindings.get(name).with_context(|| {
+                format!("--first-pass: binding {name} isn't in your allowed_bindings")
+            })?,
+        )),
+        None => None,
+    };
+    let mut cascade: Vec<Option<(bool, String)>> = vec![None; key.findings.len()];
+    let (mut settled, mut sent_on, mut dimension_count) = (0usize, 0usize, 0usize);
     let keep_tags = "\n\nKeep each finding's title as it's given, with its [K..] tag, and judge \
                      each on its own: don't merge them.";
     let raw = |i: usize, f: &trial::KeyFinding| roles::Raw {
@@ -4123,6 +4166,45 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
             label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
         rule(&lens, roles::read_ratings(&answer.text)?, None, &mut judged);
+        dimension_count += 1;
+        if let Some((name, binding)) = first {
+            // The first pass on the same prompt, with its note. Where it
+            // settles the dimension its verdicts stand; where it sends it on,
+            // the Judge's, from the call above, stand.
+            let first_prompt = format!("{prompt}{}", roles::FIRST_PASS_NOTE);
+            let ratings = caller
+                .call(&Call {
+                    role: Role::Judge,
+                    binding_name: name,
+                    binding,
+                    prompt: &first_prompt,
+                    artifact: Some(&artifact),
+                    writes: false,
+                    no_tools: false,
+                    repo: &s.tree,
+                    label: format!("{}: the first-pass Judge, on the key's findings", lens.id),
+                })
+                .and_then(|a| roles::read_ratings(&a.text));
+            match ratings {
+                Ok(ratings)
+                    if !ratings
+                        .iter()
+                        .any(|r| flow::first_pass_escalates(&cfg, &lens, r, &lines)) =>
+                {
+                    settled += 1;
+                    rule(&lens, ratings, None, &mut cascade);
+                }
+                other => {
+                    if let Err(e) = other {
+                        eprintln!("{APP_NAME}: {}'s first pass: {e:#}", lens.id);
+                    }
+                    sent_on += 1;
+                    for (i, _) in &mine {
+                        cascade[*i] = judged[*i].clone();
+                    }
+                }
+            }
+        }
         if !per_finding {
             continue;
         }
@@ -4214,6 +4296,22 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
                 .collect::<Vec<_>>()
         );
         result["per_finding"] = alone;
+    }
+    if let Some(name) = &first_name {
+        let mut with = tally(&cascade);
+        with["binding"] = json!(name);
+        with["dimensions"] = json!(dimension_count);
+        with["settled"] = json!(settled);
+        with["sent_on"] = json!(sent_on);
+        with["differ_from_judge"] = json!(
+            key.findings
+                .iter()
+                .zip(judged.iter().zip(&cascade))
+                .filter(|(_, (a, b))| matches!((a, b), (Some(a), Some(b)) if a.0 != b.0))
+                .map(|(f, _)| f.id.clone())
+                .collect::<Vec<_>>()
+        );
+        result["first_pass"] = with;
     }
     Ok(result)
 }
