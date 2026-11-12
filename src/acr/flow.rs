@@ -16,9 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::proto::RunUsage;
 
 use super::change::{self, Change};
-use super::config::{
-    Action, Binding, Config, GateMode, HumanGate, Lens, Role, Severity, Stage as Kind,
-};
+use super::config::{Action, Binding, Config, GateMode, Lens, Role, Severity, Stage as Kind};
 use super::plan::{self, Why, tokens_in};
 use super::roles::{self, Raw};
 use super::stages;
@@ -93,6 +91,33 @@ pub enum Gate {
     Fold,
     Final,
     Escalation,
+    /// For the session that ran the review to fold in what was chosen, in
+    /// the working tree, and say so.
+    Fix,
+}
+
+impl Gate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gate::Scope => "scope",
+            Gate::Fold => "fold",
+            Gate::Final => "final",
+            Gate::Escalation => "escalation",
+            Gate::Fix => "fix",
+        }
+    }
+}
+
+/// Who folds in what a review upholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fixer {
+    /// A fresh agent on the Orchestrator's binding, which must write.
+    #[default]
+    Orchestrator,
+    /// The session, or person, that ran the review: it holds the change's
+    /// context, as the builder does in the in-session method.
+    Session,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +127,8 @@ pub enum Stage {
     Review,
     Decide,
     Fix,
+    /// The session that ran the review is fixing: see `Gate::Fix`.
+    Fixing,
     Final,
     Done,
 }
@@ -139,6 +166,13 @@ pub struct Finding {
     pub action: Action,
     pub reason: String,
     pub state: FindingState,
+    /// What a person said of it, for whoever fixes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// Another lens's finding this one is the same defect as: it's decided
+    /// and fixed with that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_as: Option<String>,
 }
 
 impl Finding {
@@ -194,6 +228,40 @@ pub struct Escalation {
     pub reason: String,
     /// A person has seen it.
     pub seen: bool,
+    /// What it's about, for the question it becomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<About>,
+}
+
+/// What an escalation is about, so that a person can answer it in kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum About {
+    /// A finding whose ruling is a person's call: a values call, a split,
+    /// or a Critical that was there before.
+    Finding { lens: String, finding: String },
+    /// A lens that didn't finish its work this round.
+    Unfinished { lens: String },
+    /// Lenses still blocked at `max_rounds`.
+    MaxRounds,
+    /// The Orchestrator couldn't fix what was folded in.
+    Unfixed,
+}
+
+/// A defect a person says the reviewers missed. It's folded in like a
+/// blocker, and the rounds after attack the fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reported {
+    pub id: String,
+    pub round: u32,
+    pub text: String,
+    pub fixed: bool,
+}
+
+/// A session's fixes under way: the checkout from before them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fixing {
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +352,19 @@ pub struct Run {
     /// What each steelman between rounds did, in order.
     #[serde(default)]
     pub steelmans: Vec<Steelman>,
+    /// Defects a person reported the reviewers missed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported: Vec<Reported>,
+    /// Who folds in what's upheld.
+    #[serde(default)]
+    pub fixer: Fixer,
+    /// The tier was raised at the scope gate, so the lenses are chosen
+    /// again before it's asked once more.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rescope: bool,
+    /// The session's fixes, while they're under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixing: Option<Fixing>,
 }
 
 /// A synthesis between rounds of a review to convergence: what the
@@ -436,10 +517,16 @@ fn record(run: &mut Run, cfg: &Config, call: &Call, input_bytes: usize, answer: 
 }
 
 fn escalate(run: &mut Run, reason: String) {
+    escalate_about(run, reason, None);
+}
+
+/// An escalation a person can answer in kind, as `about` says.
+fn escalate_about(run: &mut Run, reason: String, about: Option<About>) {
     if !run.escalations.iter().any(|e| e.reason == reason) {
         run.escalations.push(Escalation {
             reason,
             seen: false,
+            about,
         });
     }
 }
@@ -723,6 +810,20 @@ pub fn start(
         steelmans: Vec::new(),
         fix: None,
         sweep: false,
+        reported: Vec::new(),
+        // An Orchestrator that can't write leaves it to whoever ran the
+        // review, rather than to nobody.
+        fixer: if s
+            .cfg
+            .binding(Role::Orchestrator, None)
+            .is_ok_and(|b| b.writes)
+        {
+            Fixer::Orchestrator
+        } else {
+            Fixer::Session
+        },
+        rescope: false,
+        fixing: None,
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -730,7 +831,7 @@ pub fn start(
     if let Some(why) = plan::config_escalation(s.cfg, change) {
         escalate(&mut run, why);
     }
-    if s.cfg.human_gate == HumanGate::Ends {
+    if s.cfg.human_gate.asks_scope() {
         run.stage = Stage::Scope;
     }
     Ok(run)
@@ -1670,13 +1771,17 @@ fn rate(
         };
         let id = format!("{}-r{}-{}", lens.id, run.round, n + 1);
         if to_person {
-            escalate(
+            escalate_about(
                 run,
                 format!(
                     "{id} is Critical and was there before the change, which neither claims to \
                      fix it nor makes it worse, so it doesn't block: {}",
                     rating.title
                 ),
+                Some(About::Finding {
+                    lens: lens.id.clone(),
+                    finding: id.clone(),
+                }),
             );
         }
         if rating.split || (rating.values_call && severity == Severity::Rejected) {
@@ -1685,7 +1790,14 @@ fn rate(
             } else {
                 "a values call"
             };
-            escalate(run, format!("{what} on {id}: {}", rating.title));
+            escalate_about(
+                run,
+                format!("{what} on {id}: {}", rating.title),
+                Some(About::Finding {
+                    lens: lens.id.clone(),
+                    finding: id.clone(),
+                }),
+            );
             run.disagreements.push(Disagreement {
                 lens: lens.id.clone(),
                 finding: id.clone(),
@@ -1708,6 +1820,8 @@ fn rate(
                 format!("{} (outside this lens's criteria)", rating.reason)
             },
             state,
+            note: String::new(),
+            same_as: None,
         });
     }
     findings
@@ -1767,12 +1881,15 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             .iter()
             .any(|f| f.blocks() && f.state == FindingState::Open);
         for failure in &round.failures {
-            escalate(
+            escalate_about(
                 run,
                 format!(
                     "{id} wasn't fully checked in round {}: {failure}",
                     run.round
                 ),
+                Some(About::Unfinished {
+                    lens: id.to_string(),
+                }),
             );
         }
         gate_text = gate_report(&round);
@@ -1878,12 +1995,15 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             );
         }
         for failure in &round.failures {
-            escalate(
+            escalate_about(
                 run,
                 format!(
                     "{id} wasn't fully reviewed in round {}: {failure}",
                     run.round
                 ),
+                Some(About::Unfinished {
+                    lens: id.to_string(),
+                }),
             );
         }
         let confirmed = round.failures.is_empty()
@@ -1902,7 +2022,7 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
 }
 
 fn all_settled(run: &Run) -> bool {
-    run.lenses.values().all(|l| l.outcome != Outcome::Open)
+    run.lenses.values().all(|l| l.outcome != Outcome::Open) && run.reported.iter().all(|r| r.fixed)
 }
 
 /// What comes after a round.
@@ -1941,7 +2061,7 @@ fn settle(run: &mut Run, cfg: &Config) {
         }
     }
     if open.is_empty() {
-        run.stage = if cfg.human_gate == HumanGate::Ends {
+        run.stage = if cfg.human_gate.asks_final() {
             Stage::Final
         } else {
             Stage::Done
@@ -1951,9 +2071,10 @@ fn settle(run: &mut Run, cfg: &Config) {
     let blocked = run.lenses.values().any(|l| !l.blockers().is_empty());
     if run.round >= cfg.max_rounds {
         for id in &open {
-            escalate(
+            escalate_about(
                 run,
                 format!("{id} still has blockers at max_rounds ({})", cfg.max_rounds),
+                Some(About::MaxRounds),
             );
         }
         run.stage = Stage::Done;
@@ -1966,7 +2087,7 @@ fn settle(run: &mut Run, cfg: &Config) {
         run.stage = Stage::Review;
         return;
     }
-    if cfg.human_gate == HumanGate::PerRound {
+    if cfg.human_gate.asks_fold() {
         run.stage = Stage::Decide;
     } else {
         for lens in run.lenses.values_mut() {
@@ -1990,33 +2111,11 @@ fn fix(
     caller: &dyn Caller,
     reload: &dyn Fn(bool) -> Result<Change>,
 ) -> Result<()> {
-    // Each lens's latest round, if no steelman has had it yet.
-    let since = run.steelmans.last().map_or(0, |m| m.round);
-    let latest = |state: FindingState| -> Vec<(String, Finding)> {
-        run.lenses
-            .values()
-            .filter_map(|l| l.latest().map(|r| (l.id.clone(), r)))
-            .filter(|(_, r)| r.round > since)
-            .flat_map(|(id, r)| {
-                r.findings
-                    .iter()
-                    .filter(move |f| f.state == state)
-                    .map(move |f| (id.clone(), f.clone()))
-            })
-            .collect()
-    };
     // Only blockers: what's upheld without blocking goes to a person, since
     // folding it in grows the change, and gives the next round more to attack.
-    let folded = latest(FindingState::Folded);
-    let list = |findings: &[(String, Finding)]| -> String {
-        findings
-            .iter()
-            .map(|(_, f)| {
-                let at = f.file.as_deref().unwrap_or("somewhere in the change");
-                format!("- {} ({at}): {}\n  {}\n", f.id, f.title, f.detail)
-            })
-            .collect()
-    };
+    let folded = to_fix(run);
+    let reported: Vec<Reported> = run.reported.iter().filter(|r| !r.fixed).cloned().collect();
+    let list = |findings: &[(String, Finding)]| fix_list(findings, &reported);
     let writing = run.converge && s.cfg.stages.contains(&Kind::TestWriting);
     let intent = if run.converge {
         let fixed = run.lenses.values().any(|l| !l.done.is_empty());
@@ -2085,6 +2184,12 @@ fn fix(
                     lens.done.push(fixed.done.clone());
                 }
             }
+            for r in run.reported.iter_mut() {
+                r.fixed = true;
+            }
+            if !run.converge && !reported.is_empty() {
+                reopen_all(run);
+            }
             if run.converge {
                 let lens_of = |finding: &str| {
                     folded
@@ -2119,62 +2224,188 @@ fn fix(
                         m.tests_done = done;
                     }
                 }
-                // The change is a new version now. A lens attacks it again
-                // if the fixes touched what it covers, with the fixes as its
-                // focus; the rest wait for the sweep before it can end.
-                let delta = before_fix.as_deref().and_then(|from| {
-                    let to = caller.snapshot(&run.repo)?;
-                    caller.delta(&run.repo, from, &to)
-                });
-                run.sweep = false;
-                match delta {
-                    Some((files, diff)) => {
-                        let _ = fs::write(
-                            s.work_dir.join(format!("round-{}.fix.diff", run.round)),
-                            &diff,
-                        );
-                        let touched = Change {
-                            files: files.clone(),
-                            diff,
-                            ..Change::default()
-                        };
-                        run.fix = Some(FixDelta {
-                            round: run.round,
-                            files,
-                        });
-                        for lens in run.lenses.values_mut() {
-                            let applies = cfg
-                                .lenses
-                                .iter()
-                                .find(|l| l.id == lens.id)
-                                .and_then(|l| plan::lens_applies(l, &touched).ok().flatten())
-                                .is_some();
-                            if lens.outcome == Outcome::Confirmed && applies {
-                                lens.outcome = Outcome::Open;
-                            }
-                        }
-                    }
-                    None => {
-                        run.fix = None;
-                        for lens in run.lenses.values_mut() {
-                            if lens.outcome == Outcome::Confirmed {
-                                lens.outcome = Outcome::Open;
-                            }
-                        }
-                    }
-                }
+                refocus(run, s, caller, before_fix.as_deref());
             }
             run.round += 1;
             run.stage = Stage::Review;
         }
         Err(e) => {
-            escalate(
+            escalate_about(
                 run,
                 format!("the Orchestrator couldn't fix the blockers: {e:#}"),
+                Some(About::Unfixed),
             );
             run.stage = Stage::Done;
         }
     }
+    Ok(())
+}
+
+/// What's to be fixed, as the fixer reads it: each finding with what a
+/// person said of it, a finding that's the same defect as another listed
+/// once, and the defects a person reported the reviewers missed.
+fn fix_list(findings: &[(String, Finding)], reported: &[Reported]) -> String {
+    let mut out = String::new();
+    for (lens, f) in findings {
+        if f.same_as
+            .as_ref()
+            .is_some_and(|p| findings.iter().any(|(_, g)| &g.id == p))
+        {
+            continue;
+        }
+        let at = f.file.as_deref().unwrap_or("somewhere in the change");
+        out.push_str(&format!("- {} ({at}): {}\n  {}\n", f.id, f.title, f.detail));
+        let also: Vec<&str> = findings
+            .iter()
+            .filter(|(l, g)| g.same_as.as_deref() == Some(&f.id) && l != lens)
+            .map(|(l, _)| l.as_str())
+            .collect();
+        if !also.is_empty() {
+            out.push_str(&format!(
+                "  The same defect was found by: {}\n",
+                also.join(", ")
+            ));
+        }
+        if !f.note.is_empty() {
+            out.push_str(&format!("  Your user says: {}\n", f.note));
+        }
+    }
+    for r in reported {
+        out.push_str(&format!(
+            "- {} (your user found it; the reviewers missed it): {}\n",
+            r.id, r.text
+        ));
+    }
+    out
+}
+
+/// Every lens attacks again: what a person asks for, or what a defect
+/// nobody's lens found needs, since any lens could own it.
+pub(super) fn reopen_all(run: &mut Run) {
+    for lens in run.lenses.values_mut() {
+        if lens.outcome == Outcome::Confirmed {
+            lens.outcome = Outcome::Open;
+        }
+    }
+}
+
+/// The change is a new version after fixes. In a review to convergence, a
+/// lens attacks it again if the fixes touched what it covers, with the
+/// fixes as its focus; the rest wait for the sweep before it can end.
+/// Without the checkout from before the fixes, every lens attacks again.
+fn refocus(run: &mut Run, s: &Setting, caller: &dyn Caller, before: Option<&str>) {
+    let delta = before.and_then(|from| {
+        let to = caller.snapshot(&run.repo)?;
+        caller.delta(&run.repo, from, &to)
+    });
+    run.sweep = false;
+    match delta {
+        Some((files, diff)) => {
+            let _ = fs::write(
+                s.work_dir.join(format!("round-{}.fix.diff", run.round)),
+                &diff,
+            );
+            let touched = Change {
+                files: files.clone(),
+                diff,
+                ..Change::default()
+            };
+            run.fix = Some(FixDelta {
+                round: run.round,
+                files,
+            });
+            for lens in run.lenses.values_mut() {
+                let applies = s
+                    .cfg
+                    .lenses
+                    .iter()
+                    .find(|l| l.id == lens.id)
+                    .and_then(|l| plan::lens_applies(l, &touched).ok().flatten())
+                    .is_some();
+                if lens.outcome == Outcome::Confirmed && applies {
+                    lens.outcome = Outcome::Open;
+                }
+            }
+        }
+        None => {
+            run.fix = None;
+            reopen_all(run);
+        }
+    }
+}
+
+/// The blockers still to fix, by lens, from rounds no fix has had yet.
+fn to_fix(run: &Run) -> Vec<(String, Finding)> {
+    let since = run.steelmans.last().map_or(0, |m| m.round);
+    run.lenses
+        .values()
+        .filter_map(|l| l.latest().map(|r| (l.id.clone(), r)))
+        .filter(|(_, r)| r.round > since)
+        .flat_map(|(id, r)| {
+            r.findings
+                .iter()
+                .filter(|f| f.state == FindingState::Folded)
+                .map(move |f| (id.clone(), f.clone()))
+        })
+        .collect()
+}
+
+/// What the session that ran the review is to fix, as it reads it.
+pub fn fix_brief(run: &Run) -> String {
+    let reported: Vec<Reported> = run.reported.iter().filter(|r| !r.fixed).cloned().collect();
+    fix_list(&to_fix(run), &reported)
+}
+
+/// The session that ran the review has fixed what was folded in, in the
+/// working tree: the next round attacks the change as it is now, with the
+/// session's briefs for its lenses, if it wrote any.
+pub fn fixed_by_session(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    briefs: BTreeMap<String, String>,
+) -> Result<()> {
+    if run.waiting != Some(Gate::Fix) {
+        bail!(
+            "run {} isn't waiting for fixes{}",
+            run.id,
+            run.waiting
+                .map(|g| format!(": it's waiting at its {} gate", g.as_str()))
+                .unwrap_or_default()
+        );
+    }
+    let folded = to_fix(run);
+    let done = "fixed by the session that ran the review".to_string();
+    for (id, _) in &folded {
+        if let Some(lens) = run.lenses.get_mut(id)
+            && !lens.done.contains(&done)
+        {
+            lens.done.push(done.clone());
+        }
+    }
+    let reported = run.reported.iter().any(|r| !r.fixed);
+    for r in run.reported.iter_mut() {
+        r.fixed = true;
+    }
+    let from = run.fixing.take().and_then(|f| f.from);
+    if run.converge {
+        run.steelmans.push(Steelman {
+            round: run.round,
+            blockers: folded.iter().map(|(_, f)| f.id.clone()).collect(),
+            done,
+            declined: Vec::new(),
+            pins: Vec::new(),
+            tests_done: String::new(),
+            briefs,
+        });
+        refocus(run, s, caller, from.as_deref());
+    } else if reported {
+        reopen_all(run);
+    }
+    run.round += 1;
+    run.stage = Stage::Review;
+    run.status = Status::Running;
+    run.waiting = None;
     Ok(())
 }
 
@@ -2245,6 +2476,18 @@ fn step(
     }
     match run.stage {
         Stage::Scope => {
+            // A tier raised at the gate brings its lenses, which are asked
+            // about before any reviewer runs.
+            if run.rescope {
+                let change = reload(false)?;
+                let artifacts = write_artifact(s, run, &change, 0)?;
+                choose_lenses(run, s, &change, caller, &artifacts.diff)?;
+                run.rescope = false;
+                if unseen(run) {
+                    pause(run, Gate::Escalation);
+                    return Ok(false);
+                }
+            }
             pause(run, Gate::Scope);
             return Ok(false);
         }
@@ -2269,7 +2512,17 @@ fn step(
             pause(run, Gate::Fold);
             return Ok(false);
         }
+        Stage::Fix if run.fixer == Fixer::Session => run.stage = Stage::Fixing,
         Stage::Fix => fix(run, s, caller, reload)?,
+        Stage::Fixing => {
+            if run.fixing.is_none() {
+                run.fixing = Some(Fixing {
+                    from: caller.snapshot(&run.repo),
+                });
+            }
+            pause(run, Gate::Fix);
+            return Ok(false);
+        }
         Stage::Final => {
             pause(run, Gate::Final);
             return Ok(false);
@@ -2313,6 +2566,10 @@ pub fn decide(run: &mut Run, decision: &Decision) -> Result<()> {
             }
         }
         Gate::Fold => decide_blockers(run, decision)?,
+        Gate::Fix => bail!(
+            "this waits for the fixes: once they're in the working tree, resume with --fixed, \
+             or --stop"
+        ),
     }
     Ok(())
 }
@@ -4409,6 +4666,286 @@ lenses:
         };
         resume(&mut run, &cfg, &c, &fake, stop).unwrap();
         assert_eq!(run.status, Status::Stopped);
+    }
+
+    /// A person's answers to what the review asks now, by each question's
+    /// header, keyed as AskUserQuestion keys them: by the question's text.
+    fn answered(
+        run: &Run,
+        cfg: &Config,
+        by_header: &[(&str, serde_json::Value)],
+    ) -> BTreeMap<String, serde_json::Value> {
+        let ask = super::super::carousel::ask(run, cfg, "acrbus");
+        ask.carousels
+            .iter()
+            .flat_map(|c| &c.questions)
+            .filter_map(|q| {
+                by_header
+                    .iter()
+                    .find(|(h, _)| *h == q.header)
+                    .map(|(_, v)| (q.question.clone(), v.clone()))
+            })
+            .collect()
+    }
+
+    fn headers(run: &Run, cfg: &Config) -> Vec<String> {
+        let ask = super::super::carousel::ask(run, cfg, "acrbus");
+        assert!(
+            ask.carousels
+                .iter()
+                .all(|c| (1..=4).contains(&c.questions.len())),
+            "a carousel holds 1 to 4 questions"
+        );
+        ask.carousels
+            .iter()
+            .flat_map(|c| &c.questions)
+            .inspect(|q| {
+                assert!(q.header.chars().count() <= 12, "{}", q.header);
+                assert!((2..=4).contains(&q.options.len()), "{}", q.question);
+            })
+            .map(|q| q.header.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result() {
+        let cfg = plain("in-the-loop", 3, 1);
+        let fixed = std::sync::atomic::AtomicBool::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer
+                    if prompt.contains("alpha")
+                        && !fixed.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let again = c.clone();
+        let reload = move |_| Ok(again.clone());
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // The scope first, and who fixes, before any reviewer runs.
+        assert_eq!(run.waiting, Some(Gate::Scope));
+        assert_eq!(headers(&run, &cfg), ["Scope", "Fixer"]);
+        assert_eq!(fake.count(Role::Reviewer), 0);
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "This session".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert_eq!(run.fixer, Fixer::Session);
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // Then each blocker, and what the reviewers missed.
+        assert_eq!(run.waiting, Some(Gate::Fold));
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Missed"]);
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Blocker 1", "guard it with a lock".into()),
+                ("Missed", "the README still names the old flag".into()),
+            ],
+        );
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        // Each verdict and each missed defect is feedback for the calibration.
+        assert_eq!(applied.feedback.len(), 2, "{:?}", applied.feedback);
+        assert_eq!(
+            applied.feedback[0].note.as_deref(),
+            Some("To the fixer: guard it with a lock")
+        );
+        assert_eq!(
+            applied.feedback[1].missed.as_deref(),
+            Some("the README still names the old flag")
+        );
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // The session fixes, with the person's note and the missed defect.
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        assert_eq!(fake.count(Role::Orchestrator), 0, "nobody else fixes");
+        let brief = fix_brief(&run);
+        assert!(
+            brief.contains("alpha-r1-1")
+                && brief.contains("Your user says: guard it with a lock")
+                && brief.contains("you-1 (your user found it")
+                && brief.contains("the README still names the old flag"),
+            "{brief}"
+        );
+        assert!(
+            super::super::carousel::ask(&run, &cfg, "acrbus")
+                .then
+                .contains("acr resume r --fixed")
+        );
+        fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // Every lens attacks the fix, since a missed defect is nobody's lens's.
+        assert_eq!(run.round, 2);
+        assert!(run.lenses.values().all(|l| l.rounds.len() == 2));
+        assert!(run.reported.iter().all(|r| r.fixed));
+        // And the result is the person's to approve.
+        assert_eq!(run.waiting, Some(Gate::Final));
+        let a = answered(&run, &cfg, &[("Result", "Approve".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+    }
+
+    #[test]
+    fn a_values_call_is_the_persons_and_their_ruling_stands() {
+        let cfg = plain("exception", 3, 1);
+        let judged = std::sync::atomic::AtomicU32::new(0);
+        let fake =
+            Fake::new(|role, prompt: &str| match role {
+                Role::Reviewer if judged.load(std::sync::atomic::Ordering::SeqCst) < 2 => {
+                    Ok(ONE.into())
+                }
+                Role::Reviewer => Ok(CLEAN.into()),
+                Role::Judge => {
+                    judged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(r#"{"findings": [{"title": "t", "severity": "Rejected", "values_call": true,
+                    "sides": ["speed", "safety"]}]}"#
+                    .into())
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    Ok(r#"{"done": "fixed it"}"#.into())
+                }
+                _ => Ok(NOTHING.into()),
+            });
+        let (mut run, c) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert_eq!(headers(&run, &cfg), ["Values call", "Values call"]);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        let q = &ask.carousels[0].questions[0];
+        assert!(
+            q.question.contains("speed") && q.question.contains("safety"),
+            "{}",
+            q.question
+        );
+        assert!(
+            q.question.contains("It's ruled not to block"),
+            "{}",
+            q.question
+        );
+        // The person rules alpha's blocks, and beta's as the Judge did.
+        let mut a = BTreeMap::new();
+        for q in ask.carousels.iter().flat_map(|c| &c.questions) {
+            let call = if q.question.contains("alpha-r1-1") {
+                "It blocks"
+            } else {
+                "As ruled"
+            };
+            a.insert(q.question.clone(), serde_json::json!(call));
+        }
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        let verdicts: Vec<Option<super::super::configure::Verdict>> =
+            applied.feedback.iter().map(|f| f.verdict).collect();
+        assert!(verdicts.contains(&Some(super::super::configure::Verdict::ShouldBlock)));
+        assert!(verdicts.contains(&Some(super::super::configure::Verdict::Right)));
+        let raised = &run.lenses["alpha"].rounds[0].findings[0];
+        assert!(
+            raised.blocks() && raised.state == FindingState::Folded,
+            "{raised:?}"
+        );
+        assert_eq!(
+            run.lenses["beta"].rounds[0].findings[0].state,
+            FindingState::Dropped
+        );
+        // It's fixed, and the next round attacks the fix.
+        let s = setting(&cfg);
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert!(
+            fake.count(Role::Orchestrator) > 0,
+            "the Orchestrator fixes it"
+        );
+        assert!(run.round >= 2, "{:?}", run.status);
+    }
+
+    #[test]
+    fn the_person_can_stop_anywhere_and_must_answer_whats_asked() {
+        // Sized small, below the tier its paths would choose.
+        let cfg = {
+            let mut cfg = plain("in-the-loop", 3, 1);
+            for t in cfg.tiers.iter_mut() {
+                t.rule.paths.clear();
+            }
+            cfg
+        };
+        let fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Sizer => r#"{"tier": "small", "sure": true, "reason": "small"}"#.into(),
+                _ => CLEAN.to_string(),
+            })
+        });
+        let (mut run, c) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.waiting, Some(Gate::Scope));
+        assert_eq!(run.tier, "small");
+        // What's needed is said, by its header.
+        let err = format!(
+            "{:#}",
+            super::super::carousel::apply(&mut run, &cfg, &BTreeMap::new(), 1).unwrap_err()
+        );
+        assert!(err.contains("[Scope]") && err.contains("[Fixer]"), "{err}");
+        // Words of their own don't stand for a choice where none is offered.
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "sure, why not".into()),
+                ("Fixer", "This session".into()),
+            ],
+        );
+        let err = format!(
+            "{:#}",
+            super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap_err()
+        );
+        assert!(err.contains("choose one of Approve"), "{err}");
+        // A raised tier brings its lenses, and is asked about again.
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "One tier higher".into()),
+                ("Fixer", "This session".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert!(run.rescope);
+        assert_eq!((run.tier.as_str(), run.fan_out), ("big", 1));
+        let s = setting(&cfg);
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Scope));
+        assert!(!run.rescope);
+        // At the top tier, there's no higher one to offer.
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        assert!(
+            ask.carousels[0].questions[0]
+                .options
+                .iter()
+                .all(|o| o.label != "One tier higher")
+        );
+        // And stopping ends it, with no reviewer run.
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Stop the review".into()),
+                ("Fixer", "This session".into()),
+            ],
+        );
+        let applied = super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert!(applied.stopped);
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_ne!(run.status, Status::Waiting);
+        assert_eq!(fake.count(Role::Reviewer), 0);
     }
 
     #[test]

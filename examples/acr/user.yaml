@@ -22,7 +22,7 @@ allowed_bindings:
     tools: [read, grep, glob]
     writes: true    # the Orchestrator may apply fixes, in the repository
 defaults:
-  human_gate: exception
+  human_gate: in-the-loop
   # Every role needs a binding, here or in the repository's config.
   bindings:
     sizer: small

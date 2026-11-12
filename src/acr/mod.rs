@@ -3,6 +3,7 @@
 //! bindings all come from config, in `config`.
 
 mod calibration;
+mod carousel;
 mod carry;
 mod change;
 mod config;
@@ -332,9 +333,30 @@ pub enum AcrCmd {
         #[arg(long)]
         accept: bool,
     },
+    /// What a review waiting for a person asks them: its questions, as
+    /// question carousels in the shape AskUserQuestion takes, or with
+    /// `--text` as a numbered list. Answer with `acr resume <id> --answers`.
+    Ask {
+        run_id: String,
+        #[arg(long)]
+        text: bool,
+    },
     /// Carry on with a review that's waiting for a person.
     Resume {
         run_id: String,
+        /// The answers to `acr ask`'s questions, as a JSON object keyed by
+        /// each question's text: the JSON itself, `@<file>`, or `-` to read
+        /// it from stdin.
+        #[arg(long, value_name = "JSON", conflicts_with_all = ["fold", "waive", "approve", "fixed"])]
+        answers: Option<String>,
+        /// What the review waits for is fixed, in the working tree, by
+        /// whoever ran it: the next round attacks the change as it is now.
+        #[arg(long, conflicts_with_all = ["fold", "waive", "approve", "stop"])]
+        fixed: bool,
+        /// With `--fixed`: a builder's brief for the next round's lenses, on
+        /// what the fixes changed.
+        #[arg(long, value_name = "FILE", requires = "fixed")]
+        brief: Option<PathBuf>,
         /// Blockers to fix, by ID, with commas.
         #[arg(long, value_delimiter = ',')]
         fold: Vec<String>,
@@ -1314,6 +1336,147 @@ fn post(run: &Run, cfg: &Config, pr: u64) -> Result<()> {
     Ok(())
 }
 
+/// A person's answers: the JSON itself, `@<file>`, or `-` for stdin.
+fn read_answers(given: &str) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    let text = match given {
+        "-" => std::io::read_to_string(std::io::stdin()).context("reading the answers")?,
+        file if file.starts_with('@') => fs::read_to_string(&file[1..])
+            .with_context(|| format!("reading the answers from {}", &file[1..]))?,
+        json => json.to_string(),
+    };
+    serde_json::from_str(&text).context(
+        "the answers are a JSON object, each question's text mapped to its answer, as \
+         AskUserQuestion gives them",
+    )
+}
+
+/// Keeps a person's verdicts for the repository's calibration. A failure to
+/// keep them is said, and the review goes on.
+fn keep_feedback(paths: &Paths, run: &Run, feedback: &[configure::Feedback]) {
+    if feedback.is_empty() {
+        return;
+    }
+    let kept = change::name(&run.repo).and_then(|repo| {
+        feedback
+            .iter()
+            .try_for_each(|f| configure::add_feedback(&paths.state, &repo, f))
+    });
+    match kept {
+        Ok(()) => eprintln!(
+            "{APP_NAME}: kept {} verdict(s) as feedback: `{APP_NAME} acr calibrate` folds them \
+             into the config when you're ready.",
+            feedback.len()
+        ),
+        Err(e) => eprintln!("{APP_NAME}: couldn't keep your verdicts as feedback: {e:#}"),
+    }
+}
+
+/// Whether a person is at this terminal to ask.
+fn at_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// While the review waits for a person at this terminal, asks them, and
+/// carries on. A review run by an agent, or in the background, ends at the
+/// gate instead, for `acr ask` and `acr resume`.
+fn attend(
+    paths: &Paths,
+    run: &mut Run,
+    cfg: &Config,
+    s: &flow::Setting,
+    caller: &BridgeCaller,
+    reloading: &dyn Fn(bool) -> Result<change::Change>,
+) -> Result<()> {
+    while run.status == flow::Status::Waiting && at_terminal() {
+        save(paths, run, cfg)?;
+        let line = |prompt: &str| -> Result<String> {
+            eprint!("{prompt}");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(answer.trim().to_string())
+        };
+        if run.waiting == Some(flow::Gate::Fix) {
+            eprintln!(
+                "\n{APP_NAME}: fold these in, in the working tree:\n{}",
+                flow::fix_brief(run)
+            );
+            let answer = line("Press Enter once they're fixed, or type stop: ")?;
+            if answer.eq_ignore_ascii_case("stop") {
+                flow::decide(
+                    run,
+                    &Decision {
+                        stop: true,
+                        ..Decision::default()
+                    },
+                )?;
+            } else {
+                flow::fixed_by_session(run, s, caller, Default::default())?;
+            }
+        } else {
+            let ask = carousel::ask(run, cfg, &APP_NAME.to_string());
+            eprintln!("\n{}", ask.summary);
+            let mut answers = std::collections::BTreeMap::new();
+            for q in ask.carousels.iter().flat_map(|c| &c.questions) {
+                eprintln!("\n[{}] {}", q.header, q.question);
+                for (n, o) in q.options.iter().enumerate() {
+                    eprintln!("  {}) {}: {}", n + 1, o.label, o.description);
+                }
+                let hint = if q.multi_select {
+                    "numbers, with commas, or Enter for none"
+                } else {
+                    "a number, or your own words"
+                };
+                loop {
+                    let typed_in = line(&format!("Your answer ({hint}): "))?;
+                    match typed(q, &typed_in) {
+                        Some(value) => {
+                            answers.insert(q.question.clone(), value);
+                            break;
+                        }
+                        None if q.multi_select => break,
+                        None => eprintln!("Choose one, or say it in your own words."),
+                    }
+                }
+            }
+            match carousel::apply(run, cfg, &answers, crate::util::now_ms()) {
+                Ok(applied) => keep_feedback(paths, run, &applied.feedback),
+                Err(e) => {
+                    eprintln!("{APP_NAME}: {e:#}");
+                    continue;
+                }
+            }
+        }
+        flow::drive(run, s, caller, reloading)?;
+    }
+    Ok(())
+}
+
+/// What a person typed at the terminal, as an answer: numbers pick
+/// choices, and anything else is their own words.
+fn typed(q: &carousel::Question, text: &str) -> Option<serde_json::Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let picks: Option<Vec<String>> = text
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|n| q.options.get(n))
+                .map(|o| o.label.clone())
+        })
+        .collect();
+    match picks {
+        Some(labels) if q.multi_select => Some(serde_json::json!(labels)),
+        Some(labels) if labels.len() == 1 => Some(serde_json::json!(labels[0])),
+        _ => Some(serde_json::json!(text)),
+    }
+}
+
 /// Starts a review's progress log in its folder, and says where it is, and
 /// what in its bindings could cut its calls off.
 fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: &str) {
@@ -1376,36 +1539,41 @@ fn next_steps(run: &Run, cfg: &Config) -> String {
         (Status::Confirmed, _) => {
             format!("confirmed: every lens agrees. Its findings: `{APP_NAME} acr feedback {id}`.")
         }
-        (Status::Waiting, Some(flow::Gate::Scope)) => format!(
-            "waiting for you to approve its scope, tier {} ({}), before any reviewer runs: \
-             `{APP_NAME} acr resume {id} --approve`, or `--stop`.",
-            run.tier, run.tier_why
+        (Status::Waiting, Some(flow::Gate::Fix)) => format!(
+            "waiting for the fixes: fold what `{APP_NAME} acr ask {id}` lists into the working \
+             tree, then `{APP_NAME} acr resume {id} --fixed`, or `--stop`."
         ),
-        (Status::Waiting, Some(flow::Gate::Fold)) => format!(
-            "waiting for you to choose which blockers get fixed: {}. `{APP_NAME} acr resume \
-             {id} --fold <ids>`{}, `--waive <ids>`, or `--stop`. `{APP_NAME} acr feedback {id}` \
-             lists them with their IDs.",
-            blockers.join(", "),
-            if writes {
-                ""
-            } else {
-                " (the Orchestrator's binding can't write, so give it `writes: true` in acr.yaml for that)"
-            }
-        ),
-        (Status::Waiting, Some(flow::Gate::Final)) => format!(
-            "waiting for you to approve the result: `{APP_NAME} acr resume {id} --approve`, or `--stop`."
-        ),
-        (Status::Waiting, _) => {
-            let unseen: Vec<&str> = run
-                .escalations
-                .iter()
-                .filter(|e| !e.seen)
-                .map(|e| e.reason.as_str())
-                .collect();
+        (Status::Waiting, Some(gate)) => {
+            let what = match gate {
+                flow::Gate::Scope => format!(
+                    "to approve its scope, tier {} ({}), before any reviewer runs",
+                    run.tier, run.tier_why
+                ),
+                flow::Gate::Fold => format!(
+                    "to decide its blockers: {}{}",
+                    blockers.join(", "),
+                    if writes || run.fixer == flow::Fixer::Session {
+                        ""
+                    } else {
+                        " (the Orchestrator's binding can't write, so give it `writes: true` in \
+                         acr.yaml, or fix them yourself)"
+                    }
+                ),
+                flow::Gate::Final => "to approve the result".to_string(),
+                flow::Gate::Escalation | flow::Gate::Fix => {
+                    let unseen: Vec<&str> = run
+                        .escalations
+                        .iter()
+                        .filter(|e| !e.seen)
+                        .map(|e| e.reason.as_str())
+                        .collect();
+                    format!("on what it escalated: {}", unseen.join("; "))
+                }
+            };
             format!(
-                "waiting for you, escalated: {}. Read it, then `{APP_NAME} acr resume {id} \
-                 --approve` to go on, or `--stop`.",
-                unseen.join("; ")
+                "waiting for you {what}. `{APP_NAME} acr ask {id}` gives its questions, for a \
+                 question carousel, or as text with `--text`; answer with `{APP_NAME} acr resume \
+                 {id} --answers '<json>'`, or end it with `--stop`."
             )
         }
         (_, _) if blockers.is_empty() => format!(
@@ -1739,15 +1907,39 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let change = reload(&cfg, repo, base, head)?;
             let caller = BridgeCaller::new(paths)?;
             following(&caller, paths, &id, &cfg, "started");
+            if s.builder_brief.is_none() {
+                caller.note(
+                    "no builder's brief: the session that built the change knows best where it \
+                     could be wrong. Write one, as docs/acr-repo-setup.md's section 5a shows, and \
+                     pass it with --brief next time",
+                );
+            }
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
             flow::drive(&mut run, &s, &caller, &reloading)?;
+            attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
             return finish(paths, &run, &cfg, post_pr);
+        }
+        AcrCmd::Ask { run_id, text } => {
+            let dir = run_dir(paths, &run_id);
+            let read =
+                |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
+            let run: Run = serde_json::from_slice(&read("run.json")?)?;
+            let cfg: Config = stored_config(&read("config.json")?)?;
+            let ask = carousel::ask(&run, &cfg, &APP_NAME.to_string());
+            if text {
+                print!("{}", carousel::as_text(&ask));
+            } else {
+                println!("{}", serde_json::to_string_pretty(&ask)?);
+            }
         }
         AcrCmd::Resume {
             run_id,
+            answers,
+            fixed,
+            brief,
             fold,
             waive,
             approve,
@@ -1760,6 +1952,21 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
             let _active = keep::active_guard(paths, &run_id)?;
             let cfg: Config = stored_config(&read("config.json")?)?;
+            // A person's answers are applied, and their verdicts kept for the
+            // calibration, before anything is called.
+            let mut stop = stop;
+            let answered = answers.is_some();
+            if let Some(answers) = answers {
+                let applied = carousel::apply(
+                    &mut run,
+                    &cfg,
+                    &read_answers(&answers)?,
+                    crate::util::now_ms(),
+                )?;
+                keep_feedback(paths, &run, &applied.feedback);
+                stop |= applied.stopped;
+            }
+            let fixing = fixed || run.waiting == Some(flow::Gate::Fix);
             // Ending a review calls nothing and reads no code, so neither its
             // agents nor its checkout has to be as it was.
             if stop {
@@ -1770,7 +1977,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             } else {
                 // Until a fix, the review is of its head, which must be
                 // checked out.
-                if run.lenses.values().all(|l| l.done.is_empty()) {
+                if !fixing && run.lenses.values().all(|l| l.done.is_empty()) {
                     change::checked_out(
                         &run.repo,
                         &run.base,
@@ -1780,22 +1987,42 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 }
                 check_machine(paths, &cfg, &run.repo, true)?;
             }
-            let decision = Decision {
-                fold,
-                waive,
-                approve,
-                stop,
-            };
-            flow::decide(&mut run, &decision)?;
+            if !answered && !fixed {
+                let decision = Decision {
+                    fold,
+                    waive,
+                    approve,
+                    stop,
+                };
+                flow::decide(&mut run, &decision)?;
+            } else if stop {
+                flow::decide(
+                    &mut run,
+                    &Decision {
+                        stop,
+                        ..Decision::default()
+                    },
+                )?;
+            }
             let mut s = setting(paths, &cfg, &run_id, None)?;
             s.description = run.description.clone();
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
             following(&caller, paths, &run_id, &cfg, "resumed");
+            if fixed {
+                let briefs = brief
+                    .as_deref()
+                    .map(stages::read_builder_brief)
+                    .transpose()?
+                    .map(|b| b.lenses)
+                    .unwrap_or_default();
+                flow::fixed_by_session(&mut run, &s, &caller, briefs)?;
+            }
             let head = run.head.clone();
             let reloading =
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
             flow::drive(&mut run, &s, &caller, &reloading)?;
+            attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
             return finish(paths, &run, &cfg, post_pr);
         }
         AcrCmd::Benchmark { target, known } => {
@@ -2938,15 +3165,20 @@ mod tests {
         let none = serde_json::json!([]);
         let scope = next_steps(&run("waiting", Some("scope"), none.clone()), &cfg);
         assert!(
-            scope.contains("approve its scope, tier core") && scope.contains("resume r1 --approve"),
+            scope.contains("approve its scope, tier core")
+                && scope.contains("acr ask r1")
+                && scope.contains("acr resume r1 --answers"),
             "{scope}"
         );
         // The fold says how to let the Orchestrator fix, only where it can't.
         let fold = next_steps(&run("waiting", Some("fold"), none.clone()), &cfg);
         assert!(
-            fold.contains("--fold <ids>") && !fold.contains("writes: true"),
+            fold.contains("decide its blockers") && !fold.contains("writes: true"),
             "{fold}"
         );
+        // Waiting for the session's own fixes, it says how to say they're in.
+        let fix = next_steps(&run("waiting", Some("fix"), none.clone()), &cfg);
+        assert!(fix.contains("acr resume r1 --fixed"), "{fix}");
         let mut reads = cfg.clone();
         let name = reads
             .binding_name(Role::Orchestrator, None)
@@ -3237,6 +3469,9 @@ mod tests {
         save(&paths, &run, &cfg).unwrap();
         let resume = |stop: bool| AcrCmd::Resume {
             run_id: "r-stop".into(),
+            answers: None,
+            fixed: false,
+            brief: None,
             fold: Vec::new(),
             waive: Vec::new(),
             approve: !stop,
@@ -3386,6 +3621,40 @@ mod tests {
             "and never takes another's"
         );
         fs::remove_dir_all(paths.state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn what_a_person_types_at_the_terminal_is_their_answer() {
+        let q = |multi: bool| carousel::Question {
+            question: "q".into(),
+            header: "h".into(),
+            options: ["Fix it", "Not a defect", "None of them"]
+                .iter()
+                .map(|l| carousel::Choice {
+                    label: l.to_string(),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select: multi,
+        };
+        assert_eq!(
+            typed(&q(false), "2"),
+            Some(serde_json::json!("Not a defect"))
+        );
+        assert_eq!(
+            typed(&q(false), "use a lock"),
+            Some(serde_json::json!("use a lock"))
+        );
+        assert_eq!(
+            typed(&q(false), "9"),
+            Some(serde_json::json!("9")),
+            "out of range is words"
+        );
+        assert_eq!(
+            typed(&q(true), "1, 3"),
+            Some(serde_json::json!(["Fix it", "None of them"]))
+        );
+        assert_eq!(typed(&q(true), "  "), None);
     }
 
     #[test]

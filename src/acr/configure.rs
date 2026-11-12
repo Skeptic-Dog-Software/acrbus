@@ -361,6 +361,23 @@ pub struct Kept {
     pub state: String,
 }
 
+impl Kept {
+    /// A finding of `lens`'s, as it's kept and as feedback names it.
+    pub fn of(lens: &str, f: &super::flow::Finding) -> Kept {
+        Kept {
+            id: f.id.clone(),
+            lens: lens.to_string(),
+            title: f.title.clone(),
+            detail: f.detail.clone(),
+            file: f.file.clone(),
+            line: f.line,
+            severity: format!("{:?}", f.severity),
+            blocked: f.blocks(),
+            state: format!("{:?}", f.state).to_lowercase(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeptRun {
     pub run: String,
@@ -397,17 +414,7 @@ fn keep(
     for (lens, result) in lenses {
         for round in &result.rounds {
             for f in &round.findings {
-                let kept = Kept {
-                    id: f.id.clone(),
-                    lens: lens.clone(),
-                    title: f.title.clone(),
-                    detail: f.detail.clone(),
-                    file: f.file.clone(),
-                    line: f.line,
-                    severity: format!("{:?}", f.severity),
-                    blocked: f.blocks(),
-                    state: format!("{:?}", f.state).to_lowercase(),
-                };
+                let kept = Kept::of(lens, f);
                 match findings.iter_mut().find(|k| k.id == kept.id) {
                     Some(old) => *old = kept,
                     None => findings.push(kept),
@@ -858,6 +865,8 @@ mod tests {
             action,
             reason: String::new(),
             state,
+            note: String::new(),
+            same_as: None,
         }
     }
 

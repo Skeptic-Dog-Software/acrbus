@@ -69,8 +69,14 @@ impl Progress {
             state: paths.state.clone(),
             config: paths.config.clone(),
         };
+        // Tests drive real callers, and their lines aren't anyone's to read.
+        let out: Box<dyn Write + Send> = if cfg!(test) {
+            Box::new(std::io::sink())
+        } else {
+            Box::new(std::io::stderr())
+        };
         Progress::with(
-            Box::new(std::io::stderr()),
+            out,
             Box::new(move |agent, id| bridge::standing(&paths, agent, id)),
             EVERY,
         )
