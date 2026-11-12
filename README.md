@@ -232,6 +232,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 | `idle_secs` | How long a run can go quiet before its process tree is woken, and, if nothing stirs, ended and tried again in a fresh run, up to 3 tries in all. Default 1200; 0 turns it off. Either way, `acrbus bridge status` shows when each running request last used CPU or changed a file, which tells a slow run from a stalled one. |
 | `env`, `secrets` | More environment, and variables read from files only you can read. |
 | `attachments` | `"path"`, the default, tells the agent where each attachment is. `"inline"` puts each one's text in its message, for an agent that can read only its working directory, since attachments are kept outside it. |
+| `log_retention_days` | How long each run's log and folder are kept. Default 14. See [What's kept](#whats-kept). |
 
 | Placeholder | Is |
 | --- | --- |
@@ -242,6 +243,24 @@ path = "/usr/local/bin:/usr/bin:/bin"
 
 A bridge isn't a sandbox: the agent runs as you, with what its own settings
 allow.
+
+### What's kept
+
+Nothing a run or a review leaves is deleted as it finishes, so you can see
+what each agent did:
+
+- each run's log (`acrbus bridge log <agent> <id>`), and its folder under
+  `~/.local/state/acrbus/bridge/<agent>/runs/<id>`, a folder for each try,
+  with the agent's session, its scratch files and what it was sent;
+- a finished review's files, under `~/.local/state/acrbus/acr/<id>`. It
+  can't be resumed, but its record is there;
+- the copies reviewers, checks and the doctor worked in, and a trial's copy,
+  canary and sessions.
+
+The daemon clears them once an hour, when they're older than 14 days, or a
+bridge's `log_retention_days`, and nothing else does. A run still open stays
+however old, and a review waiting for you stays 30 days. Everything is under
+the state folder, which only you can read.
 
 ### Agents acrbus knows
 
@@ -282,6 +301,7 @@ judgment and fences nothing in. It says:
   script in, and it may fetch the tools and packages a review needs;
 - it never reads, sends or uses a credential;
 - it reads outside its working directory only what the review needs;
+- it doesn't read what earlier reviews and runs left;
 - it sends nothing anywhere but its answer, and leaves nothing behind;
 - when doing its role seems to need any of that, it says so, and you
   decide.

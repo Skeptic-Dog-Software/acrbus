@@ -229,6 +229,16 @@ pub fn ago(then: i64, now: i64) -> String {
     }
 }
 
+/// Whether `path` was last changed `age` ago or longer. Not, if it can't
+/// be told.
+pub fn older_than(path: &Path, age: std::time::Duration) -> bool {
+    fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|d| d >= age)
+}
+
 /// A log is cut back when it passes this, in bytes.
 pub const LOG_MAX: u64 = 1 << 20;
 /// What's kept of it: about the last this many bytes, from a line's start.

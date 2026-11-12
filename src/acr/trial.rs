@@ -1,10 +1,11 @@
 //! A blind trial of a review design on a change whose findings are known:
 //! the benchmark that says which design catches what, and at what cost.
 //!
-//! Each trial checks the change's head out in a throwaway worktree. It
+//! Each trial checks the change's head out in a worktree of its own. It
 //! runs the design with nobody in the loop, and has a scorer compare what
-//! it found with an answer key. It leaves nothing behind: the worktree,
-//! the temporary Claude config and its transcripts all go.
+//! it found with an answer key. What it leaves, the worktree, the temporary
+//! Claude config and its transcripts, stays to be looked at, until the
+//! daemon's cleanup clears it.
 //!
 //! This is tooling for measuring designs, so unlike the rest of ACR it
 //! names the agent it runs: headless Claude Code.
@@ -247,53 +248,31 @@ pub struct Converged {
     pub disagreements: Vec<super::flow::Disagreement>,
 }
 
-/// A trial's scratch folder and its copy of the change, removed however it
-/// ends.
+/// A trial's scratch folder and its copy of the change. They stay however
+/// it ends, with what its sessions left, until the daemon's cleanup clears
+/// them `cleanup::KEEP` later.
 pub(super) struct Scratch {
     pub dir: PathBuf,
     pub tree: PathBuf,
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// How long what a failed trial left is kept, to find out why.
-const KEPT_DAYS: u64 = 7;
-/// A trial folder older than this was left by one that was killed: none runs
-/// this long.
-const STALE_DAYS: u64 = 3;
-
 impl Scratch {
-    /// Keeps what the trial's sessions left, its transcripts and debug logs,
-    /// but not the copy, for `KEPT_DAYS`. Returns where, if any of it moved.
-    pub(super) fn keep(&self, paths: &Paths) -> Option<PathBuf> {
-        let kept = kept_dir(paths).join(self.dir.file_name()?);
-        fs::create_dir_all(&kept).ok()?;
-        let mut moved = false;
-        for entry in fs::read_dir(&self.dir).ok()?.flatten() {
-            let path = entry.path();
-            if path != self.tree && fs::rename(&path, kept.join(entry.file_name())).is_ok() {
-                moved = true;
-            }
-        }
-        moved.then_some(kept)
+    /// The error, saying where what the trial left is kept.
+    pub(super) fn failed(&self, e: anyhow::Error) -> anyhow::Error {
+        anyhow::anyhow!("{e:#}\n{}", self.kept())
     }
 
-    /// The error, saying where what the trial left is kept.
-    pub(super) fn failed(&self, paths: &Paths, e: anyhow::Error) -> anyhow::Error {
-        match self.keep(paths) {
-            Some(kept) => anyhow::anyhow!(
-                "{e:#}\nWhat its sessions left is kept in {} for {KEPT_DAYS} days.",
-                kept.display()
-            ),
-            None => e,
-        }
+    /// Where what the trial left is kept, and for how long.
+    pub(super) fn kept(&self) -> String {
+        format!(
+            "What it left is kept in {} for {} days.",
+            self.dir.display(),
+            crate::cleanup::KEEP_DAYS
+        )
     }
 }
 
+/// Where an acrbus before 0.1.16 kept what failed trials left.
 fn kept_dir(paths: &Paths) -> PathBuf {
     paths.state.join("acr-trials-kept")
 }
@@ -305,32 +284,31 @@ fn patches_dir(paths: &Paths) -> PathBuf {
     paths.state.join("acr-bench").join("converged")
 }
 
-/// Removes what failed trials left once it's past keeping, and the folders
-/// and canaries of trials that were killed.
-fn prune(paths: &Paths) {
+/// Removes trials' folders and canaries once they're past keeping, and the
+/// changes reviews to convergence left. The daemon's hourly cleanup calls
+/// it. Returns how many went.
+pub(super) fn prune(paths: &Paths) -> usize {
     let day = Duration::from_secs(24 * 3600);
-    let old = |path: &Path, days: u64| {
-        fs::symlink_metadata(path)
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day * days as u32))
-    };
     let places = [
-        (kept_dir(paths), KEPT_DAYS),
-        (paths.state.join("acr-trials"), STALE_DAYS),
-        (patches_dir(paths), PATCH_DAYS),
+        (kept_dir(paths), crate::cleanup::KEEP),
+        (paths.state.join("acr-trials"), crate::cleanup::KEEP),
+        (patches_dir(paths), day * PATCH_DAYS as u32),
     ];
-    for (dir, days) in places {
+    let mut gone = 0;
+    for (dir, age) in places {
         for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
-            if old(&path, days) {
-                let _ = if path.is_dir() {
+            if crate::util::older_than(&path, age) {
+                let removed = if path.is_dir() {
                     fs::remove_dir_all(&path)
                 } else {
                     fs::remove_file(&path)
                 };
+                gone += usize::from(removed.is_ok());
             }
         }
     }
+    gone
 }
 
 /// A file outside every folder a trial's sessions may read, holding a secret
@@ -348,12 +326,6 @@ impl Canary {
         let secret = format!("canary-{}", new_id());
         fs::write(&path, format!("{secret}\n"))?;
         Ok(Canary { path, secret })
-    }
-}
-
-impl Drop for Canary {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -396,7 +368,6 @@ pub(super) fn resolved(mut key: Key) -> Result<Key> {
 /// change turned out. It's named after the repository, so its review config
 /// is found.
 pub(super) fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
-    prune(paths);
     let dir = paths.state.join("acr-trials").join(new_id());
     fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
@@ -1101,7 +1072,7 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
         Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm),
         Arm::Separated | Arm::Converge => pipeline(&s.tree, &key, arm),
     }
-    .map_err(|e| s.failed(paths, e))?;
+    .map_err(|e| s.failed(e))?;
     // Kept apart from the copy, which goes, so the result can be audited.
     let converged = match ran.converged.take() {
         Some((mut c, patch)) => {
@@ -1125,7 +1096,7 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
             // The review is what cost the tokens, so it's saved unscored,
             // for `rescore`, rather than lost with the scorer.
             Err(e) => {
-                failures.push(unscored(&e, s.keep(paths).as_deref(), key_path));
+                failures.push(unscored(&e, &s, key_path));
                 None
             }
         }
@@ -1147,17 +1118,10 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
 
 /// Says a run wasn't scored, why, where the scorer's sessions are kept, and
 /// how to score it.
-fn unscored(e: &anyhow::Error, kept: Option<&Path>, key_path: &Path) -> String {
-    let kept = kept
-        .map(|k| {
-            format!(
-                " (its sessions are kept in {} for {KEPT_DAYS} days)",
-                k.display()
-            )
-        })
-        .unwrap_or_default();
+fn unscored(e: &anyhow::Error, s: &Scratch, key_path: &Path) -> String {
     format!(
-        "not scored: {e:#}{kept}; score it with `{APP_NAME} acr rescore {} --results <file>`",
+        "not scored: {e:#}. {} Score it with `{APP_NAME} acr rescore {} --results <file>`",
+        s.kept(),
         key_path.display()
     )
 }
@@ -1256,7 +1220,7 @@ pub fn residual(paths: &Paths, key: Key, defects: &[Defect]) -> Result<Value> {
                 limit: SCORER_TIMEOUT,
             },
         )
-        .map_err(|e| s.failed(paths, e))?;
+        .map_err(|e| s.failed(e))?;
         let value = last_json(&answer).context("the check's answer isn't JSON")?;
         for d in defects.iter().filter(|d| d.dimension == *dim) {
             let row = value["defects"]
@@ -1435,7 +1399,9 @@ mod tests {
         assert!(!out.status.success(), "the later commit is in the copy");
         let tree = s.tree.clone();
         drop(s);
-        assert!(!tree.exists(), "the copy goes when the trial ends");
+        assert!(tree.exists(), "the copy stays when the trial ends");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -1582,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_trial_keeps_what_its_sessions_left_but_not_the_copy() {
+    fn a_failed_trial_keeps_everything_it_left_and_says_where() {
         let dir = std::env::temp_dir().join(format!("tb-trial-kept-{}", new_id()));
         let paths = Paths {
             state: dir.join("state"),
@@ -1598,28 +1564,19 @@ mod tests {
             dir: trial.clone(),
             tree,
         };
-        let e = s.failed(&paths, anyhow::anyhow!("it broke"));
-        let said = format!("{e:#}");
+        let said = format!("{:#}", s.failed(anyhow::anyhow!("it broke")));
         assert!(
-            said.starts_with("it broke") && said.contains("kept in"),
+            said.starts_with("it broke") && said.contains(&trial.display().to_string()),
             "{said}"
         );
-        let kept = kept_dir(&paths).join(trial.file_name().unwrap());
+        drop(s);
+        // It all stays, the copy too, until the daemon's cleanup.
         assert_eq!(
-            fs::read_to_string(kept.join("builder/debug.txt")).unwrap(),
+            fs::read_to_string(trial.join("builder/debug.txt")).unwrap(),
             "where it stopped"
         );
-        assert!(!kept.join("repo").exists(), "the copy isn't kept");
-        drop(s);
-        assert!(!trial.exists());
-        // Nothing left to keep, and the error stands as it was.
-        let empty = paths.state.join("acr-trials").join(new_id());
-        fs::create_dir_all(empty.join("repo")).unwrap();
-        let s = Scratch {
-            tree: empty.join("repo"),
-            dir: empty,
-        };
-        assert_eq!(format!("{:#}", s.failed(&paths, anyhow::anyhow!("x"))), "x");
+        assert!(trial.join("repo/a.txt").exists());
+        assert_eq!(prune(&paths), 0, "not yet old");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1695,9 +1652,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(tried, SCORER_TRIES);
         assert!(err.to_string().contains("try 2"), "{err}");
+        let s = Scratch {
+            dir: PathBuf::from("/kept/x"),
+            tree: PathBuf::from("/kept/x/repo"),
+        };
         let note = unscored(
             &err.context("the scorer failed 2 times"),
-            Some(Path::new("/kept/x")),
+            &s,
             Path::new("/b/k.yaml"),
         );
         assert!(

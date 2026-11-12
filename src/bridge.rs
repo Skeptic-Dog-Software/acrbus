@@ -67,8 +67,6 @@ const RECV_SLOT: usize = 0;
 const RECV_MAX: usize = 20;
 /// Kept free in a cut reply, for a note a bus adds if it can't send the rest.
 const ROOM_FOR_A_NOTE: usize = 1024;
-/// How often old run logs are cleared.
-const LOG_PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// The pause after failing to reach the daemon.
 const RETRY: Duration = Duration::from_secs(3);
 /// How long the bridge keeps offering a reply the bus refuses. It may be
@@ -151,7 +149,8 @@ pub struct Settings {
     /// The most stderr a result carries, in bytes.
     #[serde(default = "default_stderr_tail")]
     pub stderr_tail_bytes: usize,
-    /// Days to keep each run's log.
+    /// Days to keep each run's log and folder, which the daemon's hourly
+    /// cleanup clears after them.
     #[serde(default = "default_log_retention")]
     pub log_retention_days: u32,
     /// What a request may ask for. Left out, it may ask for nothing.
@@ -283,7 +282,7 @@ fn default_stderr_tail() -> usize {
 }
 
 fn default_log_retention() -> u32 {
-    14
+    crate::cleanup::KEEP_DAYS
 }
 
 /// Why this machine's bridge for `agent` would refuse a request with these
@@ -1343,6 +1342,16 @@ struct Saved {
     ext: Option<Box<Extras>>,
 }
 
+/// The folder for try `attempt` at a request, under `runs`: named for the
+/// try, or the next one free, should a try's folder be there already, as
+/// one a stopped bridge left is.
+fn try_dir(runs: &Path, attempt: u32) -> PathBuf {
+    (attempt.max(1)..)
+        .map(|n| runs.join(n.to_string()))
+        .find(|dir| !dir.exists())
+        .unwrap_or_else(|| runs.join(new_id()))
+}
+
 /// Copies every transcript under a session's `projects` folder, as a
 /// Claude Code session leaves them, to `to`. Nothing, for an agent that
 /// keeps none there.
@@ -1474,6 +1483,54 @@ pub fn longest(paths: &Paths, agent: &str) -> Option<u64> {
 
 pub fn state_dir(paths: &Paths, agent: &str) -> PathBuf {
     paths.state.join("bridge").join(agent)
+}
+
+/// What the daemon's cleanup cleared of one bridge's files.
+#[derive(Debug, Default, PartialEq)]
+pub struct Swept {
+    /// Runs whose log and folder went.
+    pub runs: usize,
+    /// Whether `bridge.log` was cut back to its last lines.
+    pub log_cut: bool,
+}
+
+/// Clears what the bridge for `agent` keeps of its runs once its
+/// `log_retention_days` have passed: each run's log, and its folder, with
+/// the agent's session, scratch files and what it was sent. A run still
+/// open stays however old. The bridge itself removes none of it, so it can
+/// all be looked at: this is the daemon's hourly cleanup, and nothing else
+/// clears them.
+pub fn sweep(paths: &Paths, agent: &str) -> Swept {
+    let days =
+        load(paths, agent).map_or_else(|_| default_log_retention(), |s| s.log_retention_days);
+    sweep_dir(
+        &state_dir(paths, agent),
+        Duration::from_secs(u64::from(days) * 86_400),
+    )
+}
+
+/// `sweep`, of the bridge whose folder is `dir`, for runs older than `age`.
+fn sweep_dir(dir: &Path, age: Duration) -> Swept {
+    let open = |id: &str| dir.join("inflight").join(format!("{id}.json")).exists();
+    let mut gone = HashSet::new();
+    for sub in ["log", "runs"] {
+        for entry in fs::read_dir(dir.join(sub)).into_iter().flatten().flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !open(&id)
+                && crate::util::older_than(&entry.path(), age)
+                && fs::remove_dir_all(entry.path()).is_ok()
+            {
+                gone.insert(id);
+            }
+        }
+    }
+    Swept {
+        runs: gone.len(),
+        log_cut: matches!(
+            crate::util::trim_log(&dir.join("bridge.log"), LOG_MAX, LOG_KEEP),
+            Ok(true)
+        ),
+    }
 }
 
 fn read_report(paths: &Paths, agent: &str) -> Option<Report> {
@@ -1617,7 +1674,6 @@ struct Bridge {
     /// Replies and refusals on their way out, which mustn't hold up the
     /// receiver, so that a cancel always gets through.
     helpers: Mutex<Vec<thread::JoinHandle<()>>>,
-    logs_pruned: Mutex<Option<Instant>>,
     /// Every secret value seen, to keep out of logs and replies.
     secrets: Mutex<Vec<String>>,
     out: Mutex<Box<dyn Write + Send>>,
@@ -1686,7 +1742,6 @@ impl Bridge {
             changed: Condvar::new(),
             report: Mutex::default(),
             helpers: Mutex::default(),
-            logs_pruned: Mutex::default(),
             secrets: Mutex::new(secrets),
             out: Mutex::new(out),
         })
@@ -1730,7 +1785,6 @@ impl Bridge {
             "listening as {}: {mode}, up to {} at once, {}s timeout",
             self.agent, self.cfg.max_concurrent, self.cfg.timeout_secs
         ));
-        self.prune_logs();
         let workers: Vec<_> = (0..self.cfg.max_concurrent)
             .map(|_| {
                 let bridge = self.clone();
@@ -1887,7 +1941,8 @@ impl Bridge {
     // Picking up after a stopped bridge.
 
     /// Stops what a crashed bridge left running, so a message's next try
-    /// isn't running beside its last, and clears out its working files.
+    /// isn't running beside its last. What the runs left stays, to be looked
+    /// at: each try has a folder of its own.
     fn recover(&self) -> Result<()> {
         let inbox: Inbox = local::call(
             &self.socket,
@@ -1924,9 +1979,6 @@ impl Bridge {
                 self.forget(&id);
             }
         }
-        let runs = self.dir.join("runs");
-        fs::remove_dir_all(&runs)?;
-        fs::create_dir_all(&runs)?;
         Ok(())
     }
 
@@ -1961,35 +2013,6 @@ impl Bridge {
             body: text,
             ext: None,
         }))
-    }
-
-    /// Clears run logs past `log_retention_days`, at most once an hour.
-    fn prune_logs(&self) {
-        let mut pruned = lock(&self.logs_pruned);
-        if pruned.is_some_and(|t| t.elapsed() < LOG_PRUNE_EVERY) {
-            return;
-        }
-        *pruned = Some(Instant::now());
-        drop(pruned);
-        let log = self.dir.join("bridge.log");
-        if matches!(crate::util::trim_log(&log, LOG_MAX, LOG_KEEP), Ok(true)) {
-            self.log(format!("cut {} back to its last lines", log.display()));
-        }
-        let age = Duration::from_secs(u64::from(self.cfg.log_retention_days) * 86_400);
-        let Ok(entries) = fs::read_dir(self.dir.join("log")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|d| d >= age);
-            if old {
-                let _ = fs::remove_dir_all(entry.path());
-            }
-        }
     }
 
     // Taking messages.
@@ -2197,7 +2220,6 @@ impl Bridge {
     fn worker(&self) {
         while let Some(job) = self.next_job() {
             self.handle(&job);
-            self.prune_logs();
             let msg = &job.item.msg;
             let mut state = self.lock_state();
             if job.plan.session == SessionMode::PerSender {
@@ -2324,11 +2346,6 @@ impl Bridge {
             self.log(format!("couldn't save the reply to {}: {e:#}", msg.id));
         }
         self.send_reply(msg, &saved);
-        // A caller that keeps its own record asks for none here.
-        let options = msg.ext.as_ref().and_then(|e| e.options.as_ref());
-        if options.and_then(|o| o.log) == Some(false) {
-            let _ = fs::remove_dir_all(self.log_dir(&msg.id));
-        }
     }
 
     /// Sends a reply, which acknowledges the message. It keeps trying while
@@ -2429,12 +2446,14 @@ impl Bridge {
             )));
         }
         self.save_journal(&msg.id, &journal);
-        let run_dir = self.dir.join("runs").join(&msg.id);
+        let runs = self.dir.join("runs").join(&msg.id);
         let outcome = loop {
+            // Each try starts fresh in a folder of its own, and leaves it
+            // to be looked at: the daemon's cleanup clears it later.
+            let run_dir = try_dir(&runs, journal.attempts);
             let outcome = self
                 .run(job, &mut journal, &run_dir)
                 .unwrap_or_else(|e| Outcome::Finished(self.failed(format!("{e:#}"))));
-            let _ = fs::remove_dir_all(&run_dir);
             match outcome {
                 // Abandoned isn't the request's fault: run it again, fresh,
                 // while tries are left.
@@ -3495,12 +3514,21 @@ mod tests {
         let script = r#"n=$(cat "$HOME/tries" 2>/dev/null || echo 0)
             n=$((n + 1))
             echo $n > "$HOME/tries"
+            echo $n > "$2/try"
             [ $n -eq 1 ] && sleep 300
             echo "answered on try $n""#;
         let bridge = rig.start(rig.settings(script, "idle_secs = 1"));
         let id = rig.ask("hello");
         assert_eq!(rig.reply_to(&id), "answered on try 2");
         bridge.stop().unwrap();
+        // Each try had a folder of its own, and both stay to be looked at.
+        let runs = rig.state().join("runs").join(&id);
+        for n in ["1", "2"] {
+            assert_eq!(
+                fs::read_to_string(runs.join(n).join("try")).unwrap().trim(),
+                n
+            );
+        }
     }
 
     #[test]
@@ -3555,8 +3583,9 @@ mod tests {
         let dirs: Vec<&str> = seen.lines().collect();
         assert_eq!(dirs.len(), 2);
         assert_ne!(dirs[0], dirs[1]);
+        // Each stays, to be looked at, until the daemon's cleanup.
         for dir in dirs {
-            assert!(!Path::new(dir).exists(), "{dir} was left behind");
+            assert!(Path::new(dir).join("left").exists(), "{dir} wasn't kept");
         }
     }
 
@@ -3821,13 +3850,20 @@ mod tests {
                 leader_started: process_started(pid),
             },
         );
-        fs::create_dir_all(rig.state().join("runs").join(&id)).unwrap();
+        let first = rig.state().join("runs").join(&id).join("1");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("stdout"), "what the first try said").unwrap();
 
         let bridge = rig.start(rig.settings(r#"echo "answered $(cat)""#, ""));
         assert_eq!(rig.reply_to(&id), "answered again");
         assert!(left.wait().unwrap().signal().is_some());
         bridge.stop().unwrap();
-        assert!(!rig.state().join("runs").join(&id).exists());
+        // What the first try left stays, and the next ran in its own folder.
+        assert_eq!(
+            fs::read_to_string(first.join("stdout")).unwrap(),
+            "what the first try said"
+        );
+        assert!(rig.state().join("runs").join(&id).join("2").is_dir());
     }
 
     #[test]
@@ -4843,18 +4879,40 @@ mod tests {
     }
 
     #[test]
-    fn old_run_logs_go_after_their_retention() {
+    fn a_runs_log_and_folder_stay_until_the_cleanup_clears_them() {
         let rig = Rig::new();
-        let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
+        let settings = || rig.settings(r#"echo note > "$2/tmp/scratch"; echo out"#, "");
+        let bridge = rig.start(settings());
         let id = rig.ask("hello");
         rig.reply_to(&id);
         rig.wait_acked(&id);
         bridge.stop().unwrap();
-        let dir = rig.state().join("log").join(&id);
-        assert!(dir.exists());
-        let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
-        until("the log to go", || (!dir.exists()).then_some(()));
+        // A start clears nothing either.
+        let bridge = rig.start(settings());
         bridge.stop().unwrap();
+        let (log, run) = (
+            rig.state().join("log").join(&id),
+            rig.state().join("runs").join(&id),
+        );
+        assert!(log.join("stdout").exists());
+        assert!(
+            run.join("1/tmp/scratch").exists(),
+            "the agent's own files stay"
+        );
+        // One still open stays however old.
+        let open = new_id();
+        fs::create_dir_all(rig.state().join("runs").join(&open).join("1")).unwrap();
+        fs::write(
+            rig.state().join("inflight").join(format!("{open}.json")),
+            "{}",
+        )
+        .unwrap();
+        let swept = sweep_dir(&rig.state(), Duration::from_secs(3600));
+        assert_eq!(swept, Swept::default(), "not old yet");
+        let swept = sweep_dir(&rig.state(), Duration::ZERO);
+        assert_eq!(swept.runs, 1);
+        assert!(!log.exists() && !run.exists());
+        assert!(rig.state().join("runs").join(&open).exists());
     }
 
     #[test]
@@ -5024,7 +5082,7 @@ mod tests {
     }
 
     #[test]
-    fn a_caller_can_ask_for_no_log() {
+    fn a_run_is_logged_even_when_its_caller_asks_for_none() {
         let rig = Rig::new();
         let bridge = rig.start(rig.settings("echo out", ""));
         let id = rig.ask_with(with(RunOptions {
@@ -5035,14 +5093,9 @@ mod tests {
             rig.reply_item(&id).msg.result().unwrap().status,
             RunStatus::Ok
         );
-        let dir = rig.state().join("log").join(&id);
-        until("the log to go", || (!dir.exists()).then_some(()));
-        let kept = rig.ask("hello");
-        rig.reply_to(&kept);
-        assert!(
-            rig.state().join("log").join(&kept).exists(),
-            "others keep theirs"
-        );
+        rig.wait_acked(&id);
+        assert!(rig.state().join("log").join(&id).join("stdout").exists());
+        assert!(rig.state().join("runs").join(&id).join("1").is_dir());
         bridge.stop().unwrap();
     }
 

@@ -390,6 +390,19 @@ fn run_dir(paths: &Paths, id: &str) -> PathBuf {
     keep::dir(paths).join(id)
 }
 
+/// Refuses to go on with a review that's finished: its files stay a while,
+/// to be looked at, but it's over.
+fn not_finished(paths: &Paths, id: &str) -> Result<()> {
+    if keep::is_finished(paths, id) {
+        bail!(
+            "review {id} has finished. Its files are kept in {} until the daemon's cleanup \
+             clears them, but it can't go on: start a new one",
+            run_dir(paths, id).display()
+        );
+    }
+    Ok(())
+}
+
 fn flags(t: &Target) -> Flags {
     Flags {
         human_gate: t.human_gate,
@@ -1083,7 +1096,7 @@ fn doctor_tests(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
             ))),
         }
     }
-    let _ = fs::remove_dir_all(&root);
+    // The copy and its logs stay, to be looked at, until the daemon's cleanup.
     out
 }
 
@@ -1942,8 +1955,18 @@ pub fn check_user_config(text: &str) -> Result<()> {
     config::parse_user(text).map(|_| ())
 }
 
+/// The daemon's cleanup of what reviews leave: finished reviews' files,
+/// reviewers' and checks' copies, trials, and findings kept for feedback,
+/// once they're past keeping.
+/// Returns how many went.
+pub fn sweep(paths: &Paths) -> usize {
+    keep::prune(paths)
+        + flow::prune_copies(&copies_root(paths))
+        + trial::prune(paths)
+        + configure::prune_findings(&paths.state)
+}
+
 pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
-    keep::prune(paths);
     // Every role a review starts reads the system prompt this version has.
     if let Err(e) = crate::setup::keep_system_prompt(paths) {
         eprintln!("{APP_NAME}: couldn't keep ACR's system prompt: {e:#}");
@@ -2067,6 +2090,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             return finish(paths, &run, &cfg, post_pr);
         }
         AcrCmd::Ask { run_id, text } => {
+            not_finished(paths, &run_id)?;
             let dir = run_dir(paths, &run_id);
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
@@ -2090,6 +2114,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             stop,
             post_pr,
         } => {
+            not_finished(paths, &run_id)?;
             let dir = run_dir(paths, &run_id);
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
@@ -2566,12 +2591,14 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
                 .any(|a| a == "--settings")
         });
         let mut outside = false;
+        let mut run_id = None;
         let wrong = answer.map(|a| {
             let (wrong, read_outside) = outside_is_a_note(
                 trial::check_answer(&a.text, &key.head, &canary.secret, bash),
                 confined,
             );
             outside = read_outside;
+            run_id = (!wrong.is_empty()).then_some(a.run_id);
             wrong
         });
         let place = if in_copy {
@@ -2584,6 +2611,16 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             started,
             wrong,
         );
+        // Kept by its bridge, to see what the agent did.
+        if let Some(id) = run_id {
+            println!(
+                "  its run: `{APP_NAME} bridge log {bridge} {id}`, and its session in {}",
+                crate::bridge::state_dir(paths, bridge)
+                    .join("runs")
+                    .join(&id)
+                    .display()
+            );
+        }
         if outside {
             println!(
                 "  note: it can read files outside its folders. Nothing keeps this agent's \
@@ -2591,7 +2628,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             );
         }
     }
-    let _ = fs::remove_dir_all(&copies);
+    // The copies stay, to be looked at, until the daemon's cleanup.
     // A review to convergence's steelman, which writes in the copy.
     if let Some(b) = cfg.allowed_bindings.get(STEELMAN_BINDING) {
         let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
@@ -2624,7 +2661,6 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             }
             wrong
         });
-        let _ = fs::remove_file(&result);
         report(
             &format!("{STEELMAN_BINDING} through {}, writing", b.agent),
             started,
@@ -2632,11 +2668,8 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         );
     }
     drop(allowed);
-    if !ok && let Some(kept) = s.keep(paths) {
-        println!(
-            "What the builder's session left is kept in {}.",
-            kept.display()
-        );
+    if !ok {
+        println!("{}", s.kept());
     }
     Ok(ok)
 }
@@ -2913,18 +2946,6 @@ fn pipeline_arm(
     })
 }
 
-/// `acrbus acr calibrate`, for one key: its own review's findings, each
-/// tagged, go to the pipeline's Judge one dimension at a time, in a copy of
-/// the change, and its ratings are set against the review's.
-/// A folder that goes when this does.
-struct Gone(PathBuf);
-
-impl Drop for Gone {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// `acr configure` and `acr calibrate`: the configurer reviews the repository
 /// in a clone of its own, with its history, and proposes its review config,
 /// which waits beside the config for a person to read and accept. A
@@ -2975,7 +2996,8 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     };
     let folds = feedback.iter().map(|f| f.at).max();
     let root = copies_root(paths).join(format!("configure-{}", crate::util::new_id()));
-    let _gone = Gone(root.clone());
+    // The clone stays, with what the configurer did in it, until the
+    // daemon's cleanup.
     fs::create_dir_all(&root)?;
     let clone = root.join(&name);
     let cloned = std::process::Command::new("git")
@@ -3683,8 +3705,10 @@ mod tests {
         let err = format!("{:#}", super::run(&paths, resume(false)).unwrap_err());
         assert!(err.contains("has to be what's checked out"), "{err}");
         super::run(&paths, resume(true)).unwrap();
-        // Ended, and tidied away as a finished review is.
-        assert!(!run_dir(&paths, "r-stop").join("run.json").exists());
+        // Ended, and kept to be looked at, but it can't go on.
+        assert!(run_dir(&paths, "r-stop").join("run.json").exists());
+        let err = format!("{:#}", super::run(&paths, resume(true)).unwrap_err());
+        assert!(err.contains("has finished"), "{err}");
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());
         let _ = fs::remove_dir_all(&repo);
     }
