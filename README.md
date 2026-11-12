@@ -135,8 +135,9 @@ the config's schema in [schema/acr.schema.json](schema/acr.schema.json).
   it keeps of every run.
 - [Grayboard](docs/grayboard.md): answering a review's questions from
   Slack, and holding a claim on a change while it's reviewed.
-- [The bus](docs/bus.md): the message bus underneath, its commands, and
-  building your own program on acrbus.
+- [The bus](docs/bus.md): the message bus underneath, its commands, doors
+  for agents that run in other OS accounts, and building your own program
+  on acrbus.
 
 ## History
 

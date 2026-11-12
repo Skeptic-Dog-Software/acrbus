@@ -1933,6 +1933,11 @@ impl Bus {
                 Ok(to) if to.machine != me.machine => {
                     Some(format!("this is {}, not {}", me.machine, to.machine))
                 }
+                // A door agent takes requests from this machine's agents only.
+                Ok(to) if crate::door::is_door(&self.cfg, &to.agent) => Some(format!(
+                    "{} takes messages only from agents on {}",
+                    to.agent, me.machine
+                )),
                 _ if !valid_name(&from) => Some(format!("{from:?} isn't a valid agent name")),
                 _ if msg.body.len() > MAX_BODY => Some("the message is over 64 KiB".into()),
                 _ if msg.reply_to.as_deref().is_some_and(|r| !is_id(r)) => {
