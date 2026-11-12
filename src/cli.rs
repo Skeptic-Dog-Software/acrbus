@@ -171,22 +171,6 @@ enum Cmd {
         #[command(subcommand)]
         command: BridgeCmd,
     },
-    /// Run a command inside the fence its bridge wrote for the run: in
-    /// macOS's sandbox, reading and writing only the run's copy, reading its
-    /// history and toolchains, with no network and no secret. An agent's
-    /// tool layer runs each shell command through this, under a bridge with
-    /// [bridges.<agent>.fence]. Without a fence, it runs nothing.
-    Fence {
-        /// The command, run by /bin/sh -c.
-        #[arg(short = 'c', value_name = "COMMAND")]
-        command: Option<String>,
-        /// Check instead that a bridge's fence holds on this machine.
-        #[arg(long, value_name = "BRIDGE", conflicts_with = "command")]
-        check: Option<String>,
-        /// A program and its arguments, instead of -c.
-        #[arg(last = true, value_name = "PROGRAM")]
-        program: Vec<std::ffi::OsString>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -329,16 +313,6 @@ fn agent_name(explicit: Option<String>) -> Result<String> {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    // A fenced command runs with its agent's environment, which needs no
-    // bus and may have no state folder of this program's.
-    if let Cmd::Fence {
-        command,
-        check: None,
-        program,
-    } = cli.command
-    {
-        return crate::fence::run(command, program);
-    }
     let paths = Paths::find()?;
     paths.check_socket()?;
     let socket = paths.socket();
@@ -387,14 +361,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             ServiceCmd::Uninstall => setup::service_uninstall(&paths)?,
         },
         Cmd::Acr { command } => return acr::run(&paths, command),
-        Cmd::Fence { check, .. } => {
-            let agent = check.unwrap_or_default();
-            return Ok(if crate::fence::check_bridge(&paths, &agent)? {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            });
-        }
         Cmd::Bridge { command } => match command {
             BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
             BridgeCmd::Install { agent, now } => setup::bridge_install(&paths, &agent, now)?,
