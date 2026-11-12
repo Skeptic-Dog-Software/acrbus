@@ -236,6 +236,11 @@ pub struct Config {
     /// and that holds their claims. Left out, reviews never reach one.
     #[serde(default)]
     pub grayboard: Option<GrayboardConfig>,
+    /// Agents that run in another OS account and reach the bus only through
+    /// a door of their own: agent name to its door. A door agent takes
+    /// requests from agents on this machine and can only answer them.
+    #[serde(default)]
+    pub doors: std::collections::HashMap<String, DoorConfig>,
     /// Settings a network reads, such as the path to a CLI it runs: keys
     /// only the program's networks declare (`network::Kind::settings`).
     /// Anything else is refused when the config is loaded.
@@ -260,6 +265,19 @@ pub struct GrayboardConfig {
     /// How often, in seconds, the daemon checks for your answers.
     #[serde(default = "default_grayboard_poll")]
     pub poll_secs: u64,
+}
+
+/// `[doors.<agent>]` in config.toml: an agent in another OS account, and the
+/// socket it reaches the bus through.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoorConfig {
+    /// The OS account the agent runs as. Only its processes get through.
+    pub account: String,
+    /// The door's Unix socket. Its folder must already exist, belong to the
+    /// user the daemon runs as, and be writable by nobody else; the setup
+    /// lets the account reach into it (see the README's Doors).
+    pub socket: PathBuf,
 }
 
 /// `acr-<this machine's short host name>`, so two machines never take each
@@ -466,6 +484,26 @@ mod tests {
     }
 
     #[test]
+    fn a_door_names_its_account_and_socket() {
+        let cfg: Config = toml::from_str(
+            "[doors.open-source]\naccount = \"grayboard-oss\"\nsocket = \"/Users/Shared/acrbus-doors/open-source/door.sock\"",
+        )
+        .unwrap();
+        let door = &cfg.doors["open-source"];
+        assert_eq!(door.account, "grayboard-oss");
+        assert_eq!(
+            door.socket,
+            Path::new("/Users/Shared/acrbus-doors/open-source/door.sock")
+        );
+        cfg.check_settings(&ACRBUS).unwrap();
+        // A misspelled door setting is refused, not ignored.
+        assert!(
+            toml::from_str::<Config>("[doors.x]\naccount = \"a\"\nsocket = \"/s\"\nsockt = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn everything_is_optional() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.port, DEFAULT_PORT);
@@ -478,6 +516,7 @@ mod tests {
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.max_subagents, 5);
         assert!(cfg.bridges.is_empty());
+        assert!(cfg.doors.is_empty());
         assert_eq!(cfg.network, None, "the program's own network");
         assert!(cfg.machine.is_none() && cfg.owner.is_none());
         assert_eq!(cfg.max_attachment_bytes, 1 << 30);

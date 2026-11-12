@@ -15,6 +15,7 @@ mod cleanup;
 pub mod cli;
 pub mod config;
 mod daemon;
+mod door;
 mod format;
 mod grayboard;
 mod hook;
