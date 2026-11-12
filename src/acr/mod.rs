@@ -1061,6 +1061,11 @@ struct BridgeCaller {
     paths: Paths,
     /// What a person following the review is told as it goes.
     progress: progress::Progress,
+    /// The requests sent and not yet answered, and the file they're kept
+    /// in, so that stopping the review stops them too, even if this
+    /// process is gone by then.
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    calls_file: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1092,7 +1097,52 @@ impl BridgeCaller {
                 config: paths.config.clone(),
             },
             progress: progress::Progress::new(paths),
+            calls: Default::default(),
+            calls_file: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Keeps the requests in flight in `path`, and on a signal to stop,
+    /// cancels them on their bridges before it exits.
+    fn stops_calls(&self, path: PathBuf) {
+        *self.calls_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        let (socket, agent, calls) = (
+            self.socket.clone(),
+            self.agent.clone(),
+            std::sync::Arc::clone(&self.calls),
+        );
+        let watched = crate::bridge::on_stop_signal(move |_| {
+            let ids = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for id in &ids {
+                let _ = crate::call::cancel_run(&socket, &agent, id);
+            }
+            eprintln!(
+                "{APP_NAME}: stopped, and cancelled {} call(s) still at work.",
+                ids.len()
+            );
+            std::process::exit(130);
+        });
+        if let Err(e) = watched {
+            eprintln!("{APP_NAME}: stopping this review won't stop its calls: {e:#}");
+        }
+    }
+
+    /// A request sent, or answered: the list in flight, and its file.
+    fn in_flight(&self, id: &str, sent: bool) {
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        if sent {
+            calls.push(id.to_string());
+        } else {
+            calls.retain(|c| c != id);
+        }
+        if let Some(path) = self
+            .calls_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = fs::write(path, calls.join("\n"));
+        }
     }
 
     /// How long a call on `b` asks its bridge to let it run: its binding's
@@ -1237,6 +1287,9 @@ impl BridgeCaller {
         })?;
         let sent: Sent = client.reply()?;
         self.progress.sent(token, &sent.id);
+        self.in_flight(&sent.id, true);
+        let request = sent.id.clone();
+        let _answered = OnDrop(|| self.in_flight(&request, false));
         let awaited = match client.reply::<Awaited>() {
             Ok(awaited) => awaited,
             // The daemon went away mid-wait, as it does when it's updated.
@@ -1477,6 +1530,36 @@ fn typed(q: &carousel::Question, text: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Runs its closure when dropped, however the scope ends.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+/// Cancels the calls a review left at work when its process ended without
+/// them, such as on a kill, so that they don't hold their bridges.
+fn cancel_left(paths: &Paths, id: &str) {
+    let file = run_dir(paths, id).join("calls");
+    let Ok(text) = fs::read_to_string(&file) else {
+        return;
+    };
+    let socket = paths.socket();
+    let ids: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    for call in &ids {
+        let _ = crate::call::cancel_run(&socket, SENDER, call);
+    }
+    if !ids.is_empty() {
+        eprintln!(
+            "{APP_NAME}: cancelled {} call(s) review {id} left at work when it stopped.",
+            ids.len()
+        );
+    }
+    let _ = fs::remove_file(&file);
+}
+
 /// Starts a review's progress log in its folder, and says where it is, and
 /// what in its bindings could cut its calls off.
 fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: &str) {
@@ -1485,6 +1568,7 @@ fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: 
         let _ = fs::create_dir_all(dir);
     }
     caller.log_to(log.clone());
+    caller.stops_calls(run_dir(paths, id).join("calls"));
     caller.note(&format!(
         "review {id} {how}. It says what it's doing as it goes, at least once a minute, \
          here and in {}",
@@ -1950,7 +2034,14 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
+            if keep::active(paths).contains(&run_id) {
+                bail!(
+                    "review {run_id} is still running in another process: stop that first, \
+                     with Ctrl-C or a kill, which cancels its calls"
+                );
+            }
             let _active = keep::active_guard(paths, &run_id)?;
+            cancel_left(paths, &run_id);
             let cfg: Config = stored_config(&read("config.json")?)?;
             // A person's answers are applied, and their verdicts kept for the
             // calibration, before anything is called.
@@ -2018,6 +2109,10 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     .unwrap_or_default();
                 flow::fixed_by_session(&mut run, &s, &caller, briefs)?;
             }
+            // Under way again, as its record says to anyone who looks.
+            run.status = flow::Status::Running;
+            run.waiting = None;
+            save(paths, &run, &cfg)?;
             let head = run.head.clone();
             let reloading =
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
@@ -3655,6 +3750,26 @@ mod tests {
             Some(serde_json::json!(["Fix it", "None of them"]))
         );
         assert_eq!(typed(&q(true), "  "), None);
+    }
+
+    #[test]
+    fn a_review_keeps_its_calls_in_flight_so_stopping_it_stops_them() {
+        let paths = paths();
+        let caller = BridgeCaller::new(&paths).unwrap();
+        let dir = run_dir(&paths, "r-calls");
+        fs::create_dir_all(&dir).unwrap();
+        *caller.calls_file.lock().unwrap() = Some(dir.join("calls"));
+        caller.in_flight("one", true);
+        caller.in_flight("two", true);
+        caller.in_flight("one", false);
+        assert_eq!(fs::read_to_string(dir.join("calls")).unwrap(), "two");
+        drop(caller);
+        // A resume clears what a review that died left at work, even with
+        // no bus to tell, and leaves nothing to clear twice.
+        cancel_left(&paths, "r-calls");
+        assert!(!dir.join("calls").exists());
+        cancel_left(&paths, "r-calls");
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
     }
 
     #[test]
