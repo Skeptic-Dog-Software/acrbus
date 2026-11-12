@@ -5,7 +5,7 @@
 mod calibration;
 mod carousel;
 mod carry;
-mod change;
+pub(crate) mod change;
 mod config;
 mod configure;
 mod flow;
@@ -753,6 +753,12 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
                 took(longest)
             )));
         }
+        if let Ok(set) = crate::bridge::load(paths, bridge) {
+            let shells = cfg.chosen_bindings().iter().any(|(_, b)| {
+                b.agent.split_once('@').map(|(a, _)| a) == Some(bridge) && b.has_shell()
+            });
+            out.extend(doctor_fence(paths, bridge, &set, shells));
+        }
     }
     // Calibration.
     let decided = not_findings(&cfg, &source, repo, "HEAD").unwrap_or_default();
@@ -843,6 +849,39 @@ fn bridge_env(settings: &crate::bridge::Settings) -> Vec<(String, String)> {
 }
 
 /// Whether `command` succeeds in `dir` with only `env`.
+/// A command as a bridge's reviewers run it: through the bridge's fence,
+/// with a fence for `copy` written in `run_dir` as the bridge writes one,
+/// when it has a fence; as it is otherwise.
+fn fenced(
+    settings: &crate::bridge::Settings,
+    copy: &Path,
+    run_dir: &Path,
+    command: &str,
+    mut env: Vec<(String, String)>,
+) -> Result<(String, Vec<(String, String)>)> {
+    let Some(fence) = &settings.fence else {
+        return Ok((command.to_owned(), env));
+    };
+    fs::create_dir_all(run_dir)?;
+    let file = crate::fence::write_policy(run_dir, copy, &settings.path, fence)?;
+    for prefix in crate::config::app().env {
+        env.push((
+            format!("{prefix}_{}", crate::fence::POLICY_VAR),
+            file.display().to_string(),
+        ));
+    }
+    let bin = std::env::current_exe().context("finding this program, which runs the fence")?;
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    Ok((
+        format!(
+            "{} fence -c {}",
+            quote(&bin.display().to_string()),
+            quote(command)
+        ),
+        env,
+    ))
+}
+
 fn runs_with(dir: &Path, command: &str, env: &[(String, String)]) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -873,12 +912,56 @@ const TOOLCHAIN_OF: [(&str, &str, &str); 8] = [
 /// Whether reviewers who run things find the repository's toolchain, as
 /// their bridge runs them: tests that pass for you can't run for them
 /// without it.
+/// Whether a bridge fences its agent's shell, and whether that fence holds
+/// on this machine. A shell without one is said, not stopped: it's the
+/// person's call whether that matters here.
+fn doctor_fence(
+    paths: &Paths,
+    bridge: &str,
+    set: &crate::bridge::Settings,
+    shells: bool,
+) -> Vec<Said> {
+    let Some(fence) = &set.fence else {
+        return if shells {
+            vec![Said::Note(format!(
+                "the {bridge} bridge doesn't fence its agent's shell, so a reviewer's shell can \
+                 read and write anything you can, outside its copy: tokens and keys too. \
+                 [bridges.{bridge}.fence] fences it, for an agent whose tool layer runs each \
+                 command through `{APP_NAME} fence`"
+            ))]
+        } else {
+            Vec::new()
+        };
+    };
+    let scratch = paths.state.join(format!("fence-check-{}", new_id()));
+    match crate::fence::check(fence, &set.path, &scratch) {
+        Ok(wrong) if wrong.is_empty() => vec![Said::Ok(format!(
+            "the {bridge} bridge's fence holds here: a fenced command works in its copy, and \
+             reads, writes and reaches nothing else, and gets no secret. `{APP_NAME} acr check` \
+             shows whether its agent's shell goes through it"
+        ))],
+        Ok(wrong) => vec![Said::Fix(format!(
+            "the {bridge} bridge's fence doesn't hold here: {}",
+            wrong.join("; ")
+        ))],
+        Err(e) => vec![Said::Fix(format!(
+            "the {bridge} bridge's fence couldn't be checked: {e:#}"
+        ))],
+    }
+}
+
 fn doctor_toolchain(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
     let mut out = Vec::new();
     let Some((agent, settings)) = reviewers_bridge(paths, cfg) else {
         return out;
     };
     let env = bridge_env(&settings);
+    // Through its fence, when it has one, as its reviewers' commands run.
+    let scratch = paths.state.join(format!("fence-doctor-{}", new_id()));
+    let runs = |command: &str| {
+        fenced(&settings, repo, &scratch, command, env.clone())
+            .is_ok_and(|(command, env)| runs_with(repo, &command, &env))
+    };
     for (marker, tool, probe) in TOOLCHAIN_OF {
         if !repo.join(marker).is_file()
             || out.iter().any(
@@ -887,13 +970,13 @@ fn doctor_toolchain(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
         {
             continue;
         }
-        if runs_with(repo, probe, &env) {
+        if runs(probe) {
             out.push(Said::Ok(format!(
                 "reviewers find `{tool}` as the {agent} bridge runs them"
             )));
             continue;
         }
-        let found = runs_with(repo, &format!("command -v {tool}"), &env);
+        let found = runs(&format!("command -v {tool}"));
         let yours = Command::new("sh")
             .arg("-c")
             .arg(format!("command -v {tool}"))
@@ -925,6 +1008,7 @@ fn doctor_toolchain(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
             ),
         }));
     }
+    let _ = fs::remove_dir_all(&scratch);
     out
 }
 
@@ -1011,10 +1095,33 @@ fn doctor_tests(paths: &Paths, cfg: &Config, repo: &Path) -> Vec<Said> {
                 settings.home.display()
             )));
         }
+        let (command, env) = match fenced(&settings, &copy, &root, &command, env) {
+            Ok(fenced) => fenced,
+            Err(e) => {
+                out.push(Said::Fix(format!(
+                    "couldn't fence the tests as the {agent} bridge would: {e:#}"
+                )));
+                let _ = fs::remove_dir_all(&root);
+                return out;
+            }
+        };
         let (result, log) = ran("as-reviewers", &command, Some(&env));
+        let how = if settings.fence.is_some() {
+            "through its fence"
+        } else {
+            "with its HOME and PATH"
+        };
         match result {
             Ok(Some(true)) => out.push(Said::Ok(format!(
-                "the tests run as the {agent} bridge's reviewers would, with its HOME and PATH"
+                "the tests run as the {agent} bridge's reviewers would, {how}"
+            ))),
+            _ if settings.fence.is_some() => out.push(Said::Fix(format!(
+                "the tests pass for you but not through the {agent} bridge's fence, as its \
+                 reviewers would run them: the fence reads only the copy, the toolchains on its \
+                 path and the system. Add a toolchain or a filled cache under your home to \
+                 [bridges.{agent}.fence] `read`, and the variables that point at it to its \
+                 `env` ({})",
+                log.display()
             ))),
             _ => out.push(Said::Fix(format!(
                 "the tests pass for you but not as the {agent} bridge's reviewers would run them, \
@@ -2458,7 +2565,14 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         } else {
             s.tree.clone()
         };
-        let prompt = trial::check_prompt(&tree, &canary.path, bash, None);
+        // A fenced shell is asked to read outside its copy too, which shows
+        // whether the agent's shell really goes through the fence.
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent);
+        let fenced = bash
+            && crate::bridge::load(paths, bridge)
+                .ok()
+                .is_some_and(|s| s.fence.is_some());
+        let prompt = trial::check_prompt(&tree, &canary.path, bash, fenced, None);
         let started = std::time::Instant::now();
         let answer = caller.call(&Call {
             role: Role::Reviewer,
@@ -2474,10 +2588,11 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             ),
         });
         let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
-        let place = if in_copy {
-            ", in a copy of its own"
-        } else {
-            ""
+        let place = match (in_copy, fenced) {
+            (true, true) => ", in a copy of its own, its shell fenced",
+            (true, false) => ", in a copy of its own",
+            (false, true) => ", its shell fenced",
+            (false, false) => "",
         };
         report(
             &format!("{name} through {}{place}", b.agent),
@@ -2499,7 +2614,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             ..b.clone()
         };
         let result = s.tree.join(".acr-check-steelman.json");
-        let prompt = trial::check_prompt(&s.tree, &canary.path, true, Some(&result));
+        let prompt = trial::check_prompt(&s.tree, &canary.path, true, false, Some(&result));
         let started = std::time::Instant::now();
         let answer = caller.call(&Call {
             role: Role::Orchestrator,
@@ -3716,6 +3831,43 @@ mod tests {
             "and never takes another's"
         );
         fs::remove_dir_all(paths.state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_doctor_runs_a_fenced_bridges_reviewer_commands_through_its_fence() {
+        let dir = std::env::temp_dir().join(format!("tb-acr-fenced-{}", new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bridge = |fence: &str| -> crate::bridge::Settings {
+            toml::from_str(&format!(
+                "owner = \"o\"\ncommand = \"/bin/sh\"\nworking_directory = \"/tmp\"\n\
+                 home = \"/tmp/h\"\npath = \"/usr/bin:/bin\"\n{fence}"
+            ))
+            .unwrap()
+        };
+        let copy = dir.join("copy");
+        let plain = bridge("");
+        let (command, env) =
+            fenced(&plain, &copy, &dir.join("run"), "go test", Vec::new()).unwrap();
+        assert_eq!(command, "go test");
+        assert!(env.is_empty());
+        let fenced_bridge = bridge("fence = { network = \"none\" }");
+        let (command, env) = fenced(
+            &fenced_bridge,
+            &copy,
+            &dir.join("run"),
+            "echo it's",
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(command.ends_with(" fence -c 'echo it'\\''s'"), "{command}");
+        let file = env
+            .iter()
+            .find(|(k, _)| k == "ACRBUS_FENCE")
+            .map(|(_, v)| PathBuf::from(v))
+            .unwrap();
+        let text = fs::read_to_string(file).unwrap();
+        assert!(text.contains(&copy.display().to_string()), "{text}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

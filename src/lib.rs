@@ -14,6 +14,7 @@ mod call;
 pub mod cli;
 pub mod config;
 mod daemon;
+mod fence;
 mod format;
 mod hook;
 mod local;
