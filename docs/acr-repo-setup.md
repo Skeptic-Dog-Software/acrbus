@@ -314,8 +314,19 @@ since by then it holds the change's context.
   the role's binding, sent only when its bridge has a slot to spare, and
   counted apart from the roles' work. The provider's prompt cache is keyed
   to the review and the bridge and model, so every round's calls to one
-  model reach the same cache. `acrbus acr judge-check --per-finding` sets
-  per-finding verdicts against per-lens ones on a key, before you switch.
+  model reach the same cache. A provider that keeps a cache per replica,
+  such as Fireworks, routes by that key, so pi's calls send it three ways,
+  for a gateway in between that forwards only some of them: the
+  `x-session-affinity` header; `x-bf-eh-x-session-affinity`, which Bifrost
+  forwards as `x-session-affinity`, unless its allowlist leaves it out;
+  and the request's `user`, in an OpenAI chat request that sets none. Each
+  turn's cached prompt tokens, where the response says, are in the run's
+  stderr (`acrbus bridge log <agent> <id> --stderr`), as `acrbus cache:`
+  lines. pi rounds a thinking level its model doesn't have to one it does,
+  and says so there as `acrbus effort:`: GLM 5.3 on Fireworks has `low`,
+  `high` and `max`, so `medium` runs as `high`. `acrbus acr judge-check
+  --per-finding` sets per-finding verdicts against per-lens ones on a key,
+  before you switch.
 - **Plan's estimate.** `acrbus acr plan` counts only the text the review
   sends and reads back. `costs.per_call` adds a measured average for each
   role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to
