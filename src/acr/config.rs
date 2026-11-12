@@ -1116,7 +1116,8 @@ mod tests {
     fn the_go_example_is_valid() {
         let cfg = resolved(GO).unwrap();
         assert_eq!(cfg.human_gate, HumanGate::PerRound);
-        assert_eq!(cfg.review_scope, ReviewScope::BottomOfStack);
+        // A pull request merges whole, so it's reviewed whole.
+        assert_eq!(cfg.review_scope, ReviewScope::WholePr);
         // Its five, and elegance, which every repository gets.
         assert_eq!(cfg.lenses.len(), 6);
         assert!(cfg.lenses.iter().any(|l| l.id == ELEGANCE));

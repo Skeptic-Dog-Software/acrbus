@@ -155,6 +155,11 @@ acrbus acr run --repo <path> --base <base> --head <head>
 - **`--head`** is its last commit, and it must be checked out, with nothing
   on top. Leave the checkout alone until the review ends. Leave `--head` out
   to review the working tree.
+- **What's reviewed** is all of `<base>..<head>` as one diff, which is what
+  merging the pull request puts on the base. `review_scope: bottom-of-stack`
+  in the config, or `--review-scope bottom-of-stack` on a run, reviews only
+  the first commit after the base instead, and then that commit is the one
+  to check out.
 - **`plan`** shows the tier, the lenses and an estimate. The estimate counts
   only the text ACR sends and reads back. What agents' tools read adds more,
   often several times as much, so treat it as a floor.
