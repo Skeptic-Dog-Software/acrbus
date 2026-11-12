@@ -74,6 +74,18 @@ decides which lenses run and how many reviewers each gets, so a docs fix
 doesn't pay for a security review. `acrbus acr plan` shows the lenses and an
 estimate before anything runs, and every model call is counted.
 
+**It pays for what every call shares once.** Each round, tools map the
+change: each changed file's definitions, where they're referenced, the tests
+that name them, its hunks, and the test gate's results. That map goes to
+every reviewer and Judge in the system prompt, after ACR's own and ahead of
+anything that differs between their calls, with what a fix changed last, so
+the provider's prompt cache serves it to every call after the first, and
+each round after the first shares the last one's up to the first file a fix
+touched. A role's first call warms the cache before the rest start; a
+keep-alive refreshes a prefix still in use before it could be evicted; and
+the report gives each role's calls, fresh and cached tokens, dollars and
+times, and how many bytes each fan-out's calls share.
+
 **It survives its agents, and says what they're doing.** Each headless run
 gets an environment of its own, and a watch for going quiet: a run whose
 process tree stops using CPU and writing is woken, and if it can't be,

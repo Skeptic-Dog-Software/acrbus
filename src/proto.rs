@@ -88,6 +88,21 @@ pub struct RunOptions {
     /// only from its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<bool>,
+    /// Part of a review: a file of facts every call of the round shares, on
+    /// this machine, under the bus's state folder. The bridge gives it to
+    /// its agent ahead of the call's own text, where the agent takes a
+    /// system prompt, so the round's calls share a cached prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<String>,
+    /// Part of a review: the key the calls sharing a prefix send, so a
+    /// provider that needs it routes them to the same prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    /// Part of a review where every role on a bridge gets the same tools,
+    /// `tools`: the ones this call may use. Its agent refuses the rest when
+    /// they're called. Only an agent that can hold a call to them takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// A file held by its hash on each bus it reaches.

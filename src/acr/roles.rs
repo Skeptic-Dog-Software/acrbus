@@ -339,8 +339,168 @@ pub(super) const WAIT: &str = "Run a long command in the foreground, with a time
 /// decided. The attached file is the change: what's said about it, then its
 /// diff. Those are its claims; the reviewer gets nothing of the case made
 /// for them, and none of the rebuttals of earlier rounds.
-/// A reviewer's brief. One with `own_copy` works in a copy of the checkout
-/// that's its alone, and is told to settle doubts by running things there.
+/// Where a part of a prompt came from: what a role's input is made of, so a
+/// test can hold a reviewer to nothing a model wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// This version's own text, the same for every call of the role.
+    Fixed,
+    /// The repository's review config, which a person accepted.
+    Config,
+    /// Found by a tool: the gate's results, a scope or a path.
+    Tool,
+    /// Written by a model during the review: a brief.
+    Model,
+}
+
+/// A part of a prompt, with where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub source: Source,
+    pub text: String,
+}
+
+fn part(source: Source, text: impl Into<String>) -> Part {
+    Part {
+        source,
+        text: text.into(),
+    }
+}
+
+/// A keep-alive's whole brief: the role's cached prefix is what it's for.
+pub const KEEP_ALIVE: &str = "This call only refreshes the prompt cache: it isn't a task. Use no tool. Reply with the \
+     single word: ok";
+
+/// A prompt's parts, joined.
+pub fn join(parts: &[Part]) -> String {
+    parts.iter().map(|p| p.text.as_str()).collect()
+}
+
+/// What a reviewer's brief is made of, beyond the lens.
+pub struct ReviewerCall<'a> {
+    /// What's under review: the change from one commit to another.
+    pub scope: &'a str,
+    /// Decided non-issues, or "" for none: in facts-only mode, none.
+    pub not_findings: &'a str,
+    /// It works in a copy of its own, and can run things there.
+    pub own_copy: bool,
+    /// How to work in the repository, for a reviewer that runs things.
+    pub runbook: Option<&'a str>,
+    /// A brief written for this change, by its builder, the Orchestrator or
+    /// a steelman: leads, not findings.
+    pub brief: Option<&'a str>,
+    /// The test gate's results, this round.
+    pub gate: &'a str,
+}
+
+/// A reviewer's brief, in the cache's order: the role's own text, the same
+/// for every reviewer, then the lens's, then this call's. One with
+/// `own_copy` works in a copy of the checkout that's its alone, and is told
+/// to settle doubts by running things there.
+pub fn reviewer_parts(lens: &Lens, call: &ReviewerCall) -> Vec<Part> {
+    let attached = super::change::ATTACHED;
+    let mut parts = vec![part(
+        Source::Fixed,
+        format!(
+            "You are a reviewer of a change. Find what is wrong: assume defects exist until \
+             you've shown otherwise. {attached} What's said about it, and the comments and docs \
+             the change adds, are claims to check, not to take on trust: check them against the \
+             code and tests too, and report one they don't bear out. Report what's wrong in the \
+             code the change touches or relies on even if it was wrong before the change, and \
+             say it's pre-existing: that it isn't the change's doing doesn't make it not a \
+             finding.\n\n\
+             Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
+             \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find \
+             nothing, say so with an empty list.\n\n"
+        ),
+    )];
+    if let Some(r) = call.runbook.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(part(
+            Source::Config,
+            format!("# How to work in this repository\n\n{r}\n\n"),
+        ));
+    }
+    parts.push(part(
+        Source::Config,
+        format!(
+            "# Your lens\n\nYou are the reviewer for {id}. Attack the change in this lens, and \
+             nothing outside it. What wrong means here: {criteria}\n\n",
+            id = lens.id,
+            criteria = lens.criteria,
+        ),
+    ));
+    if let Some(b) = lens
+        .blocker
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        parts.push(part(Source::Config, format!("What blocks here: {b}\n\n")));
+    }
+    if let Some(a) = lens
+        .attack
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        parts.push(part(
+            Source::Config,
+            format!("# How to attack in this lens\n\n{a}\n\n"),
+        ));
+    }
+    parts.push(part(
+        Source::Tool,
+        format!("# This call\n\nScope: {}.\n\n", call.scope),
+    ));
+    parts.push(part(
+        Source::Fixed,
+        if call.own_copy {
+            format!(
+                "Your working directory is your own copy of the repository, as the change leaves \
+                 it, and nothing you do there reaches the change. Read any of it you need. Where \
+                 reading leaves a doubt, settle it by running something: the tests that cover the \
+                 change, a probe of what it claims, or a mutation, breaking the code a test should \
+                 guard to see whether the test fails. Report a test that still passes against \
+                 broken code. Nobody is here to grant a permission, so a shell command that would \
+                 need one is refused: name paths in full, not through variables or `$(...)`, and \
+                 put a probe of more than one step in a script, written with the Write tool and \
+                 run by its path. {WAIT}\n\n"
+            )
+        } else {
+            "Your working directory is the repository, as the change leaves it: read any of it \
+             you need, but change nothing.\n\n"
+                .to_string()
+        },
+    ));
+    if !call.gate.trim().is_empty() {
+        parts.push(part(Source::Tool, call.gate.to_string()));
+    }
+    if let Some(b) = call.brief.map(str::trim).filter(|b| !b.is_empty()) {
+        parts.push(part(
+            Source::Model,
+            format!(
+                "# Where to attack in this change\n\nFrom a brief written for this change: \
+                 leads, not findings, and what it says about the change is a claim to check, not \
+                 to take on trust.\n\n{b}\n\n"
+            ),
+        ));
+    }
+    let decided = call.not_findings.trim();
+    if !decided.is_empty() {
+        parts.push(part(
+            Source::Config,
+            format!("Not findings, which are already decided, so leave them out:\n{decided}\n\n"),
+        ));
+    }
+    parts.push(part(
+        Source::Fixed,
+        "Answer with only the JSON described above.",
+    ));
+    parts
+}
+
+/// A reviewer's brief, as one text. See [`reviewer_parts`].
+#[cfg(test)]
 pub fn reviewer_prompt(
     lens: &Lens,
     scope: &str,
@@ -348,52 +508,18 @@ pub fn reviewer_prompt(
     own_copy: bool,
     guide: &str,
 ) -> String {
-    let decided = match not_findings.trim() {
-        "" => "None.".to_string(),
-        text => text.to_string(),
-    };
-    // What blocks in this lens, from the repository's calibration.
-    let blocks = match lens.blocker.as_deref().map(str::trim) {
-        Some(b) if !b.is_empty() => format!("What blocks here: {b}\n\n"),
-        _ => String::new(),
-    };
-    let workdir = if own_copy {
-        format!(
-            "Your working directory is your own copy of the repository, as the change leaves \
-             it, and nothing you do there reaches the change. Read any of it you need. Where \
-             reading leaves a doubt, settle it by running something: the tests that cover the \
-             change, a probe of what it claims, or a mutation, breaking the code a test should \
-             guard to see whether the test fails. Report a test that still passes against \
-             broken code. Nobody is here to grant a permission, so a shell command that would \
-             need one is refused: name paths in full, not through variables or `$(...)`, and \
-             put a probe of more than one step in a script, written with the Write tool and run \
-             by its path. {WAIT}"
-        )
-    } else {
-        "Your working directory is the repository, as the change leaves it: read any of it \
-         you need, but change nothing."
-            .to_string()
-    };
-    let attached = super::change::ATTACHED;
-    format!(
-        "You are the reviewer for {id}. Find what is wrong: assume defects exist until \
-         you've shown otherwise.\n\n\
-         What wrong means here: {criteria}\n\n\
-         {blocks}\
-         Scope: {scope}. {attached} Attack that, and nothing outside \
-         this lens. What's said about it, and the comments and docs the change adds, are claims \
-         to check, not to take on trust: check them against the code and tests too, and \
-         report one they don't bear out. Report what's wrong in the code the change touches or relies on even if it \
-         was wrong before the change, and say it's pre-existing: that it isn't the change's \
-         doing doesn't make it not a finding. {workdir}\n\n\
-         {guide}\
-         Not findings, which are already decided, so leave them out:\n{decided}\n\n\
-         Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
-         \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find nothing, \
-         say so with an empty list.",
-        id = lens.id,
-        criteria = lens.criteria,
-    )
+    let parts = reviewer_parts(
+        lens,
+        &ReviewerCall {
+            scope,
+            not_findings,
+            own_copy,
+            runbook: None,
+            brief: None,
+            gate: guide,
+        },
+    );
+    join(&parts)
 }
 
 /// For a reviewer that reported in prose where it should have answered in
@@ -517,12 +643,116 @@ pub fn judge_hunks(hunks: &str) -> String {
     )
 }
 
-pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {
+/// A Judge's brief, in the cache's order: the role's own text, the same for
+/// every Judge, then the lens's, then this call's findings.
+pub fn judge_parts(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<Vec<Part>> {
+    let findings = serde_json::to_string_pretty(reviews)?;
+    Ok(judge_parts_for(
+        lens,
+        not_findings,
+        format!(
+            "The findings, from {n} reviewer(s), one list each:\n{findings}\n\n",
+            n = reviews.len()
+        ),
+        true,
+    ))
+}
+
+/// A Judge's brief for one finding: its claim and the lines it cites, and
+/// none of the reviewer's case for it, so no finding's framing reaches the
+/// ruling on another, and none of the reviewer's reasoning reaches this one.
+pub fn judge_finding_parts(lens: &Lens, claim: &Raw, cited: &str, not_findings: &str) -> Vec<Part> {
+    let claim = serde_json::json!({
+        "title": claim.title,
+        "file": claim.file,
+        "line": claim.line,
+    });
+    let cited = cited.trim();
+    let cited = if cited.is_empty() {
+        String::new()
+    } else {
+        format!("The lines it cites, to start from:\n\n```\n{cited}\n```\n\n")
+    };
+    judge_parts_for(
+        lens,
+        not_findings,
+        format!(
+            "One finding, by its claim alone, with the reviewer's reasoning left out: check it \
+             against the code yourself.\n{}\n\n{cited}",
+            serde_json::to_string_pretty(&claim).unwrap_or_default()
+        ),
+        false,
+    )
+}
+
+fn judge_parts_for(lens: &Lens, not_findings: &str, these: String, several: bool) -> Vec<Part> {
     let attached = super::change::ATTACHED;
-    // The lens's own definition of a blocker, from the repository's
-    // calibration, and the fact that says a finding meets it.
-    let (blocker, blocker_keys) = match lens.blocker.as_deref().map(str::trim) {
-        Some(b) if !b.is_empty() => (
+    let blocker_keys = if lens
+        .blocker
+        .as_deref()
+        .is_some_and(|b| !b.trim().is_empty())
+    {
+        ", \"meets_blocker\", \"blocker_clause\""
+    } else {
+        ""
+    };
+    let mut parts = vec![part(
+        Source::Fixed,
+        format!(
+            "You are a Judge of reviewers' findings about a change. {attached} Your working \
+             directory is the repository, as the change leaves it. Check each finding against \
+             the code. Change nothing in the repository: you repair nothing. To test a claim, \
+             you may write and run a script, but only under $TMPDIR, which is yours for this call \
+             and goes when it ends.\n\n\
+             Merge findings that are the same defect into one. Rate each by what it costs, given \
+             what the change says it's for: a defect that defeats that purpose, or a claim about \
+             meeting it that the code and tests don't bear out, costs more than the same defect \
+             elsewhere. Rate each as:\n\
+             - Critical: wrong result, data loss, security hole\n\
+             - High: real defect in a realistic case\n\
+             - Medium: real defect in a narrow case\n\
+             - Low: nit or unlikely edge case\n\
+             - Rejected: a decided non-issue, with the reason\n\n\
+             A real defect outside the lens's criteria is rated like any other, with `on_task` \
+             false: don't reject it for that.\n\n\
+             For each finding, also state these facts, each true or false, from the code: \
+             `real_defect`, it's a real defect, whatever caused it and whichever lens it belongs \
+             to: false only for something that isn't a defect at all. A missing test, or a \
+             comment, doc or ledger line that's incomplete, is a real defect: rate it Low if it's \
+             minor; `pre_existing`, the defect is in code as it was before the change, which the \
+             change didn't add or alter: a test or line the change adds is never pre-existing; \
+             `claims_fix`, the change says it fixes it; `worsens`, the change makes a \
+             pre-existing defect worse; `weak_pin`, it's a test the change adds or changes that \
+             can't fail when what it's there to pin breaks; `misleads`, it's a claim the change \
+             makes, in a comment, doc, ledger line or test name, that would lead someone relying \
+             on it to ship a defect or skip a test; with `weak_pin` give the test's name in \
+             `weak_pin_test`, and with `misleads` the claim's exact words in `misleading_claim`, \
+             both copied from lines the change adds: a fact without its quote counts as false; \
+             `equivalent_mutant`, only for a deliberate break of the code (a mutant) that the \
+             tests passed: true if that break changes nothing a user or caller could see, and \
+             false for every other finding. Fixed rules decide from these facts what blocks: rate \
+             the severity for what the defect costs on its own.\n\n\
+             Set split when the reviewers disagree about a finding. Set values_call when \
+             rejecting it comes down to values, not fact. Give both sides in `sides` when you set \
+             either.\n\n"
+        ),
+    )];
+    parts.push(part(
+        Source::Config,
+        format!(
+            "# The lens: {id}\n\nIts criteria: {criteria}\n\n",
+            id = lens.id,
+            criteria = lens.criteria,
+        ),
+    ));
+    if let Some(b) = lens
+        .blocker
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        parts.push(part(
+            Source::Config,
             format!(
                 "In this lens, a blocker is: {b}\nState `meets_blocker`, true if a finding is a \
                  blocker by that definition, and copy into `blocker_clause` the words of the \
@@ -530,58 +760,30 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
                  there before the change, which the change neither claims to fix nor makes worse, \
                  doesn't block whatever it meets.\n\n"
             ),
-            ", \"meets_blocker\", \"blocker_clause\"",
+        ));
+    }
+    parts.push(part(
+        Source::Config,
+        format!("# This call\n\nDecided non-issues:\n{not_findings}\n\n"),
+    ));
+    parts.push(part(
+        if several { Source::Model } else { Source::Tool },
+        these,
+    ));
+    parts.push(part(
+        Source::Fixed,
+        format!(
+            "Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
+             \"severity\", \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \
+             \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \
+             \"weak_pin_test\", \"misleads\", \"misleading_claim\", \"equivalent_mutant\"{blocker_keys}}}]}}."
         ),
-        _ => (String::new(), ""),
-    };
-    Ok(format!(
-        "Judge these findings from {n} reviewer(s) of the {id} lens. Its criteria: {criteria}\n\n\
-         {attached} Your working \
-         directory is the repository, as the change leaves it. Check each finding against the \
-         code. Change nothing in the \
-         repository: you repair nothing. To test a claim, you may write and run a script, but \
-         only under $TMPDIR, which is yours for this call and goes when it ends.\n\n\
-         Merge findings that are the same defect into one. Rate each by what it costs, given \
-         what the change says it's for: a defect that defeats that purpose, or a claim about \
-         meeting it that the code and tests don't bear out, costs more than the same defect \
-         elsewhere. Rate each as:\n\
-         - Critical: wrong result, data loss, security hole\n\
-         - High: real defect in a realistic case\n\
-         - Medium: real defect in a narrow case\n\
-         - Low: nit or unlikely edge case\n\
-         - Rejected: a decided non-issue, with the reason\n\n\
-         A real defect outside this lens's criteria is rated like any other, with `on_task` \
-         false: don't reject it for that.\n\n\
-         For each finding, also state these facts, each true or false, from the code: \
-         `real_defect`, it's a real defect, whatever caused it and whichever lens it belongs \
-         to: false only for something that isn't a defect at all. A missing test, or a \
-         comment, doc or ledger line that's incomplete, is a real defect: rate it Low if it's \
-         minor; `pre_existing`, the defect is in code as it was before the change, which the change \
-         didn't add or alter: a test or line the change adds is never pre-existing; \
-         `claims_fix`, the change says it fixes it; `worsens`, the change makes a pre-existing \
-         defect worse; `weak_pin`, it's a test the change adds or changes that can't fail when \
-         what it's there to pin breaks; `misleads`, it's a claim the change makes, in a \
-         comment, doc, ledger line or test name, that would lead someone relying on it to ship \
-         a defect or skip a test; with `weak_pin` give the test's name in `weak_pin_test`, \
-         and with `misleads` the claim's exact words in `misleading_claim`, both copied from \
-         lines the change adds: a fact without its quote counts as false; `equivalent_mutant`, only for a deliberate break of the code \
-         (a mutant) that the tests passed: true if that break changes nothing a user or caller \
-         could see, and false for every other finding. Fixed rules decide from these facts what \
-         blocks: rate the severity for what the defect costs on its own.\n\n\
-         {blocker}\
-         Decided non-issues:\n{not_findings}\n\n\
-         Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
-         comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
-         The reviewers' findings, one list each:\n{findings}\n\n\
-         Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
-         \"severity\", \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \
-         \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"weak_pin_test\", \
-         \"misleads\", \"misleading_claim\", \"equivalent_mutant\"{blocker_keys}}}]}}.",
-        n = reviews.len(),
-        id = lens.id,
-        criteria = lens.criteria,
-        findings = serde_json::to_string_pretty(reviews)?,
-    ))
+    ));
+    parts
+}
+
+pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {
+    Ok(join(&judge_parts(lens, reviews, not_findings)?))
 }
 
 pub fn read_ratings(text: &str) -> Result<Vec<Rating>> {

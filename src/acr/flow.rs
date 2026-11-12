@@ -5,7 +5,7 @@
 //! that fails leaves its lens open and goes to a person, because a review
 //! that didn't happen must never read as a clean one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::proto::RunUsage;
 
 use super::change::{self, Change};
-use super::config::{Action, Binding, Config, GateMode, Lens, Role, Severity, Stage as Kind};
+use super::config::{
+    Action, Binding, Config, GateMode, JudgeMode, Lens, ReviewerInput, Role, Severity,
+    Stage as Kind,
+};
 use super::plan::{self, Why, tokens_in};
 use super::roles::{self, Raw};
 use super::stages;
@@ -52,6 +55,40 @@ pub struct Answer {
     pub secs: Option<u64>,
 }
 
+/// A bridge and model: the calls that can share a cached prefix.
+pub type ToolGroup = (String, Option<String>);
+
+/// A round's shared facts, as its callers give them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shared {
+    /// The rendered facts, kept in the run's folder.
+    pub facts: PathBuf,
+    /// The run. Each call adds its bridge and model, for the cache's key:
+    /// every round's calls to one model reach the same replica, so a round
+    /// reads what the last one left in its cache.
+    pub key: String,
+    /// By bridge and model, the tools every reviewer's and Judge's call on
+    /// it is given when their roles' tools are matched: their union, sorted.
+    pub tools: BTreeMap<ToolGroup, Vec<String>>,
+    /// The agents the round's reviewers and Judge are bound to, each of
+    /// which must take the facts for any call to be given them.
+    pub agents: Vec<String>,
+}
+
+/// What a round's facts were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactsRound {
+    pub round: u32,
+    /// A hash of the rendered facts.
+    pub key: String,
+    pub bytes: u64,
+    pub files: u64,
+    /// The calls were given them: every agent the reviewers and the Judge
+    /// are bound to takes them.
+    #[serde(default)]
+    pub given: bool,
+}
+
 /// How a role reaches its model.
 pub trait Caller: Sync {
     fn call(&self, call: &Call) -> Result<Answer>;
@@ -63,6 +100,28 @@ pub trait Caller: Sync {
     /// Tells a person something that happened, without changing what it
     /// says it's doing: a lens with nothing for its Judge, say.
     fn say(&self, _what: &str) {}
+
+    /// The round's shared facts, for every reviewer's and Judge's call from
+    /// now on: given to the agent ahead of the call's own text. None stops.
+    /// True if it gives them: only then do the calls leave out what the
+    /// facts carry. A caller that can't give them to every agent the
+    /// round's calls go to gives them to none.
+    fn share(&self, _shared: Option<Shared>) -> bool {
+        false
+    }
+
+    /// Whether the call labelled `label` has filled the prompt cache yet:
+    /// its first answer has come, or its first tokens show. None if this
+    /// caller can't tell.
+    fn warmed(&self, _label: &str) -> Option<bool> {
+        None
+    }
+
+    /// Whether `binding`'s bridge has a slot to spare for a call no review
+    /// is waiting on, such as a keep-alive.
+    fn has_room(&self, _binding: &Binding) -> bool {
+        true
+    }
 
     /// What the checkout is now, to tell whether a role that may only read
     /// changed it. None if this caller can't say.
@@ -312,6 +371,16 @@ pub struct Usage {
     /// How long the call took, from sending it to its answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secs: Option<u64>,
+    /// What the call was, as progress named it: "correctness: reviewer 1".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The fan-out it was part of, such as "reviewers" or "judges", for the
+    /// cache's figures: the first call fills a prefix the rest should read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<String>,
+    /// It was its fan-out's first call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first: bool,
 }
 
 impl Usage {
@@ -327,6 +396,10 @@ pub fn dollars(usage: &[Usage]) -> Option<f64> {
     billed.peek()?;
     billed.map(|u| u.usd).sum()
 }
+
+/// The label of the Sizer's call that finds the defects more than one lens
+/// found, which a usage summary counts apart from its sizing.
+pub const DEDUPE: &str = "the Sizer, finding defects more than one lens found";
 
 /// A review, as far as it's got. It's all saved, so that it can stop for a
 /// person and carry on.
@@ -382,6 +455,13 @@ pub struct Run {
     /// The session's fixes, while they're under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixing: Option<Fixing>,
+    /// Each round's shared facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<FactsRound>,
+    /// What a fan-out's calls, and each round with the last, share at the
+    /// head of what they send.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<super::facts::Prefix>,
 }
 
 /// A synthesis between rounds of a review to convergence: what the
@@ -486,6 +566,9 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         subscription: call.binding.subscription,
         round: 0,
         secs: answer.secs,
+        label: Some(call.label.clone()),
+        fan_out: None,
+        first: false,
     };
     match &answer.usage {
         Some(counted) => {
@@ -636,7 +719,12 @@ impl Artifacts {
 fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result<Artifacts> {
     fs::create_dir_all(&s.work_dir)?;
     let mut intent = super::change::intent(s.description.as_deref(), &change.commits);
-    if let Some(brief) = &s.builder_brief {
+    // A model's account of the change, which facts-only reviewers don't get.
+    if let Some(brief) = s
+        .builder_brief
+        .as_ref()
+        .filter(|_| s.cfg.facts.reviewers == ReviewerInput::All)
+    {
         intent.push_str(&stages::scope_section(brief));
     }
     // What earlier commits and the docs say is said about the change too;
@@ -898,6 +986,8 @@ pub fn start(
         fix: None,
         sweep: false,
         reported: Vec::new(),
+        facts: Vec::new(),
+        prefixes: Vec::new(),
         // An Orchestrator that can't write leaves it to whoever ran the
         // review, rather than to nobody.
         fixer: if s
@@ -960,7 +1050,7 @@ enum Brief {
 /// What attacking a round gives back: each lens's reviewers' findings, and
 /// what its stages noted.
 /// A lens's Judge's answer, if it had findings to judge.
-type Judged = Option<Result<(Usage, Vec<roles::Rating>)>>;
+type Judged = Option<Result<(Vec<Usage>, Vec<roles::Rating>)>>;
 
 /// Each lens's reviewers' findings, its Judge's answer, and its notes.
 type Attacked = (
@@ -1094,7 +1184,12 @@ fn attack(
     // Round 1's lenses are briefed by the change's builder, if it wrote a
     // brief; the next round's, after a fix, by the steelman. The brief
     // stage covers any lens they left out.
-    let given: BTreeMap<String, String> = if run.round == 1 {
+    // Facts-only reviewers get nothing a model wrote: no brief is asked for,
+    // and none given.
+    let facts_only = cfg.facts.reviewers == ReviewerInput::FactsOnly;
+    let given: BTreeMap<String, String> = if facts_only {
+        BTreeMap::new()
+    } else if run.round == 1 {
         s.builder_brief
             .as_ref()
             .map(|b| b.lenses.clone())
@@ -1112,7 +1207,7 @@ fn attack(
         .cloned()
         .collect();
     let mut briefs: BTreeMap<String, String> =
-        if cfg.stages.contains(&Kind::Brief) && !unbriefed.is_empty() {
+        if cfg.stages.contains(&Kind::Brief) && !unbriefed.is_empty() && !facts_only {
             let lenses: Vec<stages::ToBrief> = unbriefed
                 .iter()
                 .map(|id| {
@@ -1181,11 +1276,14 @@ fn attack(
             continue;
         }
         // A reviewer that can run things gets the runbook too.
-        let guide = stages::guide(
-            lens.attack.as_deref(),
-            briefs.get(&lens.id).map(String::as_str),
-            cfg.runbook.as_deref().filter(|_| own),
-        ) + gate_text;
+        let brief_text = briefs.get(&lens.id).map(String::as_str);
+        let runbook = cfg.runbook.as_deref().filter(|_| own);
+        let not_findings = if facts_only {
+            ""
+        } else {
+            s.not_findings.as_str()
+        };
+        let guide = stages::guide(lens.attack.as_deref(), brief_text, runbook) + gate_text;
         // A mutation reviewer only proposes, so one is enough.
         let fan_out = if stage == Some(Kind::Mutation) {
             1
@@ -1208,14 +1306,24 @@ fn attack(
                 | Some(Kind::Brief)
                 | Some(Kind::Gate)
                 | Some(Kind::TestWriting) => Brief::Review {
-                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
+                    prompt: roles::join(&roles::reviewer_parts(
+                        lens,
+                        &roles::ReviewerCall {
+                            scope: &scope,
+                            not_findings,
+                            own_copy: own,
+                            runbook,
+                            brief: brief_text,
+                            gate: gate_text,
+                        },
+                    )),
                     repo,
                 },
                 Some(Kind::Claims) => Brief::Review {
                     prompt: stages::claims_prompt(
                         &stages::claims(change, s.description.as_deref()),
                         &scope,
-                        &s.not_findings,
+                        not_findings,
                         own,
                         &guide,
                     ),
@@ -1239,7 +1347,7 @@ fn attack(
                     Brief::Probe {
                         prompt: stages::probes_prompt(
                             &scope,
-                            &s.not_findings,
+                            not_findings,
                             command.as_deref(),
                             &guide,
                             &carried,
@@ -1295,8 +1403,52 @@ fn attack(
             ));
         })
     };
+    // The prompt cache's warm-up, for each role's fan-out: its first call
+    // goes alone until the cache holds the prefix the rest share.
+    let warm_secs = if cfg.facts.shared {
+        cfg.facts.warm_secs
+    } else {
+        0
+    };
+    let warm_reviewers = CacheWarm::new(warm_secs);
+    let warm_judges = CacheWarm::new(warm_secs);
+    let kept_alive: std::sync::Mutex<Vec<Usage>> = Default::default();
+    let judge_prompts: std::sync::Mutex<Vec<String>> = Default::default();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // What a fan-out's calls share at the head: ACR's system prompt, the
+    // facts, and as much of their own text as they have in common.
+    let facts_bytes = run
+        .facts
+        .iter()
+        .find(|f| f.round == run.round && f.given)
+        .map_or(0, |f| f.bytes as usize);
+    let head = if facts_bytes > 0 {
+        crate::setup::SYSTEM_PROMPT.len() + facts_bytes
+    } else {
+        0
+    };
+    if head > 0 {
+        let prompts: Vec<&str> = asks
+            .iter()
+            .filter_map(|(_, brief, _)| match brief {
+                Brief::Review { prompt, .. }
+                | Brief::Probe { prompt, .. }
+                | Brief::Mutate { prompt, .. } => Some(prompt.as_str()),
+                Brief::Fail(_) => None,
+            })
+            .collect();
+        if prompts.len() > 1 {
+            let p = super::facts::Prefix::new(
+                run.round,
+                "reviewers",
+                head + super::facts::common_prefix(&prompts),
+            );
+            caller.say(&format!("round {}: {}", run.round, p.line()));
+            run.prefixes.push(p);
+        }
+    }
     // One reviewer's work: its call, and whatever its stage runs after.
-    let review = |lens: &Lens, brief: &Brief, label: &String| -> Result<Done> {
+    let review = |lens: &Lens, brief: &Brief, label: &String, first: bool| -> Result<Done> {
         let artifact = artifacts.for_lens(lens);
         let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
         let binding = cfg.binding(Role::Reviewer, Some(lens))?;
@@ -1318,7 +1470,9 @@ fn attack(
             label: label.clone(),
         };
         let answer = caller.call(&call)?;
-        let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
+        let mut usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
+        usage.fan_out = Some("reviewers".into());
+        usage.first = first;
         match brief {
             Brief::Mutate { runs, command, .. } => {
                 let mutants = stages::read_mutants(&answer.text)?;
@@ -1349,9 +1503,37 @@ fn attack(
     };
     let judge_name = cfg.binding_name(Role::Judge, None)?;
     let judge = cfg.binding(Role::Judge, None)?;
-    let main = run.repo.clone();
+    let main_path = run.repo.clone();
+    let main: &Path = &main_path;
+    let (warm_reviewers, warm_judges, stop) = (&warm_reviewers, &warm_judges, &stop);
+    let (kept_alive, judge_prompts) = (&kept_alive, &judge_prompts);
+    // One Judge's call, after its fan-out's first has warmed the cache.
+    let judge_call = |prompt: &str, artifact: &Path, label: String| -> Result<(Usage, String)> {
+        let first = warm_judges.enter(&label, caller, "Judges");
+        let call = Call {
+            role: Role::Judge,
+            binding_name: judge_name,
+            binding: judge,
+            prompt,
+            artifact: Some(artifact),
+            writes: false,
+            no_tools: false,
+            repo: main,
+            label: label.clone(),
+        };
+        let answer = caller.call(&call);
+        warm_judges.done(&label);
+        let answer = answer?;
+        lock_vec(judge_prompts).push(prompt.to_string());
+        let mut usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
+        usage.fan_out = Some("judges".into());
+        usage.first = first;
+        Ok((usage, answer.text))
+    };
+    let judge_call = &judge_call;
     // Each lens's Judge starts once its own reviewers are done, not the
-    // slowest lens's: it sees only its own lens.
+    // slowest lens's: it sees only its own lens. Per finding, each finding
+    // gets a Judge of its own, given only its claim and the lines it cites.
     let rule = |lens: &Lens, results: &[Result<Done>]| -> Judged {
         let lists: Vec<Vec<Raw>> = results
             .iter()
@@ -1359,28 +1541,65 @@ fn attack(
             .collect();
         lists.iter().any(|l| !l.is_empty()).then(|| {
             let diff = artifacts.for_lens(lens);
-            // The hunks its findings point at, up front: a start, with the
-            // whole change attached and every tool its binding gives.
-            let hunks = fs::read_to_string(diff)
-                .ok()
-                .and_then(|text| change::hunks_for(&text, lists.iter().flatten()))
-                .map(|h| roles::judge_hunks(&h))
-                .unwrap_or_default();
-            let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)? + &hunks;
-            let call = Call {
-                role: Role::Judge,
-                binding_name: judge_name,
-                binding: judge,
-                prompt: &prompt,
-                artifact: Some(diff),
-                writes: false,
-                no_tools: false,
-                repo: &main,
-                label: format!("{}: the Judge", lens.id),
-            };
-            let answer = caller.call(&call)?;
-            let usage = usage(cfg, &call, input_bytes(&prompt, Some(diff)), &answer);
-            Ok((usage, roles::read_ratings(&answer.text)?))
+            let text = fs::read_to_string(diff).ok();
+            match cfg.facts.judges {
+                JudgeMode::PerLens => {
+                    // The hunks its findings point at, up front: a start,
+                    // with the whole change attached and every tool its
+                    // binding gives.
+                    let hunks = text
+                        .as_deref()
+                        .and_then(|t| change::hunks_for(t, lists.iter().flatten()))
+                        .map(|h| roles::judge_hunks(&h))
+                        .unwrap_or_default();
+                    let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)? + &hunks;
+                    let (usage, answer) =
+                        judge_call(&prompt, diff, format!("{}: the Judge", lens.id))?;
+                    Ok((vec![usage], roles::read_ratings(&answer)?))
+                }
+                JudgeMode::PerFinding => {
+                    let all: Vec<&Raw> = lists.iter().flatten().collect();
+                    let text = &text;
+                    let out: Vec<Result<(Usage, Vec<roles::Rating>)>> = thread::scope(|scope| {
+                        let handles: Vec<_> = all
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| {
+                                scope.spawn(move || {
+                                    let cited = cited_lines(main, f, text.as_deref());
+                                    let prompt = roles::join(&roles::judge_finding_parts(
+                                        lens,
+                                        f,
+                                        &cited,
+                                        &s.not_findings,
+                                    ));
+                                    let (usage, answer) = judge_call(
+                                        &prompt,
+                                        diff,
+                                        format!("{}: the Judge, finding {}", lens.id, i + 1),
+                                    )?;
+                                    Ok((usage, roles::read_ratings(&answer)?))
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| {
+                                h.join()
+                                    .unwrap_or_else(|_| Err(anyhow!("a Judge's thread died")))
+                            })
+                            .collect()
+                    });
+                    let mut usages = Vec::new();
+                    let mut ratings = Vec::new();
+                    for r in out {
+                        let (u, mut rs) = r?;
+                        usages.push(u);
+                        ratings.append(&mut rs);
+                    }
+                    Ok((usages, ratings))
+                }
+            }
         })
     };
     let mut groups: Vec<(&Lens, Vec<(&Brief, &String)>)> = Vec::new();
@@ -1398,11 +1617,43 @@ fn attack(
             .map(|(lens, slots)| (*lens, slots.len()))
             .collect::<Vec<_>>(),
     );
-    let (review, rule, board) = (&review, &rule, &board);
-    // Every lens and every reviewer at once, and each lens's Judge as soon as
-    // its own reviewers are done: nothing here limits how many run, so only
-    // a bridge's max_concurrent does, and progress shows a call waiting on it.
+    // What a keep-alive refreshes: each role's prefix, through the binding
+    // its calls use.
+    let first_lens = groups.first().map(|(lens, _)| *lens);
+    let alive: Vec<Alive> = match first_lens {
+        Some(lens) if cfg.facts.shared && cfg.facts.keep_alive_secs > 0 && head > 0 => vec![
+            Alive {
+                warm: warm_reviewers,
+                role: Role::Reviewer,
+                name: cfg.binding_name(Role::Reviewer, Some(lens))?,
+                binding: cfg.binding(Role::Reviewer, Some(lens))?,
+                what: "reviewers",
+                till_done: true,
+            },
+            Alive {
+                warm: warm_judges,
+                role: Role::Judge,
+                name: judge_name,
+                binding: judge,
+                what: "Judges",
+                till_done: false,
+            },
+        ],
+        _ => Vec::new(),
+    };
+    let (review, rule, board, alive) = (&review, &rule, &board, &alive);
+    let main_repo = run.repo.clone();
+    let main_repo = &main_repo;
+    // Every lens and every reviewer at once, once the first has warmed the
+    // cache, and each lens's Judge as soon as its own reviewers are done:
+    // nothing here limits how many run, so only a bridge's max_concurrent
+    // does, and progress shows a call waiting on it.
     let done: Vec<(Vec<Result<Done>>, Judged)> = thread::scope(|scope| {
+        scope.spawn(move || warm_reviewers.watch(caller, stop, "reviewers"));
+        scope.spawn(move || warm_judges.watch(caller, stop, "Judges"));
+        if !alive.is_empty() {
+            scope.spawn(move || keep_alive(caller, cfg, alive, main_repo, stop, kept_alive));
+        }
         let handles: Vec<_> = groups
             .iter()
             .map(|(lens, slots)| {
@@ -1411,7 +1662,9 @@ fn attack(
                         .iter()
                         .map(|(brief, label)| {
                             scope.spawn(move || {
-                                let result = review(lens, brief, label);
+                                let first = warm_reviewers.enter(label, caller, "reviewers");
+                                let result = review(lens, brief, label, first);
+                                warm_reviewers.done(label);
                                 board.answered(&lens.id);
                                 result
                             })
@@ -1451,7 +1704,7 @@ fn attack(
                 })
             })
             .collect();
-        handles
+        let done = handles
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
@@ -1461,8 +1714,25 @@ fn attack(
                     )
                 })
             })
-            .collect()
+            .collect();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        done
     });
+    for mut u in std::mem::take(&mut *lock_vec(kept_alive)) {
+        u.round = run.round;
+        run.usage.push(u);
+    }
+    let prompts = std::mem::take(&mut *lock_vec(judge_prompts));
+    if head > 0 && prompts.len() > 1 {
+        let texts: Vec<&str> = prompts.iter().map(String::as_str).collect();
+        let p = super::facts::Prefix::new(
+            run.round,
+            "Judges",
+            head + super::facts::common_prefix(&texts),
+        );
+        caller.say(&format!("round {}: {}", run.round, p.line()));
+        run.prefixes.push(p);
+    }
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
     let mut judgments: BTreeMap<String, Judged> = BTreeMap::new();
     for ((lens, _), (results, judged)) in groups.iter().zip(done) {
@@ -1482,6 +1752,235 @@ fn attack(
         judgments.insert(lens.id.clone(), judged);
     }
     Ok((by_lens, judgments, notes))
+}
+
+fn lock_vec<T>(m: &std::sync::Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The lines a finding cites, for its own Judge to start from: around its
+/// line in the checkout, then the diff's hunks near it. Nothing of the
+/// reviewer's reasoning.
+fn cited_lines(repo: &Path, f: &Raw, diff: Option<&str>) -> String {
+    let mut out = String::new();
+    if let (Some(file), Some(line)) = (f.file.as_deref(), f.line)
+        && let Ok(text) = fs::read_to_string(repo.join(file))
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = line.max(1) as usize;
+        let from = at.saturating_sub(6).max(1);
+        let to = (at + 6).min(lines.len());
+        for n in from..=to {
+            if let Some(l) = lines.get(n - 1) {
+                out.push_str(&format!("{file}:{n}: {l}\n"));
+            }
+        }
+    }
+    if let Some(h) = diff.and_then(|t| change::hunks_for(t, std::iter::once(f))) {
+        out.push_str(&h);
+    }
+    out
+}
+
+/// A role's fan-out, for the prompt cache: its first call goes alone until
+/// the cache holds the prefix the rest share, then the rest go. With no
+/// time to wait, they all go at once.
+struct CacheWarm {
+    secs: u64,
+    state: std::sync::Mutex<WarmState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct WarmState {
+    first: Option<String>,
+    started: Option<std::time::Instant>,
+    open: bool,
+    /// Why the rest were let go, once they were, to say.
+    why: Option<&'static str>,
+    running: usize,
+}
+
+impl CacheWarm {
+    fn new(secs: u64) -> CacheWarm {
+        CacheWarm {
+            secs,
+            state: std::sync::Mutex::new(WarmState {
+                open: secs == 0,
+                ..WarmState::default()
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WarmState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits a call's turn. True for its fan-out's first, which goes at once.
+    fn enter(&self, label: &str, caller: &dyn Caller, what: &str) -> bool {
+        let mut st = self.lock();
+        st.running += 1;
+        if st.first.is_none() {
+            st.first = Some(label.to_string());
+            st.started = Some(std::time::Instant::now());
+            // A caller that can't tell when the cache is warm doesn't wait.
+            if caller.warmed(label).is_none() {
+                st.open = true;
+            }
+            if !st.open {
+                caller.say(&format!(
+                    "warming the cache: {label} goes first, and the other {what} wait up to {}s \
+                     for it to fill the cache",
+                    self.secs
+                ));
+            }
+            self.changed.notify_all();
+            return true;
+        }
+        while !st.open {
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        false
+    }
+
+    /// A call is done. The first one's end opens the way for the rest, if
+    /// nothing has yet.
+    fn done(&self, label: &str) {
+        let mut st = self.lock();
+        st.running = st.running.saturating_sub(1);
+        if st.first.as_deref() == Some(label) && !st.open {
+            st.open = true;
+            st.why = Some("the cache is warm (its first call is done)");
+            self.changed.notify_all();
+        }
+    }
+
+    /// When its first call started, if one has.
+    fn started(&self) -> Option<std::time::Instant> {
+        self.lock().started
+    }
+
+    fn running(&self) -> usize {
+        self.lock().running
+    }
+
+    /// Opens the way once the first call has filled the cache, or its time
+    /// is up, or the round ends.
+    fn watch(&self, caller: &dyn Caller, stop: &std::sync::atomic::AtomicBool, what: &str) {
+        let said = |why: &str, t0: Option<std::time::Instant>| {
+            let secs = t0.map_or(0, |t| t.elapsed().as_secs());
+            caller.say(&format!("{why} after {secs}s: the other {what} start"));
+        };
+        loop {
+            let (first, started, open, why) = {
+                let st = self.lock();
+                (st.first.clone(), st.started, st.open, st.why)
+            };
+            if open {
+                if let Some(why) = why {
+                    said(why, started);
+                }
+                return;
+            }
+            if let (Some(label), Some(t0)) = (first, started) {
+                let warm = caller.warmed(&label) == Some(true);
+                let late = t0.elapsed().as_secs() >= self.secs;
+                if warm || late {
+                    let mut st = self.lock();
+                    if !st.open {
+                        st.open = true;
+                        st.why = Some(if warm {
+                            "the cache is warm (its first call has read its prompt)"
+                        } else {
+                            "the cache isn't warm yet, but the wait is up"
+                        });
+                        self.changed.notify_all();
+                    }
+                    let why = st.why;
+                    drop(st);
+                    if let Some(why) = why {
+                        said(why, Some(t0));
+                    }
+                    return;
+                }
+            }
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut st = self.lock();
+                st.open = true;
+                self.changed.notify_all();
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+}
+
+/// A role's prefix a keep-alive refreshes.
+struct Alive<'a> {
+    warm: &'a CacheWarm,
+    role: Role,
+    name: &'a str,
+    binding: &'a Binding,
+    what: &'static str,
+    /// Live only while its calls run, as reviewers', all started at once;
+    /// otherwise from its first call to the round's end, as Judges', which
+    /// start apart.
+    till_done: bool,
+}
+
+/// Refreshes each live role's cached prefix before the provider could evict
+/// it: a minimal call with the same prefix, through the same binding, only
+/// when its bridge has a slot to spare. Its use is kept apart from the
+/// roles' work.
+fn keep_alive(
+    caller: &dyn Caller,
+    cfg: &Config,
+    alive: &[Alive],
+    repo: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+    out: &std::sync::Mutex<Vec<Usage>>,
+) {
+    let every = std::time::Duration::from_secs(cfg.facts.keep_alive_secs);
+    let mut last: Vec<Option<std::time::Instant>> = vec![None; alive.len()];
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        for (i, a) in alive.iter().enumerate() {
+            let Some(since) = a.warm.started() else {
+                continue;
+            };
+            if a.till_done && a.warm.running() == 0 {
+                continue;
+            }
+            let due = last[i].unwrap_or(since) + every;
+            if std::time::Instant::now() < due || !caller.has_room(a.binding) {
+                continue;
+            }
+            last[i] = Some(std::time::Instant::now());
+            let call = Call {
+                role: a.role,
+                binding_name: a.name,
+                binding: a.binding,
+                prompt: roles::KEEP_ALIVE,
+                artifact: None,
+                writes: false,
+                no_tools: false,
+                repo,
+                label: format!("cache keep-alive: {}", a.what),
+            };
+            if let Ok(answer) = caller.call(&call) {
+                let mut u = usage(cfg, &call, roles::KEEP_ALIVE.len(), &answer);
+                u.fan_out = Some("keep-alive".into());
+                lock_vec(out).push(u);
+                caller.say(&format!("cache: refreshed the {}' prefix", a.what));
+            }
+        }
+        for _ in 0..10 {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 /// The round's warm copy, and how its setup went.
@@ -2195,6 +2694,109 @@ fn rate(
 
 /// One round: attack every open lens, judge what comes back, and settle
 /// what's next. Judging stays out of the orchestration's context.
+/// Builds the round's facts from the change at its head, reusing the last
+/// round's for every file a fix left alone, keeps them in the run's folder,
+/// says how much they share with the last round's, and gives them to the
+/// caller for every reviewer and Judge. True if the caller gives them.
+fn share_facts(
+    run: &mut Run,
+    s: &Setting,
+    change: &Change,
+    caller: &dyn Caller,
+    gate: &str,
+) -> Result<bool> {
+    use super::facts;
+    let prior = (run.round > 1)
+        .then(|| facts::kept(&s.work_dir, run.round - 1))
+        .flatten();
+    let built = facts::Facts::build(&run.repo, change, run.round, prior.as_ref().map(|(f, _)| f));
+    let text = built.render(run.round, Some(gate));
+    let path = facts::keep(&s.work_dir, run.round, &built, &text)?;
+    if let Some((_, before)) = &prior {
+        let p = facts::Prefix::new(
+            run.round,
+            format!("the facts, with round {}'s", run.round - 1),
+            facts::shared_prefix(before, &text),
+        );
+        caller.say(&format!("round {}: {}", run.round, p.line()));
+        run.prefixes.push(p);
+    }
+    caller.say(&format!(
+        "round {}: the facts: {} file(s), {} bytes, ahead of every reviewer's and Judge's own text",
+        run.round,
+        built.files.len(),
+        text.len()
+    ));
+    run.facts.retain(|f| f.round != run.round);
+    run.facts.push(FactsRound {
+        round: run.round,
+        key: facts::Facts::key(&text),
+        bytes: text.len() as u64,
+        files: built.files.len() as u64,
+        given: false,
+    });
+    let cfg = s.cfg;
+    let mut agents: Vec<String> = cfg
+        .lenses
+        .iter()
+        .filter_map(|l| cfg.binding(Role::Reviewer, Some(l)).ok())
+        .chain(cfg.binding(Role::Judge, None).ok())
+        .map(|b| b.agent.clone())
+        .collect();
+    agents.sort();
+    agents.dedup();
+    let given = caller.share(Some(Shared {
+        facts: path,
+        key: run.id.clone(),
+        tools: matched_tools(cfg),
+        agents,
+    }));
+    if let Some(f) = run.facts.iter_mut().find(|f| f.round == run.round) {
+        f.given = given;
+    }
+    Ok(given)
+}
+
+/// When roles' tools are matched: for each bridge and model that more than
+/// one tool list shares among the reviewers and the Judge, the union of
+/// those lists, sorted, so their calls' tool definitions are the same. A
+/// group with a binding that names no tools is left as it is.
+pub fn matched_tools(cfg: &Config) -> BTreeMap<ToolGroup, Vec<String>> {
+    let mut groups: BTreeMap<ToolGroup, Vec<Option<&Vec<String>>>> = BTreeMap::new();
+    if !cfg.facts.match_tools {
+        return BTreeMap::new();
+    }
+    let mut names: Vec<&str> = cfg
+        .lenses
+        .iter()
+        .filter_map(|l| cfg.binding_name(Role::Reviewer, Some(l)).ok())
+        .collect();
+    names.extend(cfg.binding_name(Role::Judge, None).ok());
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        if let Some(b) = cfg.allowed_bindings.get(name) {
+            groups
+                .entry((b.agent.clone(), b.model.clone()))
+                .or_default()
+                .push(b.tools.as_ref());
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (key, lists) in groups {
+        if lists.iter().any(Option::is_none) {
+            continue;
+        }
+        let distinct: BTreeSet<&Vec<String>> = lists.iter().flatten().copied().collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        let union: BTreeSet<String> = distinct.into_iter().flatten().cloned().collect();
+        out.insert(key, union.into_iter().collect());
+    }
+    out
+}
+
 fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller) -> Result<()> {
     let cfg = s.cfg;
     let artifacts = write_artifact(s, run, change, run.round)?;
@@ -2269,8 +2871,37 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             return Ok(());
         }
     }
-    let (reviews, mut judgments, mut notes) =
-        attack(run, s, caller, &artifacts, change, copying, &gate_text)?;
+    // The round's facts, from tools, ahead of every reviewer's and Judge's
+    // own text. They carry the gate's results, last, so the reviewers' own
+    // text doesn't too.
+    let shared = cfg.facts.shared && {
+        match share_facts(run, s, change, caller, &gate_text) {
+            Ok(true) => true,
+            Ok(false) => {
+                caller.say(&format!(
+                    "round {}: the facts are kept, but go to no call: not every agent the \
+                     reviewers and the Judge are bound to can take them",
+                    run.round
+                ));
+                false
+            }
+            Err(e) => {
+                caller.say(&format!("round {}: no shared facts: {e:#}", run.round));
+                caller.share(None);
+                false
+            }
+        }
+    };
+    let gate_for_reviewers = if shared { String::new() } else { gate_text };
+    let (reviews, mut judgments, mut notes) = attack(
+        run,
+        s,
+        caller,
+        &artifacts,
+        change,
+        copying,
+        &gate_for_reviewers,
+    )?;
     if let Some(note) = &warm_note {
         for id in reviews.keys() {
             notes.entry(id.clone()).or_default().push(note.clone());
@@ -2308,9 +2939,11 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     let lines = stages::changed_lines(&change.diff);
     for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
         match judged {
-            Some(Ok((mut usage, ratings))) => {
-                usage.round = run.round;
-                run.usage.push(usage);
+            Some(Ok((usages, ratings))) => {
+                for mut usage in usages {
+                    usage.round = run.round;
+                    run.usage.push(usage);
+                }
                 round.findings = rate(run, cfg, lens, ratings, &lines);
             }
             Some(Err(e)) => round.failures.push(format!("the Judge: {e:#}")),
@@ -2400,7 +3033,7 @@ fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
             )
         })
         .collect();
-    let what = "the Sizer, finding defects more than one lens found";
+    let what = DEDUPE;
     let groups = ask(
         run,
         s,
@@ -6268,9 +6901,16 @@ lenses:
             "{prompt}"
         );
         assert!(prompt.contains("a starting point, not a limit"), "{prompt}");
-        // Its brief is as it was, with the hunks after; the change is still
+        // Its brief starts with the role's own text, the same for every
+        // Judge, with the hunks after the findings; the change is still
         // attached; and it runs with its binding's tools.
-        assert!(prompt.starts_with("Judge these findings"), "{prompt}");
+        assert!(
+            prompt.starts_with("You are a Judge of reviewers' findings"),
+            "{prompt}"
+        );
+        let findings = prompt.find("\"title\"").expect("the findings");
+        let hunks = prompt.find("# Where the findings point").unwrap();
+        assert!(findings < hunks, "{prompt}");
         assert!(fake.with_diff.lock().unwrap().contains(&Role::Judge));
         assert!(!fake.bare.lock().unwrap().contains(&Role::Judge));
     }
@@ -6319,5 +6959,390 @@ lenses:
             err.contains("need an answer") && err.contains("[Logged 1]"),
             "{err}"
         );
+    }
+
+    /// A caller that gives the round's facts to its calls, and tells when
+    /// a call has filled the cache: once it's answered. Reviewers find two
+    /// defects, each with reasoning a Judge of one finding mustn't see.
+    struct Cached {
+        shared: Mutex<Option<Shared>>,
+        calls: Mutex<Vec<Seen>>,
+        answered: Mutex<BTreeSet<String>>,
+        said: Mutex<Vec<String>>,
+        reviewer_ms: u64,
+    }
+
+    /// A call as it was seen: its label, role and prompt, when it started
+    /// and ended, and whether it had the facts.
+    type Seen = (String, Role, String, Instant, Instant, bool);
+
+    const TWO: &str = r#"{"findings": [
+        {"title": "the first defect", "detail": "REASONING-CANARY one", "file": "a.src", "line": 1},
+        {"title": "the second defect", "detail": "REASONING-CANARY two", "file": "a.src", "line": 1}]}"#;
+
+    impl Cached {
+        fn new(reviewer_ms: u64) -> Cached {
+            Cached {
+                shared: Mutex::new(None),
+                calls: Mutex::new(Vec::new()),
+                answered: Mutex::new(BTreeSet::new()),
+                said: Mutex::new(Vec::new()),
+                reviewer_ms,
+            }
+        }
+
+        fn of(&self, role: Role) -> Vec<Seen> {
+            let calls = self.calls.lock().unwrap();
+            calls
+                .iter()
+                .filter(|c| c.1 == role && !c.0.starts_with("cache keep-alive"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Caller for Cached {
+        fn call(&self, call: &Call) -> Result<Answer> {
+            let began = Instant::now();
+            let with_facts = self.shared.lock().unwrap().is_some()
+                && matches!(call.role, Role::Reviewer | Role::Judge);
+            let text = if call.label.starts_with("cache keep-alive") {
+                assert_eq!(call.prompt, roles::KEEP_ALIVE);
+                "ok".to_string()
+            } else {
+                match call.role {
+                    Role::Reviewer => {
+                        std::thread::sleep(Duration::from_millis(self.reviewer_ms));
+                        TWO.to_string()
+                    }
+                    Role::Judge => {
+                        let titles: Vec<&str> = ["the first defect", "the second defect"]
+                            .into_iter()
+                            .filter(|t| call.prompt.contains(t))
+                            .collect();
+                        let rated: Vec<String> = titles
+                            .iter()
+                            .map(|t| {
+                                format!(r#"{{"title": "{t}", "file": "a.src", "severity": "Low"}}"#)
+                            })
+                            .collect();
+                        format!(r#"{{"findings": [{}]}}"#, rated.join(","))
+                    }
+                    _ => NOTHING.to_string(),
+                }
+            };
+            self.calls.lock().unwrap().push((
+                call.label.clone(),
+                call.role,
+                call.prompt.to_string(),
+                began,
+                Instant::now(),
+                with_facts,
+            ));
+            self.answered.lock().unwrap().insert(call.label.clone());
+            Ok(Answer {
+                text,
+                run_id: new_id(),
+                usage: Some(RunUsage {
+                    calls: 1,
+                    input_tokens: 100,
+                    cache_read_tokens: 1000,
+                    output_tokens: 10,
+                    ..RunUsage::default()
+                }),
+                secs: Some(1),
+            })
+        }
+
+        fn say(&self, what: &str) {
+            self.said.lock().unwrap().push(what.to_string());
+        }
+
+        fn share(&self, shared: Option<Shared>) -> bool {
+            let given = shared.is_some();
+            *self.shared.lock().unwrap() = shared;
+            given
+        }
+
+        fn warmed(&self, label: &str) -> Option<bool> {
+            Some(self.answered.lock().unwrap().contains(label))
+        }
+    }
+
+    fn cached_run(top: &str, fan_out: u32, caller: &Cached) -> (Run, PathBuf) {
+        let cfg = config("exception", 1, fan_out, "", top);
+        let s = setting(&cfg);
+        fs::create_dir_all(&s.work_dir).unwrap();
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, caller).unwrap();
+        drive(&mut run, &s, caller, &|_| Ok(c.clone())).unwrap();
+        (run, s.work_dir.clone())
+    }
+
+    #[test]
+    fn a_fan_outs_first_call_warms_the_cache_before_the_rest_and_all_share_the_facts() {
+        let caller = Cached::new(150);
+        let (run, dir) = cached_run("", 3, &caller);
+        let reviewers = caller.of(Role::Reviewer);
+        assert_eq!(reviewers.len(), 6, "two lenses of three");
+        let first = reviewers.iter().min_by_key(|c| c.3).unwrap();
+        for other in reviewers.iter().filter(|c| c.0 != first.0) {
+            assert!(
+                other.3 >= first.4,
+                "{} started before the first was done",
+                other.0
+            );
+        }
+        let said = caller.said.lock().unwrap().clone();
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with(&format!("warming the cache: {} goes first", first.0))),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("the cache is warm (its first call")),
+            "{said:?}"
+        );
+        // Every reviewer and Judge had the facts; their prompts carry no gate
+        // text of their own, and the facts were kept with the run.
+        assert!(
+            caller
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| matches!(c.1, Role::Reviewer | Role::Judge))
+                .all(|c| c.5)
+        );
+        let facts = &run.facts;
+        assert_eq!(facts.len(), 1);
+        assert!(dir.join("round-1.facts.md").is_file());
+        // What every reviewer shares at the head: ACR's prompt, the facts,
+        // and their role's text up to the lens.
+        let p = run
+            .prefixes
+            .iter()
+            .find(|p| p.what == "reviewers")
+            .expect("reviewers' prefix");
+        let head = crate::setup::SYSTEM_PROMPT.len() as u64 + facts[0].bytes;
+        let role_text = reviewers[0].2.find("# Your lens").unwrap() as u64;
+        assert!(p.bytes >= head + role_text, "{p:?}");
+        assert!(
+            said.iter().any(|l| l.contains("shared prefix, reviewers:")),
+            "{said:?}"
+        );
+        // Each reviewer's call is counted in its fan-out, and only one first.
+        let fanned: Vec<&Usage> = run
+            .usage
+            .iter()
+            .filter(|u| u.fan_out.as_deref() == Some("reviewers"))
+            .collect();
+        assert_eq!(fanned.len(), 6);
+        assert_eq!(fanned.iter().filter(|u| u.first).count(), 1);
+        let rows = report::by_role(&run.usage);
+        let row = rows.iter().find(|r| r.role == "reviewers").unwrap();
+        assert_eq!(
+            (row.calls, row.fresh, row.cached, row.output),
+            (6, 600, 6000, 60)
+        );
+        assert_eq!(
+            (row.first_cached, row.rest_cached),
+            (Some(1000), Some(1000))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_role_calls_share_their_head_byte_for_byte_and_what_differs_comes_last() {
+        let lens = |id: &str, criteria: &str| Lens {
+            id: id.into(),
+            criteria: criteria.into(),
+            attack: None,
+            blocker: None,
+            triggers: Default::default(),
+            binding: None,
+            severity: Default::default(),
+            include_generated: false,
+        };
+        let call = |scope| roles::ReviewerCall {
+            scope,
+            not_findings: "- decided",
+            own_copy: false,
+            runbook: Some("run the tests"),
+            brief: Some("look here"),
+            gate: "",
+        };
+        let a = roles::reviewer_parts(&lens("alpha", "a"), &call("the change"));
+        let b = roles::reviewer_parts(&lens("beta", "b"), &call("the change"));
+        assert_eq!(a[0], b[0], "the role's own text, the same for every lens");
+        assert_eq!(a[1], b[1], "the runbook, from the config");
+        // Sources go fixed, config, tool, model: a model's words never sit
+        // ahead of what a tool or the config says, and the call's own
+        // instruction is last.
+        let order = |parts: &[roles::Part]| -> Vec<roles::Source> {
+            parts.iter().map(|p| p.source).collect()
+        };
+        let sources = order(&a);
+        let brief_at = sources
+            .iter()
+            .position(|s| *s == roles::Source::Model)
+            .unwrap();
+        let tool_at = sources
+            .iter()
+            .position(|s| *s == roles::Source::Tool)
+            .unwrap();
+        assert!(tool_at < brief_at, "{sources:?}");
+        assert_eq!(
+            a.last().unwrap().text,
+            "Answer with only the JSON described above."
+        );
+        // Two Judges of one lens share all but their findings.
+        let raw = |t: &str| roles::Raw {
+            title: t.into(),
+            detail: "REASONING-CANARY".into(),
+            file: Some("a.src".into()),
+            line: Some(1),
+        };
+        let l = lens("alpha", "a");
+        let one = roles::join(&roles::judge_finding_parts(
+            &l,
+            &raw("one"),
+            "",
+            "- decided",
+        ));
+        let two = roles::join(&roles::judge_finding_parts(
+            &l,
+            &raw("two"),
+            "",
+            "- decided",
+        ));
+        let shared = super::super::facts::shared_prefix(&one, &two);
+        assert!(
+            one[..shared].contains("- decided"),
+            "decided non-issues ahead of the finding"
+        );
+        assert!(
+            !one.contains("REASONING-CANARY"),
+            "no reviewer's reasoning reaches its Judge"
+        );
+        assert!(one[shared..].contains("one") && !one[shared..].contains("- decided"));
+    }
+
+    #[test]
+    fn per_finding_judges_rate_each_claim_alone() {
+        let caller = Cached::new(0);
+        let (run, dir) = cached_run("facts: {judges: per-finding}", 1, &caller);
+        let judges = caller.of(Role::Judge);
+        assert_eq!(judges.len(), 4, "two findings in each of two lenses");
+        for (label, _, prompt, ..) in &judges {
+            let titles = ["the first defect", "the second defect"]
+                .iter()
+                .filter(|t| prompt.contains(*t))
+                .count();
+            assert_eq!(titles, 1, "{label}: one claim each");
+            assert!(!prompt.contains("REASONING-CANARY"), "{label}");
+            assert!(label.contains("the Judge, finding "), "{label}");
+        }
+        let alpha = &run.lenses["alpha"].rounds[0];
+        assert_eq!(alpha.findings.len(), 2, "{:?}", alpha.findings);
+        let judged: Vec<&Usage> = run.usage.iter().filter(|u| u.role == Role::Judge).collect();
+        assert_eq!(judged.len(), 4);
+        assert!(
+            judged
+                .iter()
+                .all(|u| u.fan_out.as_deref() == Some("judges"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_keep_alive_refreshes_a_live_prefix_and_is_counted_apart() {
+        let caller = Cached::new(1600);
+        let (run, dir) = cached_run("facts: {keep_alive_secs: 1, warm_secs: 0}", 1, &caller);
+        let kept: Vec<&Usage> = run
+            .usage
+            .iter()
+            .filter(|u| u.fan_out.as_deref() == Some("keep-alive"))
+            .collect();
+        assert!(!kept.is_empty(), "{:?}", run.usage);
+        assert!(
+            kept.iter()
+                .all(|u| u.label.as_deref() == Some("cache keep-alive: reviewers"))
+        );
+        let said = caller.said.lock().unwrap().clone();
+        assert!(
+            said.iter()
+                .any(|l| l == "cache: refreshed the reviewers' prefix"),
+            "{said:?}"
+        );
+        let rows = report::by_role(&run.usage);
+        let alive = rows.iter().find(|r| r.role == "keep-alive").unwrap();
+        assert_eq!(alive.calls, kept.len());
+        let reviewers = rows.iter().find(|r| r.role == "reviewers").unwrap();
+        assert_eq!(reviewers.calls, 2, "keep-alive isn't reviewers' work");
+        // Off, there's none.
+        let caller = Cached::new(1200);
+        let (run, dir2) = cached_run("facts: {keep_alive_secs: 0}", 1, &caller);
+        assert!(
+            !run.usage
+                .iter()
+                .any(|u| u.fan_out.as_deref() == Some("keep-alive"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn facts_only_reviewers_get_nothing_a_model_wrote_and_no_decided_non_issues() {
+        let cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "facts: {reviewers: facts-only}\nstages: [brief]",
+        );
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Orchestrator if prompt.contains("You brief the reviewers") => {
+                    panic!("no brief is asked for")
+                }
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let mut s = setting(&cfg);
+        s.builder_brief = Some(stages::BuilderBrief {
+            scope: Some("SCOPE-CANARY".into()),
+            lenses: BTreeMap::from([("alpha".to_string(), "BRIEF-CANARY".to_string())]),
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let calls = fake.calls.lock().unwrap();
+        let reviewers: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Reviewer)
+            .map(|c| &c.3)
+            .collect();
+        assert!(!reviewers.is_empty());
+        for p in &reviewers {
+            assert!(
+                !p.contains("BRIEF-CANARY") && !p.contains("the decided thing"),
+                "{p}"
+            );
+        }
+        let sent = fake.sent.lock().unwrap();
+        for (role, text) in sent.iter().filter(|(r, _)| *r == Role::Reviewer) {
+            assert!(!text.contains("SCOPE-CANARY"), "{role:?}: {text}");
+        }
+        // The Judge still holds the reviewers to what's decided.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.0 == Role::Judge && c.3.contains("the decided thing"))
+        );
+        let _ = fs::remove_dir_all(&s.work_dir);
     }
 }

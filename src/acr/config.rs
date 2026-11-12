@@ -317,6 +317,115 @@ pub struct Policy {
     /// a model one matches. Left out, any model the user's bindings name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_models: Option<Vec<String>>,
+    /// How a round shares what tools found in the code with its roles, for
+    /// the model's prompt cache, and how its Judges and reviewers are asked.
+    /// See `FactsPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<FactsPolicy>,
+}
+
+/// How a round shares the change map and diff with its roles, ahead of
+/// their own text, so a role's calls read them from the prompt cache. Each
+/// field left out takes the framework's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsPolicy {
+    /// Build the change map each round and give it, with the diff, to every
+    /// reviewer and Judge ahead of their own text. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<bool>,
+    /// Seconds a fan-out of one role waits for its first call to fill the
+    /// cache before the rest start. 0 starts them all at once. Default 60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_secs: Option<u64>,
+    /// Seconds between refreshes of a role's cached prefix while its calls
+    /// run, so the provider doesn't evict it. 0 turns it off. Default 240.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_secs: Option<u64>,
+    /// `per-lens`, the default: one Judge rates a lens's findings together.
+    /// `per-finding`: one Judge per finding, given its claim and the lines it
+    /// cites, without the reviewer's reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judges: Option<JudgeMode>,
+    /// `all`, the default: reviewers get the briefs written for the change
+    /// and the decided non-issues, as before. `facts-only`: nothing a model
+    /// wrote, and no decided non-issues, which the Judge still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewers: Option<ReviewerInput>,
+    /// Give every role on a bridge the same tool definitions, the union of
+    /// theirs, and hold each to its own when it calls one, so roles on one
+    /// model share a cached prefix. Only for agents that can enforce it.
+    /// Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_tools: Option<bool>,
+}
+
+impl FactsPolicy {
+    fn over(self, later: FactsPolicy) -> FactsPolicy {
+        FactsPolicy {
+            shared: later.shared.or(self.shared),
+            warm_secs: later.warm_secs.or(self.warm_secs),
+            keep_alive_secs: later.keep_alive_secs.or(self.keep_alive_secs),
+            judges: later.judges.or(self.judges),
+            reviewers: later.reviewers.or(self.reviewers),
+            match_tools: later.match_tools.or(self.match_tools),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JudgeMode {
+    #[default]
+    PerLens,
+    PerFinding,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewerInput {
+    #[default]
+    All,
+    FactsOnly,
+}
+
+/// The facts settings, resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactsConfig {
+    pub shared: bool,
+    pub warm_secs: u64,
+    pub keep_alive_secs: u64,
+    pub judges: JudgeMode,
+    pub reviewers: ReviewerInput,
+    pub match_tools: bool,
+}
+
+impl Default for FactsConfig {
+    fn default() -> Self {
+        FactsConfig {
+            shared: true,
+            warm_secs: 60,
+            keep_alive_secs: 240,
+            judges: JudgeMode::PerLens,
+            reviewers: ReviewerInput::All,
+            match_tools: true,
+        }
+    }
+}
+
+impl FactsConfig {
+    fn of(p: Option<FactsPolicy>) -> FactsConfig {
+        let d = FactsConfig::default();
+        let p = p.unwrap_or_default();
+        FactsConfig {
+            shared: p.shared.unwrap_or(d.shared),
+            warm_secs: p.warm_secs.unwrap_or(d.warm_secs),
+            keep_alive_secs: p.keep_alive_secs.unwrap_or(d.keep_alive_secs),
+            judges: p.judges.unwrap_or(d.judges),
+            reviewers: p.reviewers.unwrap_or(d.reviewers),
+            match_tools: p.match_tools.unwrap_or(d.match_tools),
+        }
+    }
 }
 
 /// What a careful reviewer does by habit, made part of every round.
@@ -519,6 +628,10 @@ impl Policy {
         self.tests = later.tests.or(self.tests);
         self.runbook = later.runbook.or(self.runbook);
         self.allowed_models = later.allowed_models.or(self.allowed_models);
+        self.facts = match (self.facts, later.facts) {
+            (Some(facts), Some(later)) => Some(facts.over(later)),
+            (facts, later) => later.or(facts),
+        };
         self
     }
 }
@@ -644,6 +757,10 @@ pub struct Config {
     /// The models a review may use, as patterns: none means any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
+    /// How a round shares the change map with its roles. Older runs' stored
+    /// configs have none, and get the defaults.
+    #[serde(default)]
+    pub facts: FactsConfig,
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
@@ -767,6 +884,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         tests: merged.tests.unwrap_or_default(),
         runbook: merged.runbook,
         allowed_models: merged.allowed_models.unwrap_or_default(),
+        facts: FactsConfig::of(merged.facts),
     };
     config.check()?;
     config.check_models()?;
@@ -1690,6 +1808,7 @@ mod tests {
             tests: Some(Tests::default()),
             runbook: Some(String::new()),
             allowed_models: Some(Vec::new()),
+            facts: Some(FactsPolicy::default()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();

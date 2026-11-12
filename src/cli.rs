@@ -512,6 +512,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     effort,
                     log: None,
                     review: None,
+                    ..RunOptions::default()
                 },
                 attach,
                 timeout,
