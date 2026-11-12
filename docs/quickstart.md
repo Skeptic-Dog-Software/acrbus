@@ -265,7 +265,8 @@ not yet folded in.
 - **Reviewers** run through their bridge, with its own HOME and PATH: its
   `home` and `path` in `config.toml`. A reviewer whose binding has a shell
   (Bash, Write or Edit) works in a copy of its own. Its file tools can't
-  read outside that copy, though its shell isn't confined.
+  read outside that copy. Its shell can, unless its bridge fences it: see
+  "Fencing an agent's shell" in the README.
 
 So whatever the tests need has to be there for the reviewers too: a
 toolchain, a filled package cache. `acrbus acr doctor` checks both ways and
@@ -349,6 +350,8 @@ Things that matter for an agent other than Claude Code:
 | exit 1 | Its last line says what's left: fix it and review again. |
 | a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
 | a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, and when it last did anything. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
+| the doctor says a bridge doesn't fence its agent's shell | It's yours to judge. On a machine holding tokens or keys a reviewer mustn't read, give that bridge a `fence`, and have its agent's tool layer run each command through `acrbus fence`: see "Fencing an agent's shell" in the README. |
+| a fenced command can't find a toolchain or its packages | Add the folder to the bridge's `fence.read`, and the variables that point at it to `fence.env`, then `acrbus fence --check <agent>`. A package cache is read, not written, so fill it first, in `tests.setup` or by hand. |
 | a call "timed out" | It ran as long as its bridge allows. Raise the bridge's `timeout_secs` and `max_timeout_secs`, and restart it. |
 
 [Setting up ACR review for a repository](acr-repo-setup.md) is the reference

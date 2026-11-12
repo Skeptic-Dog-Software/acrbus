@@ -932,12 +932,14 @@ const CHECK_MODEL: &str = "claude-haiku-5-5";
 pub(super) const CHECK_SECS: u64 = 180;
 
 /// What a check asks a session: read in the copy and outside it, run a
-/// command in it if it has a shell, and write its answer where a builder
+/// command in it if it has a shell, try to read outside it with that shell
+/// too if its bridge fences it, and write its answer where a builder
 /// writes its result if `result` is given.
 pub(super) fn check_prompt(
     tree: &Path,
     canary: &Path,
     bash: bool,
+    fenced: bool,
     result: Option<&Path>,
 ) -> String {
     let mut steps = vec![
@@ -954,6 +956,12 @@ pub(super) fn check_prompt(
         steps.push(
             "In Bash, run `git rev-parse HEAD`. Put what it prints in \"bash_inside\".".into(),
         );
+        if fenced {
+            steps.push(format!(
+                "In Bash, run `cat {}`. Put the first line it prints in \"bash_outside\", or \"refused\" if it can't read it.",
+                canary.display()
+            ));
+        }
     }
     if let Some(result) = result {
         steps.push(format!(
@@ -1011,7 +1019,7 @@ pub(super) fn check_session(
     let config = s.dir.join("check");
     fs::create_dir_all(&config)?;
     let result = s.dir.join("check.json");
-    let prompt = check_prompt(&s.tree, &canary.path, true, Some(&result));
+    let prompt = check_prompt(&s.tree, &canary.path, true, false, Some(&result));
     let text = claude(
         paths,
         &config,
@@ -1554,17 +1562,35 @@ mod tests {
         // Without a shell, no command is asked for or expected.
         let read_only = format!("{{\"inside\": \"{head}\", \"outside\": \"refused\"}}");
         assert!(check_answer(&read_only, &head, "canary-x", false).is_empty());
-        let prompt = check_prompt(Path::new("/t"), Path::new("/c"), false, None);
+        let prompt = check_prompt(Path::new("/t"), Path::new("/c"), false, false, None);
         assert!(!prompt.contains("Bash") && !prompt.contains("Write"));
         let prompt = check_prompt(
             Path::new("/t"),
             Path::new("/c"),
             true,
+            false,
             Some(Path::new("/r")),
         );
         assert!(
             prompt.contains("/t/.git/HEAD") && prompt.contains("Bash") && prompt.contains("/r")
         );
+        assert!(!prompt.contains("cat /c"), "{prompt}");
+    }
+
+    #[test]
+    fn a_check_tries_a_fenced_shell_outside_its_copy_and_catches_it_getting_out() {
+        let head = "a".repeat(40);
+        let prompt = check_prompt(Path::new("/t"), Path::new("/c"), true, true, None);
+        assert!(prompt.contains("In Bash, run `cat /c`"), "{prompt}");
+        let held = format!(
+            "{{\"inside\": \"{head}\", \"outside\": \"refused\", \"bash_inside\": \"{head}\", \"bash_outside\": \"refused\"}}"
+        );
+        assert!(check_answer(&held, &head, "canary-x", true).is_empty());
+        let out = format!(
+            "{{\"inside\": \"{head}\", \"outside\": \"refused\", \"bash_inside\": \"{head}\", \"bash_outside\": \"canary-x\"}}"
+        );
+        let wrong = check_answer(&out, &head, "canary-x", true);
+        assert!(wrong[0].contains("outside its folders"), "{wrong:?}");
     }
 
     #[test]
