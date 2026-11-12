@@ -80,8 +80,11 @@ const CACHE_KEY_ENV: &str = "ACRBUS_CACHE_KEY";
 /// What a review's call is told it may use, when every role gets the same
 /// tools.
 const ALLOWED_TOOLS_ENV: &str = "ACRBUS_ALLOWED_TOOLS";
-/// acrbus's extension for pi, which sends the cache key and holds a call to
-/// its tools.
+/// What a review's call to pi is told its thinking level was asked as, so
+/// the extension can say when pi rounds it to one the model has.
+const EFFORT_ENV: &str = "ACRBUS_EFFORT";
+/// acrbus's extension for pi, which sends the cache key where a gateway
+/// passes it on, says what the cache served, and holds a call to its tools.
 const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
 
 /// How much of a failed run's stderr goes in its failure reply's text.
@@ -3091,6 +3094,9 @@ impl Bridge {
         if let Some(allowed) = &plan.allowed_tools {
             command.env(ALLOWED_TOOLS_ENV, allowed.join(","));
         }
+        if let Some(effort) = plan.effort.as_ref().filter(|_| kind == Some(Kind::Pi)) {
+            command.env(EFFORT_ENV, effort);
+        }
         // Anthropic's longer-lived prompt cache, which Claude Code takes by
         // this, for a review's calls, whose prefix outlives five minutes.
         if kind == Some(Kind::Claude) {
@@ -5398,8 +5404,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let facts = root.join("round-1.facts.md");
         fs::write(&facts, "# The change\n\nFACTS-CANARY\n").unwrap();
-        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'key=%s\nallowed=%s\n' "$ACRBUS_CACHE_KEY" "$ACRBUS_ALLOWED_TOOLS""#;
-        let bridge = rig.start(rig.settings(script, PI_TOOLS));
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'key=%s\neffort=%s\nallowed=%s\n' "$ACRBUS_CACHE_KEY" "$ACRBUS_EFFORT" "$ACRBUS_ALLOWED_TOOLS""#;
+        // pi's own options, its thinking levels too, as its kind gives them.
+        let pi = format!(
+            "{PI_TOOLS}efforts = [\"low\", \"medium\", \"high\"]\neffort_args = [\"--thinking\", \"{{EFFORT}}\"]\n"
+        );
+        let bridge = rig.start(rig.settings(script, &pi));
         let tools = vec!["grep".to_string(), "read".to_string()];
         let review = with(RunOptions {
             review: Some(true),
@@ -5407,6 +5417,7 @@ mod tests {
             cache_key: Some("acr-r1-0a1b2c".into()),
             tools: Some(tools.clone()),
             allowed_tools: Some(vec!["read".into()]),
+            effort: Some("medium".into()),
             ..RunOptions::default()
         });
         let reply = rig.reply_to(&rig.ask_with(review));
@@ -5428,6 +5439,10 @@ mod tests {
         assert!(given < ext, "{reply}");
         assert!(reply.contains(&format!("acrbus-{}.js]", env!("CARGO_PKG_VERSION"))));
         assert!(reply.contains("key=acr-r1-0a1b2c\n"), "{reply}");
+        // The effort reaches pi as its thinking level, and its extension
+        // hears what was asked, to say if pi rounds it.
+        assert!(reply.contains("[--thinking]\n[medium]"), "{reply}");
+        assert!(reply.contains("effort=medium\n"), "{reply}");
         assert!(reply.trim_end().ends_with("allowed=read"), "{reply}");
         assert!(
             reply.contains("[--tools]\n[grep,read]"),
@@ -5435,7 +5450,9 @@ mod tests {
         );
         assert!(!bare.contains("[-e]"), "{bare}");
         assert!(
-            bare.contains("key=\n") && bare.trim_end().ends_with("allowed="),
+            bare.contains("key=\n")
+                && bare.contains("effort=\n")
+                && bare.trim_end().ends_with("allowed="),
             "{bare}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -5493,7 +5510,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pi_extension_sets_the_affinity_header_and_refuses_tools_outside_the_list() {
+    fn the_pi_extension_sends_the_cache_key_where_a_gateway_passes_it_and_holds_tools() {
         let Ok(node) = Command::new("node").arg("--version").output() else {
             eprintln!("no node here: the extension's own test is skipped");
             return;
@@ -5509,9 +5526,27 @@ mod tests {
             r#"import acrbus from "./acrbus-pi.mjs";
 const handlers = {};
 acrbus({ on: (name, f) => { handlers[name] = f; } });
+const out = {};
 const headers = {};
 if (handlers.before_provider_headers) handlers.before_provider_headers({ headers });
-const out = { header: headers["x-session-affinity"] ?? null };
+out.header = headers["x-session-affinity"] ?? null;
+out.gateway = headers["x-bf-eh-x-session-affinity"] ?? null;
+const chat = { model: "m", messages: [{ role: "system", content: "s" }, { role: "user", content: "u" }] };
+const req = (payload, ctx) => handlers.before_provider_request
+  ? (handlers.before_provider_request({ payload }, ctx) ?? null) : null;
+out.openai = req(chat, { model: { api: "openai-completions" } });
+out.anthropic = req({ model: "m", system: "s", messages: [] }, { model: { api: "anthropic-messages" } });
+out.theirs = req({ ...chat, user: "someone" }, { model: { api: "openai-completions" } });
+out.shaped = req(chat, {});
+out.shapedSystem = req({ model: "m", system: "s", messages: [] }, {});
+if (handlers.after_provider_response) {
+  handlers.after_provider_response({ status: 200, headers: { "fireworks-cached-prompt-tokens": "36812" } });
+  handlers.after_provider_response({ status: 200, headers: {} });
+}
+if (handlers.before_agent_start) {
+  handlers.before_agent_start({}, { thinkingLevel: "high", model: { id: "glm" } });
+  handlers.before_agent_start({}, { thinkingLevel: "high", model: { id: "glm" } });
+}
 if (handlers.tool_call) {
   out.read = await handlers.tool_call({ toolName: "read" }) ?? null;
   out.bash = await handlers.tool_call({ toolName: "bash" }) ?? null;
@@ -5520,41 +5555,75 @@ console.log(JSON.stringify(out));
 "#,
         )
         .unwrap();
-        let run = |env: &[(&str, &str)]| -> serde_json::Value {
+        let run = |env: &[(&str, &str)]| -> (serde_json::Value, String) {
             let mut c = Command::new("node");
             c.arg(dir.join("check.mjs"))
                 .env_remove("ACRBUS_CACHE_KEY")
-                .env_remove("ACRBUS_ALLOWED_TOOLS");
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_EFFORT");
             for (k, v) in env {
                 c.env(k, v);
             }
             let out = c.output().unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            serde_json::from_slice(&out.stdout).unwrap()
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            (serde_json::from_slice(&out.stdout).unwrap(), stderr)
         };
-        let both = run(&[
+        let (all, said) = run(&[
             ("ACRBUS_CACHE_KEY", "acr-r1-0a1b2c"),
             ("ACRBUS_ALLOWED_TOOLS", "read,grep"),
+            ("ACRBUS_EFFORT", "medium"),
         ]);
-        assert_eq!(both["header"], "acr-r1-0a1b2c");
-        assert_eq!(both["read"], serde_json::Value::Null, "its own tool runs");
-        assert_eq!(both["bash"]["block"], true);
-        let why = both["bash"]["reason"].as_str().unwrap();
+        // The key, as the provider's header and as the one a gateway that
+        // forwards only x-bf-eh- headers passes on.
+        assert_eq!(all["header"], "acr-r1-0a1b2c");
+        assert_eq!(all["gateway"], "acr-r1-0a1b2c");
+        // And as `user`, in an OpenAI chat request only, never over the
+        // request's own.
+        assert_eq!(all["openai"]["user"], "acr-r1-0a1b2c");
+        assert_eq!(all["openai"]["messages"][1]["content"], "u");
+        assert_eq!(all["anthropic"], serde_json::Value::Null);
+        assert_eq!(all["theirs"], serde_json::Value::Null);
+        assert_eq!(all["shaped"]["user"], "acr-r1-0a1b2c");
+        assert_eq!(all["shapedSystem"], serde_json::Value::Null);
+        // What the cache served, per turn, when the response says.
+        assert!(
+            said.contains("acrbus cache: turn 1: 36812 prompt tokens read from the cache"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("turn 2"),
+            "a turn with no count says nothing: {said}"
+        );
+        // A level pi rounded, said once.
+        assert_eq!(
+            said.matches("asked for thinking medium, which glm doesn't have, so pi uses high")
+                .count(),
+            1,
+            "{said}"
+        );
+        assert_eq!(all["read"], serde_json::Value::Null, "its own tool runs");
+        assert_eq!(all["bash"]["block"], true);
+        let why = all["bash"]["reason"].as_str().unwrap();
         assert!(
             why.contains("may not use bash") && why.contains("read, grep"),
             "{why}"
         );
+        // A level pi kept says nothing.
+        let (_, kept) = run(&[("ACRBUS_EFFORT", "high")]);
+        assert!(!kept.contains("acrbus effort"), "{kept}");
         // A list it can't read refuses every tool.
-        let bad = run(&[("ACRBUS_ALLOWED_TOOLS", "read;rm -rf")]);
+        let (bad, _) = run(&[("ACRBUS_ALLOWED_TOOLS", "read;rm -rf")]);
         assert_eq!(bad["read"]["block"], true);
         assert_eq!(bad["header"], serde_json::Value::Null);
         // Nothing set, nothing done.
-        let none = run(&[]);
-        assert_eq!(none, serde_json::json!({"header": null}));
+        let (none, quiet) = run(&[]);
+        assert_eq!(
+            none,
+            serde_json::json!({"header": null, "gateway": null, "openai": null,
+                "anthropic": null, "theirs": null, "shaped": null, "shapedSystem": null})
+        );
+        assert!(quiet.is_empty(), "{quiet}");
         let _ = fs::remove_dir_all(&dir);
     }
 
