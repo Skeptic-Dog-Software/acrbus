@@ -32,6 +32,7 @@ const STOP: &str = "Stop the review";
 const GO_ON: &str = "Go on";
 const FIX: &str = "Fix it";
 const WAIVE: &str = "Waive it";
+const DEFER: &str = "Defer to a ticket";
 const NOT_BLOCKER: &str = "Not a blocker";
 const NOT_DEFECT: &str = "Not a defect";
 const AS_RULED: &str = "As ruled";
@@ -181,6 +182,20 @@ fn latest(run: &Run, keep: impl Fn(&Finding) -> bool) -> Vec<(String, Finding)> 
         .collect()
 }
 
+/// The note in an answer that defers a blocker: "Defer to a ticket", then
+/// whatever follows it, past a colon or a dash. None if it doesn't defer.
+fn deferred_note(text: &str) -> Option<String> {
+    let text = text.trim();
+    let head = text.get(..DEFER.len())?;
+    if !head.eq_ignore_ascii_case(DEFER) {
+        return None;
+    }
+    let rest = text[DEFER.len()..].trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '-' | '—' | '–' | ',' | '.')
+    });
+    Some(rest.trim().to_string())
+}
+
 fn open_blocker(f: &Finding) -> bool {
     f.blocks() && f.state == FindingState::Open
 }
@@ -190,6 +205,44 @@ fn who(run: &Run) -> &'static str {
         Fixer::Session => "This session",
         Fixer::Orchestrator => "The Orchestrator",
     }
+}
+
+/// Who folds in what a review upholds: the default first, and marked, so
+/// the answer most people give is the one at hand.
+fn fixer(run: &Run) -> Question {
+    let default = |is: bool, what: &str| {
+        if is {
+            format!("The default. {what}")
+        } else {
+            what.to_string()
+        }
+    };
+    let session = choice(
+        SESSION,
+        default(
+            run.fixer == Fixer::Session,
+            "The session that ran the review fixes them, with the change's context, then \
+             resumes it with --fixed",
+        ),
+    );
+    let orchestrator = choice(
+        ORCHESTRATOR,
+        default(
+            run.fixer == Fixer::Orchestrator,
+            "A fresh agent on the Orchestrator's binding fixes them",
+        ),
+    );
+    let options = match run.fixer {
+        Fixer::Orchestrator => vec![orchestrator, session],
+        Fixer::Session => vec![session, orchestrator],
+    };
+    // The text answers are keyed by stays as it was.
+    question(
+        "Fixer",
+        "Who folds in the blockers this review upholds?".into(),
+        options,
+        false,
+    )
 }
 
 fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
@@ -215,22 +268,7 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
             {
                 out.push(Asked {
                     topic: Topic::Fixer,
-                    question: question(
-                        "Fixer",
-                        "Who folds in the blockers this review upholds?".into(),
-                        vec![
-                            choice(
-                                SESSION,
-                                "The session that ran the review fixes them, with the change's \
-                                 context, then resumes it with --fixed",
-                            ),
-                            choice(
-                                ORCHESTRATOR,
-                                "A fresh agent on the Orchestrator's binding fixes them",
-                            ),
-                        ],
-                        false,
-                    ),
+                    question: fixer(run),
                 });
             }
         }
@@ -428,9 +466,13 @@ fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
         (Some(file), None) => format!("In {file}. "),
         _ => String::new(),
     };
+    let waivable = f.action == Action::BlocksUnlessWaived;
+    // A question holds four choices at most, so waiving, which ships the
+    // change with the defect and no follow-up, is an answer to type rather
+    // than a choice: deferring to a ticket is what most people want.
     let text = format!(
         "{}, {:?} in {lens}{}: {}\n\n{}\n\n{at}Choose Other to have it fixed with your note \
-         to the fixer.",
+         to the fixer, or answer \"{DEFER}: <your note>\" to defer it with a note.{}",
         f.id,
         f.severity,
         if also.is_empty() {
@@ -439,14 +481,25 @@ fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
             format!(" (also found by {})", also.join(", "))
         },
         f.title,
-        cut(&f.detail, DETAIL)
+        cut(&f.detail, DETAIL),
+        if waivable {
+            format!(" To ship with it and no ticket, answer \"{WAIVE}\".")
+        } else {
+            String::new()
+        }
     );
-    let mut options = vec![choice(
-        FIX,
-        format!("{} fixes it, and the next round checks the fix", who(run)),
-    )];
-    if f.action == Action::BlocksUnlessWaived {
-        options.push(choice(WAIVE, "It's real, but this change ships with it"));
+    let mut options = vec![
+        choice(
+            FIX,
+            format!("{} fixes it, and the next round checks the fix", who(run)),
+        ),
+        choice(
+            DEFER,
+            "It's real, but this change ships without the fix: it's recorded as deferred, \
+             and a ticket is drafted for the follow-up",
+        ),
+    ];
+    if waivable {
         options.push(choice(
             NOT_BLOCKER,
             "It's real, but shouldn't block: it's logged, and the calibration learns it",
@@ -885,10 +938,20 @@ pub fn apply(
             Topic::Fixer if chose(pick, SESSION) => run.fixer = Fixer::Session,
             Topic::Fixer if chose(pick, ORCHESTRATOR) => run.fixer = Fixer::Orchestrator,
             Topic::Blocker { id, .. } => {
+                let waivable =
+                    finding(run, id).is_some_and(|(_, f)| f.action == Action::BlocksUnlessWaived);
                 let (state, v, note) = match pick {
-                    Some(Picked::Other(text)) => {
-                        (FindingState::Folded, Verdict::Right, text.clone())
-                    }
+                    Some(Picked::Other(text)) => match deferred_note(text) {
+                        Some(note) => (FindingState::Deferred, Verdict::Right, note),
+                        None if text.trim().eq_ignore_ascii_case(WAIVE) => {
+                            if !waivable {
+                                bail!("{id} can't be waived: fix it, or defer it to a ticket");
+                            }
+                            (FindingState::Waived, Verdict::Right, String::new())
+                        }
+                        None => (FindingState::Folded, Verdict::Right, text.clone()),
+                    },
+                    p if chose(p, DEFER) => (FindingState::Deferred, Verdict::Right, String::new()),
                     p if chose(p, WAIVE) => (FindingState::Waived, Verdict::Right, String::new()),
                     p if chose(p, NOT_BLOCKER) => {
                         (FindingState::Logged, Verdict::NotABlocker, String::new())
@@ -898,12 +961,15 @@ pub fn apply(
                     }
                     _ => (FindingState::Folded, Verdict::Right, String::new()),
                 };
-                applied.feedback.extend(verdict(
-                    run,
-                    id,
-                    v,
-                    (!note.is_empty()).then(|| format!("To the fixer: {note}")),
-                ));
+                let said = match (state, note.is_empty()) {
+                    (FindingState::Deferred, true) => Some("Deferred to a ticket.".to_string()),
+                    (FindingState::Deferred, false) => {
+                        Some(format!("Deferred to a ticket: {note}"))
+                    }
+                    (_, false) => Some(format!("To the fixer: {note}")),
+                    (_, true) => None,
+                };
+                applied.feedback.extend(verdict(run, id, v, said));
                 // A defect several lenses found is decided once, for all.
                 let same: Vec<String> = std::iter::once(id.clone())
                     .chain(run.lenses.values().flat_map(|l| {
@@ -927,6 +993,9 @@ pub fn apply(
                             }
                             FindingState::Dropped => {
                                 f.reason.push_str(" A person ruled it isn't a defect.")
+                            }
+                            FindingState::Deferred => {
+                                f.reason.push_str(" A person deferred it to a ticket.")
                             }
                             _ => {}
                         }

@@ -176,9 +176,10 @@ fn end_text(run: &Run, repo: &str, full: bool) -> String {
         }
         let count = |s: FindingState| last.values().filter(|v| **v == s).count();
         out.push_str(&format!(
-            " {} finding(s) fixed, {} waived, {} logged, {} still open.",
+            " {} finding(s) fixed, {} waived, {} deferred to a ticket, {} logged, {} still open.",
             count(FindingState::Folded),
             count(FindingState::Waived),
+            count(FindingState::Deferred),
             count(FindingState::Logged),
             count(FindingState::Open),
         ));

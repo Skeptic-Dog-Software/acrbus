@@ -223,10 +223,19 @@ The gates:
 | Waits for | When | It asks |
 | --- | --- | --- |
 | scope | before any reviewer runs | approve the tier and lenses, one tier higher, or stop; and who fixes, this session or the Orchestrator |
-| fold | after a round with blockers | for each blocker: fix it (with your note to the fixer, in your own words), waive it, not a blocker, or not a defect; which logged findings should block; and what the reviewers missed |
+| fold | after a round with blockers | for each blocker: fix it (with your note to the fixer, in your own words), defer it to a ticket, not a blocker, or not a defect; which logged findings should block; and what the reviewers missed |
 | fix | when this session fixes | nothing: fold in what `acr ask` lists, write tests that pin it, then `acr resume <id> --fixed`, with `--brief <file>` for the next round |
 | final | when every lens agrees | approve, or another round; and the same logged and missed questions |
 | escalation | whenever something must go to a person | a values call or split: as ruled, or the other way; a lens that didn't finish: try again or go on without it; otherwise go on or stop |
+
+Deferring a blocker to a ticket says it's real, but this change ships
+without the fix: it no longer blocks, it isn't waived, and the review
+writes a draft ticket for it, title and body, in its folder's `tickets/`
+and in the report's `tickets`. Nothing is filed anywhere. To defer with a
+note, answer `Defer to a ticket: <your note>`, or pass `--defer <id>` to
+`acr resume`. A question holds four choices at most, so waiving, which
+ships the change with the defect and no follow-up, is an answer you type,
+`Waive it`, or `--waive <id>`, and only for a blocker that may be waived.
 
 `human_gate` in the review config chooses the gates:
 - **`in-the-loop`**, the default, asks at scope, every fold and the result.
@@ -239,8 +248,24 @@ Approving the result while saying logged findings should block: the
 choice to block wins. They become blockers, and the review goes on to fix
 them rather than end.
 
-The old answers still work: `--approve`, `--stop`, `--fold <ids>` and
-`--waive <ids>`.
+To stop a review, running or waiting, in one step:
+
+```sh
+acrbus acr stop <id>
+```
+
+If a process is running it, that process gets an interrupt, which cancels
+its calls before it exits; if it hasn't gone after 30 seconds, a kill; and
+last, a forced kill. Each goes only to the process the review's own mark
+names, and only while it's still that process. The review then ends as
+stopped, lets go of its claim on Grayboard, and says what it left: its
+kept files, the copies it worked in, and anything uncommitted in the
+checkout, which may hold an Orchestrator's fixes, with the commands to see
+or discard them. It touches none of that. `acr resume <id> --stop` does
+the same.
+
+The old answers still work: `--approve`, `--stop`, `--fold <ids>`,
+`--defer <ids>` and `--waive <ids>`.
 
 **Fixes.** Whoever you chose at the scope gate fixes what you fold in. This
 session, or you at the terminal, fixes with the change's context, as the
@@ -256,6 +281,8 @@ tools. The binding `setup acr` writes can't, so a review defaults to you.
   - `open`, a blocker with nothing done yet;
   - `folded`, to be fixed, or fixed;
   - `waived`;
+  - `deferred`, real and owed: deferred to a ticket, which the review
+    drafts;
   - `logged`, recorded without blocking;
   - `dropped`, rejected, with its reason kept.
 
@@ -373,6 +400,8 @@ Things that matter for an agent other than Claude Code:
 | exit 3 or 4 | The review is waiting for you: `acrbus acr ask <id>` says what it asks; see the gates in step 8. |
 | exit 1 | Its last line says what's left: fix it and review again. |
 | a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
+| a review must stop now | `acrbus acr stop <id>`: it stops the process running it, cancels its calls, ends it and lists what it left. |
+| was the cache warm? | Progress says, as each call answers, what its first turn read from the cache, such as `first turn 36.8k of 37.0k from cache`, and `acrbus acr usage <id>` lists every call's first turn. A pi call's log (`acrbus bridge log <agent> <id> --stderr`) has an `acrbus cache:` line per turn. A cache-write column that reads 0 everywhere says nothing: some providers don't report writes. |
 | a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, when it last did anything, and its tokens so far; a call waiting for a free slot on its bridge, and for how long; and a lens with nothing for its Judge. `acrbus acr ask <id>` shows where each lens stands. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
 | a round's setup didn't seem to run | Its `warm.log`, in the round's copies, says the command, how it ended and how long it took; progress says `setup: ok`, `failed` or `none configured`, and every reviewer hears of a failed one. |
 | copies take a lot of space | `acrbus acr doctor` counts them; `acrbus acr clean` clears those of finished work now. On macOS they're clones that share blocks with the repository, so they use less disk than their apparent size. |
