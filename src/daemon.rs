@@ -99,6 +99,17 @@ pub fn run(paths: &Paths) -> Result<()> {
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    // Doors: agents in other accounts. One that can't open says why, and
+    // the bus runs without it.
+    for door in crate::door::configured(&bus.cfg) {
+        let opened = door.map_err(anyhow::Error::msg).and_then(|d| {
+            let name = d.name.clone();
+            crate::door::open(&bus, d).with_context(|| format!("door {name}"))
+        });
+        if let Err(e) = opened {
+            bus.event(format!("{e:#}; that door stays shut"));
+        }
+    }
 
     let local = if bus.remote() { "" } else { ", local only" };
     match bus.refresh_status() {
@@ -140,7 +151,7 @@ pub fn run(paths: &Paths) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -163,7 +174,7 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let (mut uid, mut gid) = (0, 0);
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
         return Err(io::Error::last_os_error());
@@ -307,6 +318,16 @@ fn await_reply(bus: &Bus, conn: &mut Conn, agent: &str, id: &str, wait_secs: u64
 }
 
 pub(crate) fn serve_conn(bus: &Bus, stream: UnixStream) -> Result<()> {
+    serve_conn_as(bus, stream, None)
+}
+
+/// Serves a connection through `door`'s door: only what the door allows,
+/// as its agent.
+pub(crate) fn serve_door(bus: &Bus, stream: UnixStream, door: &str) -> Result<()> {
+    serve_conn_as(bus, stream, Some(door))
+}
+
+fn serve_conn_as(bus: &Bus, stream: UnixStream, door: Option<&str>) -> Result<()> {
     let mut conn = Conn {
         reader: BufReader::new(stream.try_clone()?),
         out: stream,
@@ -319,7 +340,18 @@ pub(crate) fn serve_conn(bus: &Bus, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
-        if let Err(e) = serve_one(bus, &mut conn, req) {
+        let served = match door {
+            None => {
+                crate::door::check_main(bus, &req).and_then(|()| serve_one(bus, &mut conn, req))
+            }
+            Some(door) => crate::door::check(bus, door, req).and_then(|req| match req {
+                Request::Thread { id } => Ok(conn.write(&Thread {
+                    entries: crate::door::thread(bus, door, &id)?,
+                })?),
+                req => serve_one(bus, &mut conn, req),
+            }),
+        };
+        if let Err(e) = served {
             conn.write_err(&e)?;
         }
     }
@@ -459,9 +491,12 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             check_name(&agent)?;
             bus.db().agent_live(&agent, None, now_ms())?;
             let max = max.clamp(1, 100);
-            // An agent session's handoffs count toward the limit; the CLI's
-            // and a bridge's don't.
-            let how = if session == "cli" || session.starts_with(BRIDGE_SESSION) {
+            // An agent session's handoffs count toward the limit; the CLI's,
+            // a bridge's and a door's don't.
+            let how = if session == "cli"
+                || session.starts_with(BRIDGE_SESSION)
+                || session.starts_with(crate::door::DOOR_SESSION)
+            {
                 Handoff::Free
             } else {
                 Handoff::Tool
