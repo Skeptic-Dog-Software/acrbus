@@ -83,6 +83,9 @@ const ALLOWED_TOOLS_ENV: &str = "ACRBUS_ALLOWED_TOOLS";
 /// What a review's call to pi is told its thinking level was asked as, so
 /// the extension can say when pi rounds it to one the model has.
 const EFFORT_ENV: &str = "ACRBUS_EFFORT";
+/// "1" in a pi bridge's env, as its kind's defaults set it: acrbus's
+/// extension leaves pi's pointer to its own docs out of a review's prompt.
+const DROP_DOCS_ENV: &str = "ACRBUS_DROP_PI_DOCS";
 /// acrbus's extension for pi, which sends the cache key where a gateway
 /// passes it on, says what the cache served, and holds a call to its tools.
 const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
@@ -3067,7 +3070,10 @@ impl Bridge {
                 args.push("--append-system-prompt".into());
                 args.push(path.display().to_string());
             }
-            if kind == Kind::Pi && (plan.cache_key.is_some() || plan.allowed_tools.is_some()) {
+            let drops_docs = self.cfg.env.get(DROP_DOCS_ENV).is_some_and(|v| v == "1");
+            if kind == Kind::Pi
+                && (plan.cache_key.is_some() || plan.allowed_tools.is_some() || drops_docs)
+            {
                 args.push("-e".into());
                 args.push(self.extension()?.display().to_string());
             }
@@ -5717,6 +5723,115 @@ console.log(JSON.stringify(out));
         let unknown: toml::Value = toml::from_str("kind = \"codex\"").unwrap();
         let e = format!("{:#}", with_defaults(unknown).unwrap_err());
         assert!(e.contains("\"claude\", \"omp\" and \"pi\""), "{e}");
+    }
+
+    #[test]
+    fn a_pi_bridge_drops_pis_own_docs_from_reviews_unless_its_table_keeps_them() {
+        let table = |extra: &str| -> toml::Value {
+            toml::from_str(&format!(
+                "kind = \"pi\"\nowner = \"o\"\ncommand = \"/x/pi\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        // The kind's default turns it on, and a table can turn it off.
+        let on = with_defaults(table("")).unwrap();
+        assert_eq!(on["env"][DROP_DOCS_ENV].as_str(), Some("1"));
+        let off = with_defaults(table("[env]\nACRBUS_DROP_PI_DOCS = \"0\"\n")).unwrap();
+        assert_eq!(off["env"][DROP_DOCS_ENV].as_str(), Some("0"));
+        // With it on, every review call gets acrbus's extension, and the
+        // variable that has it drop the docs; a call that isn't a review
+        // gets neither the prompt nor the extension.
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'drop=%s\n' "$ACRBUS_DROP_PI_DOCS""#;
+        for (value, loads) in [("1", true), ("0", false)] {
+            let rig = Rig::new();
+            let bridge = rig.start(rig.settings(
+                script,
+                &format!("kind = \"pi\"\n[env]\nACRBUS_DROP_PI_DOCS = \"{value}\"\n"),
+            ));
+            let review = rig.reply_to(&rig.ask_with(with(RunOptions {
+                review: Some(true),
+                ..RunOptions::default()
+            })));
+            let plain = rig.reply_to(&rig.ask("not a review"));
+            bridge.stop().unwrap();
+            assert_eq!(review.contains("[-e]\n["), loads, "{value}: {review}");
+            assert!(review.contains(&format!("drop={value}")), "{review}");
+            assert!(!plain.contains("[-e]"), "{plain}");
+        }
+    }
+
+    #[test]
+    fn the_pi_extension_drops_only_pis_own_docs_block() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-docs-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const handlers = [];
+acrbus({ on: (name, f) => { if (name === "before_agent_start") handlers.push(f); } });
+const docs = "<docs>\nPi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /x/README.md\n- Additional docs: /x/docs\n</docs>";
+const prompt = (d) => "You are a coding assistant running inside pi.\n\n<tools>\n- read: Read files\n</tools>\n\n<rules>\n- Be concise in your responses\n</rules>\n\n" + d + "\n\n<addendum>\n# ACR\n</addendum>\n\n<cwd>\n/w\n</cwd>";
+const run = (p) => {
+  let out = null;
+  for (const h of handlers) {
+    const r = h({ systemPrompt: p }, {});
+    if (r && r.systemPrompt !== undefined) out = r.systemPrompt;
+  }
+  return out;
+};
+console.log(JSON.stringify({
+  pi: run(prompt(docs)),
+  other: run(prompt("<docs>\nOur own docs: read them.\n</docs>")),
+  none: run(prompt("")),
+}));
+"#,
+        )
+        .unwrap();
+        let run = |env: &[(&str, &str)]| -> serde_json::Value {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .env_remove("ACRBUS_CACHE_KEY")
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_EFFORT")
+                .env_remove(DROP_DOCS_ENV);
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let on = run(&[(DROP_DOCS_ENV, "1")]);
+        let pi = on["pi"].as_str().expect("the prompt, without pi's docs");
+        assert!(
+            !pi.contains("Pi documentation") && !pi.contains("<docs>"),
+            "{pi}"
+        );
+        // Everything else stays, in its order, with one blank line between.
+        assert!(
+            pi.contains("- Be concise in your responses\n</rules>\n\n<addendum>\n# ACR"),
+            "{pi}"
+        );
+        assert!(pi.contains("<tools>\n- read: Read files\n</tools>") && pi.ends_with("</cwd>"));
+        // A docs block pi didn't write, or none at all, is left alone.
+        assert_eq!(on["other"], serde_json::Value::Null);
+        assert_eq!(on["none"], serde_json::Value::Null);
+        // Off, nothing changes.
+        let off = run(&[(DROP_DOCS_ENV, "0")]);
+        assert_eq!(off["pi"], serde_json::Value::Null);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

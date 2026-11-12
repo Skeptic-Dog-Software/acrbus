@@ -17,12 +17,21 @@
 //   every role on the bridge is given the same tool definitions so their
 //   prompts share a cached prefix. A call to any other tool is refused, and
 //   says so. It fails closed: a list it can't read refuses every tool.
+// - ACRBUS_DROP_PI_DOCS=1: a review's system prompt leaves out pi's pointer
+//   to its own documentation, which says itself it's for questions about
+//   the harness, never a review's: one less block every turn sends again.
+//   Only that block goes, and only when it reads as pi wrote it; the tools,
+//   their rules and everything else stay.
 
 // The headers the key goes in: the provider's own, and the same through a
 // gateway that forwards only what's prefixed for it.
 const KEY_HEADERS = ["x-session-affinity", "x-bf-eh-x-session-affinity"];
 // Response headers that count the prompt tokens read from the cache.
 const CACHED_HEADERS = ["fireworks-cached-prompt-tokens", "x-cached-prompt-tokens"];
+
+// pi's <docs> section, as pi writes it: what it says it's for, then its
+// paths. Anything else in a <docs> block is left alone.
+const PI_DOCS = /\n*<docs>\nPi documentation \(read only when the user asks about the harness itself[\s\S]*?\n<\/docs>/;
 
 // An OpenAI chat completions request, which takes `user`: by the model's API
 // when pi says, otherwise by its shape, so no other API's request gets a
@@ -69,6 +78,13 @@ export default function acrbus(pi) {
       const model = ctx?.model?.id ?? "this model";
       console.error(`acrbus effort: asked for thinking ${effort}, which ${model} doesn't have, so pi uses ${used}`);
       return undefined;
+    });
+  }
+  if (process.env.ACRBUS_DROP_PI_DOCS === "1") {
+    pi.on("before_agent_start", (event) => {
+      const prompt = event?.systemPrompt;
+      if (typeof prompt !== "string" || !PI_DOCS.test(prompt)) return undefined;
+      return { systemPrompt: prompt.replace(PI_DOCS, "") };
     });
   }
   const listed = process.env.ACRBUS_ALLOWED_TOOLS;

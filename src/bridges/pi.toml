@@ -10,6 +10,12 @@ args = ["-p", "--model", "{MODEL}", "--session-dir", "{SESSION_DIR}", "--no-exte
 timeout_secs = 14400
 max_concurrent = 3
 
+[env]
+# A review's prompt leaves out pi's pointer to its own docs, which pi says
+# are for questions about pi itself: "0" keeps it. acrbus's extension, which
+# every review call gets while this is on, does it.
+ACRBUS_DROP_PI_DOCS = "1"
+
 [options]
 max_timeout_secs = 14400
 tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
@@ -28,3 +34,10 @@ cache_read = "message.usage.cacheRead"
 cache_write = "message.usage.cacheWrite"
 usd = "message.usage.cost.total"
 model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "toolCall" }
+name = "name"
+names = ["read"]
+path = "arguments.path"

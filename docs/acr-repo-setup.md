@@ -304,6 +304,8 @@ since by then it holds the change's context.
     reviewers: all        # facts-only: no briefs a model wrote, and no
                           # decided non-issues (the Judge still applies them)
     match_tools: true     # same tool definitions for roles on one model
+    learned: true         # give the files reviewers keep opening, whole
+    learned_bytes: 24576  # the most bytes of them a round's facts carry
   ```
 
   With `match_tools`, the reviewers and the Judge bound to one bridge and
@@ -327,6 +329,25 @@ since by then it holds the change's context.
   `high` and `max`, so `medium` runs as `high`. `acrbus acr judge-check
   --per-finding` sets per-finding verdicts against per-lens ones on a key,
   before you switch.
+- **Fewer turns.** A reviewer's cost is mostly what each turn reads again:
+  everything before it. So the map carries what reviewers would otherwise
+  spend turns to open. Each reviewer call's bridge says which files its
+  agent read; the review counts them per lens in a record kept for the
+  repository (`acr-learned/<name>.json` in the state folder), and each
+  round's facts carry the files this repository's reviewers keep opening,
+  whole, after the change's own files, most opened first, up to
+  `learned_bytes`, each one opened by at least two reviewer calls. Every
+  reviewer and Judge reads them again each turn, so a file pays only when
+  reviewers would open it early anyway: keep the budget small, and watch
+  turns and cache reads per reviewer when you change it. A file given once stays where it was for the rest of the
+  review, so the facts only grow at their end, and the next review of the
+  repository starts with what this one learned. Nothing is taken away: a
+  reviewer still opens what it likes, and its prompt asks it to read from
+  the facts first and to ask for several files in one turn. Trials don't
+  learn or use the record, so their arms stay blind. `learned: false` turns
+  it off. A pi bridge also leaves pi's pointer to its own documentation out
+  of a review's prompt, since pi says it's for questions about pi itself:
+  its kind sets `ACRBUS_DROP_PI_DOCS = "1"` in its `env`, and `"0"` keeps it.
 - **Plan's estimate.** `acrbus acr plan` counts only the text the review
   sends and reads back. `costs.per_call` adds a measured average for each
   role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to

@@ -21,6 +21,14 @@
 //! review comments, which can grow during a review, and this round's gate.
 //! Nothing that varies between rounds or calls, no round number, count of
 //! calls, time or path of a copy, sits before a fact that doesn't.
+//!
+//! With a record of what this repository's reviewers open (see
+//! `learned`), the files they keep opening come too, whole, after the
+//! change's own files of the same round: each a file the change doesn't
+//! touch, which a reviewer would otherwise spend turns to open, every turn
+//! reading again all that came before. A file once given stays for the rest
+//! of the review, in the place it was given, so a round's facts only grow
+//! at their end; one a fix touches moves to the round it changed in.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -73,10 +81,38 @@ pub struct FileFacts {
     pub diff: String,
 }
 
+/// A file the change doesn't touch that this repository's reviewers keep
+/// opening, given whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnedFile {
+    pub path: String,
+    /// Its content, by hash, as [`FileFacts::blob`].
+    pub blob: String,
+    /// The round it was first given, or last changed.
+    pub since: u32,
+    pub text: String,
+}
+
 /// A round's facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub files: Vec<FileFacts>,
+    /// Files reviewers keep opening, in the order they're given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned: Vec<LearnedFile>,
+}
+
+/// What [`Facts::add_learned`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LearnedAdded {
+    /// Files given, the earlier rounds' included.
+    pub files: usize,
+    /// Their bytes.
+    pub bytes: usize,
+    /// Files new this round.
+    pub new: usize,
+    /// Files the record ranks that the budget left out.
+    pub left_out: usize,
 }
 
 impl Facts {
@@ -102,7 +138,90 @@ impl Facts {
             files.push(map_file(repo, &path, &part, &blob, round, &mut searches));
         }
         files.sort_by(|a, b| (a.since, &a.path).cmp(&(b.since, &b.path)));
-        Facts { files }
+        Facts {
+            files,
+            learned: Vec::new(),
+        }
+    }
+
+    /// Adds the files `ranked` names, most opened first, to what `prior`
+    /// gave, within `budget` bytes of their text, reading each from the
+    /// checkout at `repo`. A file `prior` gave stays where it was, with its
+    /// round, unless its content changed, which moves it to `round`; one the
+    /// change now touches, or that's gone, drops out. Each new file comes
+    /// after them, at `round`. A file the change touches, one that isn't
+    /// text, or one that doesn't fit what's left of the budget, isn't added.
+    pub fn add_learned(
+        &mut self,
+        repo: &Path,
+        round: u32,
+        prior: Option<&Facts>,
+        ranked: &[(String, u32)],
+        budget: usize,
+    ) -> LearnedAdded {
+        let changed: BTreeSet<&str> = self.files.iter().map(|f| f.path.as_str()).collect();
+        let mut learned: Vec<LearnedFile> = Vec::new();
+        let mut bytes = 0usize;
+        let read = |path: &str| -> Option<String> {
+            let full = repo.join(path);
+            let meta = fs::symlink_metadata(&full).ok()?;
+            if !meta.file_type().is_file() {
+                return None;
+            }
+            let text = fs::read_to_string(&full).ok()?;
+            (!text.contains('\0')).then_some(text)
+        };
+        for old in prior.map(|p| p.learned.as_slice()).unwrap_or_default() {
+            if changed.contains(old.path.as_str()) {
+                continue;
+            }
+            let blob = blob_of(repo, &old.path);
+            if blob == DELETED || blob.is_empty() {
+                continue;
+            }
+            let kept = if blob == old.blob {
+                old.clone()
+            } else {
+                let Some(text) = read(&old.path) else {
+                    continue;
+                };
+                LearnedFile {
+                    path: old.path.clone(),
+                    blob,
+                    since: round,
+                    text,
+                }
+            };
+            bytes += kept.text.len();
+            learned.push(kept);
+        }
+        let mut added = LearnedAdded::default();
+        for (path, _) in ranked {
+            if changed.contains(path.as_str()) || learned.iter().any(|l| &l.path == path) {
+                continue;
+            }
+            let Some(text) = read(path) else {
+                continue;
+            };
+            if bytes + text.len() > budget {
+                added.left_out += 1;
+                continue;
+            }
+            bytes += text.len();
+            added.new += 1;
+            learned.push(LearnedFile {
+                path: path.clone(),
+                blob: blob_of(repo, path),
+                since: round,
+                text,
+            });
+        }
+        // Earlier rounds' first, each where it was; then this round's.
+        learned.sort_by_key(|l| l.since);
+        added.files = learned.len();
+        added.bytes = bytes;
+        self.learned = learned;
+        added
     }
 
     /// The facts as every role gets them: the same bytes for every call in a
@@ -122,8 +241,18 @@ impl Facts {
         if let Some(pr) = pr {
             out.push_str(&pr.said());
         }
+        // Each round's files: the change's, then those reviewers keep
+        // opening, so what a later round adds comes after all of an
+        // earlier one's.
+        let mut learned = self.learned.iter().peekable();
         for f in &self.files {
+            while let Some(l) = learned.next_if(|l| l.since < f.since) {
+                out.push_str(&render_learned(l));
+            }
             out.push_str(&render_file(f));
+        }
+        for l in learned {
+            out.push_str(&render_learned(l));
         }
         out.push_str(&format!("\n# This round\n\nRound {round}.\n"));
         if let Some(c) = pr.map(|p| p.comments.trim()).filter(|c| !c.is_empty()) {
@@ -323,6 +452,18 @@ pub fn pr_text(view: &str, inline: &str) -> Result<PrText> {
         issues,
         comments: cut(&comments, MAX_PR_TEXT),
     })
+}
+
+fn render_learned(l: &LearnedFile) -> String {
+    let text = normalize(&l.text);
+    // A fence longer than any run of backticks in the file.
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!(
+        "\n## Often read: {}\n\nNot touched by the change: this repository's reviewers keep \
+         opening it, so it's here whole.\n\n{fence}\n{text}{fence}\n",
+        l.path
+    )
 }
 
 fn render_file(f: &FileFacts) -> String {
@@ -718,6 +859,165 @@ mod tests {
         assert!(bare.issues.is_empty() && bare.comments.is_empty() && bare.body.is_empty());
     }
 
+    /// A repository of plain files, committed, so their blobs hash.
+    fn learned_repo(files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tb-learnedfacts-{}", crate::util::new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        for (path, text) in files {
+            let full = dir.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, text).unwrap();
+        }
+        dir
+    }
+
+    fn changed(path: &str, since: u32) -> FileFacts {
+        FileFacts {
+            path: path.into(),
+            blob: "b".into(),
+            since,
+            symbols: Vec::new(),
+            references: Vec::new(),
+            tests: Vec::new(),
+            diff: "+x\n".into(),
+        }
+    }
+
+    fn ranked(paths: &[&str]) -> Vec<(String, u32)> {
+        paths
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, p)| (p.to_string(), i as u32 + 1))
+            .rev()
+            .collect()
+    }
+
+    #[test]
+    fn often_read_files_come_after_the_change_s_own_and_only_grow_at_the_end() {
+        let repo = learned_repo(&[
+            ("src/changed.rs", "changed"),
+            ("src/types.rs", "pub struct T;\n"),
+            ("src/util.rs", "pub fn u() {}\n"),
+            ("docs/guide.md", "how it works\n"),
+        ]);
+        let mut round1 = Facts {
+            files: vec![changed("src/changed.rs", 1)],
+            learned: Vec::new(),
+        };
+        let added = round1.add_learned(
+            &repo,
+            1,
+            None,
+            &ranked(&["src/changed.rs", "src/types.rs", "src/util.rs"]),
+            1024,
+        );
+        assert_eq!((added.files, added.new, added.left_out), (2, 2, 0));
+        let paths: Vec<&str> = round1.learned.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["src/types.rs", "src/util.rs"],
+            "the change's own file isn't repeated"
+        );
+        let text1 = round1.render(1, None);
+        let at = |t: &str, what: &str| t.find(what).unwrap_or_else(|| panic!("{what} in {t}"));
+        assert!(at(&text1, "## src/changed.rs") < at(&text1, "## Often read: src/types.rs"));
+        assert!(at(&text1, "## Often read: src/util.rs") < at(&text1, "# This round"));
+        assert!(text1.contains("pub struct T;"), "given whole");
+        // Round 2: a fix touched another file, and the record ranks a new
+        // file first. What round 1 gave stays where it was, the new comes
+        // after, and round 2 shares round 1's bytes up to its first change.
+        let mut round2 = Facts {
+            files: vec![changed("src/changed.rs", 1), changed("src/fixed.rs", 2)],
+            learned: Vec::new(),
+        };
+        round2.add_learned(
+            &repo,
+            2,
+            Some(&round1),
+            &ranked(&["docs/guide.md", "src/util.rs", "src/types.rs"]),
+            1024,
+        );
+        let paths: Vec<&str> = round2.learned.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["src/types.rs", "src/util.rs", "docs/guide.md"]);
+        let text2 = round2.render(2, None);
+        let shared = text1.find("\n# This round").unwrap();
+        assert_eq!(
+            &text2[..shared],
+            &text1[..shared],
+            "round 1's facts are round 2's prefix"
+        );
+        assert!(at(&text2, "## src/fixed.rs") < at(&text2, "## Often read: docs/guide.md"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn often_read_files_keep_to_the_budget_and_follow_their_content() {
+        let repo = learned_repo(&[
+            ("a.rs", "aaaa"),
+            ("big.rs", &"b".repeat(100)),
+            ("c.rs", "cc"),
+            ("bin.dat", "x\0y"),
+        ]);
+        let mut f = Facts::default();
+        let added = f.add_learned(
+            &repo,
+            1,
+            None,
+            &ranked(&["big.rs", "a.rs", "bin.dat", "gone.rs", "c.rs"]),
+            10,
+        );
+        let paths: Vec<&str> = f.learned.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.rs", "c.rs"],
+            "what fits, no binary, nothing missing"
+        );
+        assert_eq!((added.bytes, added.left_out), (6, 1));
+        // A file whose content changed moves to the round it changed in.
+        fs::write(repo.join("a.rs"), "a2").unwrap();
+        let mut next = Facts::default();
+        next.add_learned(&repo, 2, Some(&f), &[], 10);
+        let a = next.learned.iter().find(|l| l.path == "a.rs").unwrap();
+        assert_eq!((a.since, a.text.as_str()), (2, "a2"));
+        assert_eq!(
+            next.learned.last().unwrap().path,
+            "a.rs",
+            "after the unchanged"
+        );
+        // One the change now touches drops out.
+        let mut touched = Facts {
+            files: vec![changed("c.rs", 2)],
+            learned: Vec::new(),
+        };
+        touched.add_learned(&repo, 2, Some(&f), &[], 10);
+        assert!(touched.learned.iter().all(|l| l.path != "c.rs"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn an_often_read_file_s_fence_outlasts_its_backticks() {
+        let l = LearnedFile {
+            path: "doc.md".into(),
+            blob: "b".into(),
+            since: 1,
+            text: "```rust\nfn x() {}\n```\n".into(),
+        };
+        let r = render_learned(&l);
+        assert!(r.contains("````\n```rust"), "{r}");
+        assert!(r.trim_end().ends_with("````"), "{r}");
+    }
+
     #[test]
     fn a_pull_requests_words_sit_where_the_cache_wants_them() {
         let facts = Facts {
@@ -730,6 +1030,7 @@ mod tests {
                 tests: Vec::new(),
                 diff: "+retry\n".into(),
             }],
+            learned: Vec::new(),
         };
         let pr = PrText {
             number: 7,

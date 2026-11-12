@@ -41,3 +41,10 @@ output = "message.usage.output_tokens"
 cache_read = "message.usage.cache_read_input_tokens"
 cache_write = "message.usage.cache_creation_input_tokens"
 model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "tool_use" }
+name = "name"
+names = ["Read"]
+path = "input.file_path"

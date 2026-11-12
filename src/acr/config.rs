@@ -358,6 +358,14 @@ pub struct FactsPolicy {
     /// Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_tools: Option<bool>,
+    /// Learn which files this repository's reviewers open, and give the
+    /// ones they keep opening whole in later rounds' facts, and in the next
+    /// review's. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned: Option<bool>,
+    /// The most bytes of such files a round's facts carry. Default 24576.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_bytes: Option<u64>,
 }
 
 impl FactsPolicy {
@@ -369,6 +377,8 @@ impl FactsPolicy {
             judges: later.judges.or(self.judges),
             reviewers: later.reviewers.or(self.reviewers),
             match_tools: later.match_tools.or(self.match_tools),
+            learned: later.learned.or(self.learned),
+            learned_bytes: later.learned_bytes.or(self.learned_bytes),
         }
     }
 }
@@ -398,6 +408,8 @@ pub struct FactsConfig {
     pub judges: JudgeMode,
     pub reviewers: ReviewerInput,
     pub match_tools: bool,
+    pub learned: bool,
+    pub learned_bytes: u64,
 }
 
 impl Default for FactsConfig {
@@ -409,6 +421,8 @@ impl Default for FactsConfig {
             judges: JudgeMode::PerLens,
             reviewers: ReviewerInput::All,
             match_tools: true,
+            learned: true,
+            learned_bytes: 24 * 1024,
         }
     }
 }
@@ -424,6 +438,8 @@ impl FactsConfig {
             judges: p.judges.unwrap_or(d.judges),
             reviewers: p.reviewers.unwrap_or(d.reviewers),
             match_tools: p.match_tools.unwrap_or(d.match_tools),
+            learned: p.learned.unwrap_or(d.learned),
+            learned_bytes: p.learned_bytes.unwrap_or(d.learned_bytes),
         }
     }
 }
