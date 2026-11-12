@@ -2417,6 +2417,22 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
 
 /// `acrbus acr check`: prints how each session did. Returns whether all did
 /// as they should.
+/// A check's findings for a review's session, with reading outside its
+/// folders taken out unless its bridge confines it: an agent nothing keeps
+/// in may read outside by the person's choice, which a check says rather
+/// than fails. Returns the rest, and whether it read outside.
+fn outside_is_a_note(wrong: Vec<String>, confined: bool) -> (Vec<String>, bool) {
+    if confined {
+        return (wrong, false);
+    }
+    let read_outside = wrong.iter().any(|w| w == trial::READ_OUTSIDE);
+    let rest = wrong
+        .into_iter()
+        .filter(|w| w != trial::READ_OUTSIDE)
+        .collect();
+    (rest, read_outside)
+}
+
 fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
     let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
     let canary = trial::Canary::new(paths)?;
@@ -2438,9 +2454,18 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             }
         }
     };
-    let started = std::time::Instant::now();
-    let wrong = trial::check_session(paths, &s, &key, &canary);
-    report("a builder's session", started, wrong);
+    // Only a trial needs a builder of its own: in a review, the session
+    // that runs it is the builder.
+    if let Some(why) = trial::builder_missing(paths) {
+        println!(
+            "a trial's builder session: not checked, since {why}. A review doesn't need it: \
+             the session that runs `{APP_NAME} acr run` is its builder"
+        );
+    } else {
+        let started = std::time::Instant::now();
+        let wrong = trial::check_session(paths, &s, &key, &canary);
+        report("a builder's session", started, wrong);
+    }
 
     // The separated design's bindings: one call for each bridge and set of
     // tools, since that's what decides how a session starts.
@@ -2533,7 +2558,22 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
                 place = if in_copy { ", in a copy" } else { "" }
             ),
         });
-        let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent);
+        let confined = crate::bridge::load(paths, bridge).is_ok_and(|set| {
+            set.args
+                .iter()
+                .chain(&set.extra_args)
+                .any(|a| a == "--settings")
+        });
+        let mut outside = false;
+        let wrong = answer.map(|a| {
+            let (wrong, read_outside) = outside_is_a_note(
+                trial::check_answer(&a.text, &key.head, &canary.secret, bash),
+                confined,
+            );
+            outside = read_outside;
+            wrong
+        });
         let place = if in_copy {
             ", in a copy of its own"
         } else {
@@ -2544,6 +2584,12 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             started,
             wrong,
         );
+        if outside {
+            println!(
+                "  note: it can read files outside its folders. Nothing keeps this agent's \
+                 reads to the code under review, which is yours to judge"
+            );
+        }
     }
     let _ = fs::remove_dir_all(&copies);
     // A review to convergence's steelman, which writes in the copy.
@@ -3804,6 +3850,35 @@ mod tests {
             panic!("a bridge without it needs a fix");
         };
         assert!(fix.contains(&arg) && fix.contains("set `kind`"), "{fix}");
+    }
+
+    #[test]
+    fn a_check_says_an_unconfined_agent_reads_outside_and_fails_a_confined_one() {
+        let read = vec![
+            trial::READ_OUTSIDE.to_string(),
+            "its Bash didn't run".to_string(),
+        ];
+        let (rest, outside) = outside_is_a_note(read.clone(), false);
+        assert_eq!(rest, ["its Bash didn't run"]);
+        assert!(outside);
+        let (rest, outside) = outside_is_a_note(read.clone(), true);
+        assert_eq!(rest, read, "a confined agent that read outside is wrong");
+        assert!(!outside);
+    }
+
+    #[test]
+    fn a_check_needs_no_trial_builder_where_claude_code_isnt_set_up() {
+        let dir = std::env::temp_dir().join(format!("tb-acr-builder-{}", new_id()));
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        let why = trial::builder_missing(&paths).unwrap();
+        assert!(why.contains("setup acr"), "{why}");
+        fs::create_dir_all(dir.join("acr")).unwrap();
+        fs::write(dir.join("acr").join(crate::setup::CONFINE_FILE), "{}").unwrap();
+        assert_eq!(trial::builder_missing(&paths), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

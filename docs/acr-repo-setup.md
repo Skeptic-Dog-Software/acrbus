@@ -288,8 +288,13 @@ acrbus acr plan --base <ref>     # tier, lenses, bindings, cost; no model calls
 ```
 
 `acrbus acr check <key>` checks that each kind of session starts. It also
-checks that each one reads the copy, is refused a file outside it, and, for
-a reviewer with a shell, works in a copy of its own.
+checks that each one reads the copy and, for a reviewer with a shell, works
+in a copy of its own. It says whether a session can read a file outside its
+folders. That fails the check only for an agent its bridge confines, as
+`acrbus setup acr` confines Claude Code's file tools; for any other agent
+it's a note, and yours to judge. A trial's builder runs on Claude Code, so
+its session is checked only where `setup acr` has set that up; a review
+doesn't need it, since the session that runs the review is its builder.
 
 ## 7. Calibrate: configure it from the repository, then from your feedback
 
