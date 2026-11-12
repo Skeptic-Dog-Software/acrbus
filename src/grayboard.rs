@@ -31,7 +31,9 @@ pub const SESSION_META: &str = "io.github.nolnoch.grayboard/sessionID";
 pub const DELIVERY_META: &str = "io.github.nolnoch.grayboard/delivery";
 const PROTOCOL: &str = "2025-06-18";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SCOPES: &str = "grayboard:tools grayboard:delivery";
+/// Only tools: acrbus polls `dm_inbox` with a declared poll mode and never
+/// opens delivery, which is all `grayboard:delivery` gates.
+const SCOPES: &str = "grayboard:tools";
 /// How long a sign-in waits for the browser.
 const LOGIN_WAIT: Duration = Duration::from_secs(15 * 60);
 /// An access token this close to expiry is refreshed first.
@@ -96,6 +98,11 @@ pub struct Grant {
     #[serde(default)]
     refresh: Option<String>,
     pub signed_in_at: i64,
+    /// Set just before a refresh is sent and cleared once its outcome is
+    /// known. Still set at the next start, the outcome is unknown, and the
+    /// refresh token is never sent again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_pending: Option<i64>,
 }
 
 impl fmt::Debug for Grant {
@@ -367,6 +374,7 @@ fn granted(paths: &Paths, base: &Grant, v: &Value) -> Result<Grant> {
         .to_string();
     let expires = v["expires_in"].as_i64().unwrap_or(3600);
     let mut g = base.clone();
+    g.refresh_pending = None;
     g.access = access;
     g.access_expires_at = now_ms() + expires * 1000;
     if let Some(r) = v["refresh_token"].as_str() {
@@ -377,6 +385,183 @@ fn granted(paths: &Paths, base: &Grant, v: &Value) -> Result<Grant> {
     }
     write_grant(paths, &g)?;
     Ok(g)
+}
+
+// Refreshing, and losing a grant safely.
+
+/// How a refresh came out, by whether the server may have spent its token.
+/// The server revokes the whole grant on any reuse of a spent refresh
+/// token, so only a refresh it certainly never spent is tried again.
+enum Refreshed {
+    /// A new grant, its token rotated.
+    Granted(Value),
+    /// Refused or failed before the server spent the token: a later tick
+    /// may try it again.
+    NotSpent(Trouble),
+    /// The token is dead (`invalid_grant`): only a new sign-in helps.
+    Dead(String),
+    /// Anything else: the token may be spent, so it's never sent again.
+    Unknown(String),
+}
+
+/// Whether a request certainly never reached the server: refused,
+/// unresolvable, unroutable, or timed out while connecting. ureq reports a
+/// refused or unroutable connect as one of these I/O kinds, which only a
+/// connect can give.
+fn never_sent(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::ConnectionFailed
+        | ureq::Error::HostNotFound
+        | ureq::Error::BadUri(_)
+        | ureq::Error::InvalidProxyUrl
+        | ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
+    }
+}
+
+fn refresh_request(http: &ureq::Agent, endpoint: &str, body: &str) -> Refreshed {
+    let resp = match http
+        .post(endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(r) => r,
+        Err(e) if never_sent(&e) => {
+            return Refreshed::NotSpent(Trouble::Unreachable(e.to_string()));
+        }
+        Err(e) => {
+            return Refreshed::Unknown(format!(
+                "the refresh failed after it may have reached the server ({e})"
+            ));
+        }
+    };
+    let r = match read(resp) {
+        Ok(r) => r,
+        Err(e) => return Refreshed::Unknown(format!("the refresh's answer was lost ({e:#})")),
+    };
+    let v: Value = serde_json::from_str(&r.text).unwrap_or(Value::Null);
+    let code = v["error"].as_str().unwrap_or("");
+    match r.status {
+        200 if v["access_token"].is_string() => Refreshed::Granted(v),
+        200 => Refreshed::Unknown("the refresh's answer had no access token".into()),
+        503 | 429 if code == "temporarily_unavailable" => {
+            Refreshed::NotSpent(Trouble::Unreachable(format!(
+                "the token endpoint is unavailable for now (HTTP {})",
+                r.status
+            )))
+        }
+        status if code == "invalid_client" => Refreshed::NotSpent(Trouble::SignedOut(format!(
+            "the server doesn't know the client acrbus signs in as (HTTP {status}: \
+             invalid_client): ask its operator to register it"
+        ))),
+        status if code == "invalid_grant" => Refreshed::Dead(format!(
+            "the server no longer takes the sign-in (HTTP {status}: invalid_grant)"
+        )),
+        status => Refreshed::Unknown(format!("the token endpoint answered HTTP {status}")),
+    }
+}
+
+fn revoke_queue_path(paths: &Paths) -> PathBuf {
+    dir(paths).join("revoke-queue.json")
+}
+
+/// A refresh token to revoke, kept until the server takes the revocation.
+#[derive(Clone, Serialize, Deserialize)]
+struct QueuedRevoke {
+    endpoint: String,
+    client_id: String,
+    token: String,
+}
+
+/// Revokes refresh token `token` (RFC 7009). Ok once the server answered.
+fn revoke(http: &ureq::Agent, endpoint: &str, client_id: &str, token: &str) -> Result<()> {
+    let body = form(&[
+        ("token", token),
+        ("token_type_hint", "refresh_token"),
+        ("client_id", client_id),
+    ]);
+    let r = read(
+        http.post(endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body.as_bytes())
+            .map_err(unreachable)?,
+    )?;
+    if r.status == 200 {
+        Ok(())
+    } else {
+        bail!("the revocation endpoint answered HTTP {}", r.status)
+    }
+}
+
+/// Sends the revocations still queued, keeping any that fail again.
+/// Returns how many are left.
+fn send_queued_revokes(paths: &Paths, http: &ureq::Agent) -> usize {
+    let path = revoke_queue_path(paths);
+    let queued: Vec<QueuedRevoke> = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if queued.is_empty() {
+        return 0;
+    }
+    let left: Vec<QueuedRevoke> = queued
+        .into_iter()
+        .filter(|q| revoke(http, &q.endpoint, &q.client_id, &q.token).is_err())
+        .collect();
+    let _ = serde_json::to_vec(&left).map(|b| write_private(&path, &b));
+    left.len()
+}
+
+/// Gives up a grant whose refresh token is dead, or whose last refresh had
+/// an unknown outcome. With `revoke`, the token is revoked, or queued for
+/// the next sign-in or sign-out to revoke, and never sent as a refresh
+/// again. Returns what to say: the cause and how to sign in again.
+fn lose(paths: &Paths, grant: &Grant, why: &str, revoke_it: bool) -> anyhow::Error {
+    let mut fate = String::new();
+    if revoke_it && let Some(token) = &grant.refresh {
+        let http = agent(Duration::from_secs(20));
+        let sent = grant
+            .revocation_endpoint
+            .as_deref()
+            .is_some_and(|ep| revoke(&http, ep, &grant.client_id, token).is_ok());
+        if sent {
+            fate = " Its refresh token was revoked, and won't be sent again.".into();
+        } else if let Some(ep) = &grant.revocation_endpoint {
+            let path = revoke_queue_path(paths);
+            let mut queued: Vec<QueuedRevoke> = fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            queued.push(QueuedRevoke {
+                endpoint: ep.clone(),
+                client_id: grant.client_id.clone(),
+                token: token.clone(),
+            });
+            let _ = serde_json::to_vec(&queued).map(|b| write_private(&path, &b));
+            fate = " Its refresh token couldn't be revoked now: the next sign-in or sign-out \
+                    revokes it, and it won't be sent again."
+                .into();
+        } else {
+            fate = " It won't be sent again.".into();
+        }
+    }
+    let _ = serde_json::to_vec_pretty(&json!({
+        "signed_out_at": now_ms(),
+        "server": grant.server,
+        "lost": why,
+    }))
+    .map(|b| write_private(&grant_path(paths), &b));
+    anyhow!(Trouble::SignedOut(format!(
+        "the sign-in was lost: {why}.{fate} Run `{APP_NAME} grayboard login` to sign in again"
+    )))
 }
 
 // Signing in.
@@ -496,8 +681,11 @@ pub fn login(paths: &Paths, cfg: &GrayboardConfig, present: &dyn Fn(&str)) -> Re
         access_expires_at: 0,
         refresh: None,
         signed_in_at: now_ms(),
+        refresh_pending: None,
     };
-    granted(paths, &base, &v)
+    let g = granted(paths, &base, &v)?;
+    send_queued_revokes(paths, &http);
+    Ok(g)
 }
 
 /// `acrbus grayboard logout`: revokes the refresh token, if the server
@@ -506,20 +694,17 @@ pub fn logout(paths: &Paths) -> Result<bool> {
     let Some(g) = read_grant(paths) else {
         return Ok(false);
     };
-    if let (Some(endpoint), Some(refresh)) = (&g.revocation_endpoint, &g.refresh) {
-        let http = agent(Duration::from_secs(20));
-        let body = form(&[
-            ("token", refresh),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", &g.client_id),
-        ]);
-        if let Err(e) = http
-            .post(endpoint)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(body.as_bytes())
-        {
-            eprintln!("{APP_NAME}: couldn't revoke the sign-in on the server: {e}");
-        }
+    let http = agent(Duration::from_secs(20));
+    if let (Some(endpoint), Some(refresh)) = (&g.revocation_endpoint, &g.refresh)
+        && let Err(e) = revoke(&http, endpoint, &g.client_id, refresh)
+    {
+        eprintln!("{APP_NAME}: couldn't revoke the sign-in on the server: {e:#}");
+    }
+    let left = send_queued_revokes(paths, &http);
+    if left > 0 {
+        eprintln!(
+            "{APP_NAME}: {left} earlier sign-in(s) still couldn't be revoked; the next sign-in or sign-out tries again."
+        );
     }
     write_private(
         &grant_path(paths),
@@ -564,6 +749,15 @@ impl Session {
                 "run `{APP_NAME} grayboard login`"
             )))
         })?;
+        if grant.refresh_pending.is_some() {
+            return Err(lose(
+                paths,
+                &grant,
+                "a refresh was under way when acrbus last stopped, so whether the server spent \
+                 its token is unknown",
+                true,
+            ));
+        }
         Ok(Session {
             paths: paths.clone(),
             http: agent(Duration::from_secs(30)),
@@ -606,7 +800,11 @@ impl Session {
                 "the sign-in has lapsed: run `{APP_NAME} grayboard login`"
             )));
         };
-        let v = token_request(
+        // Marked before it's sent: should acrbus stop before the answer, the
+        // next start knows the outcome is unknown and never sends it again.
+        self.grant.refresh_pending = Some(now_ms());
+        write_grant(&self.paths, &self.grant)?;
+        let outcome = refresh_request(
             &self.http,
             &self.grant.token_endpoint,
             &form(&[
@@ -615,10 +813,31 @@ impl Session {
                 ("refresh_token", &refresh),
                 ("resource", &self.grant.resource),
             ]),
-        )?;
-        // Saved before it's used: the old refresh token no longer works.
-        self.grant = granted(&self.paths, &self.grant, &v)?;
-        Ok(())
+        );
+        match outcome {
+            // Saved before it's used: the old refresh token no longer works.
+            Refreshed::Granted(v) => {
+                self.grant = granted(&self.paths, &self.grant, &v)?;
+                Ok(())
+            }
+            Refreshed::NotSpent(t) => {
+                self.grant.refresh_pending = None;
+                write_grant(&self.paths, &self.grant)?;
+                Err(anyhow!(t))
+            }
+            Refreshed::Dead(why) => Err(self.lost(&why, false)),
+            Refreshed::Unknown(why) => Err(self.lost(&why, true)),
+        }
+    }
+
+    /// Gives up this session's grant (`lose`), and forgets its tokens here
+    /// too, so nothing in this process can send them again.
+    fn lost(&mut self, why: &str, revoke_it: bool) -> anyhow::Error {
+        let e = lose(&self.paths, &self.grant, why, revoke_it);
+        self.grant.refresh = None;
+        self.grant.access = String::new();
+        self.grant.access_expires_at = 0;
+        e
     }
 
     /// Posts one JSON-RPC message; its answer, if it has an ID.
