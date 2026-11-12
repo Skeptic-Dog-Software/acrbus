@@ -1821,9 +1821,11 @@ mod tests {
             r#""r1": {"sender": "acr@here", "since": 0, "attempt": 1}"#,
         );
         status("idle", "");
+        // As a review's process marks itself: its ID, and when it started.
         let review = paths.state.join("acr").join("rv1");
         fs::create_dir_all(&review).unwrap();
-        fs::write(review.join("pid"), me.to_string()).unwrap();
+        let started = crate::bridge::process_started(me as i32).unwrap_or_default();
+        fs::write(review.join("pid"), format!("{me}\n{started}\n")).unwrap();
         assert_eq!(under_way(&paths, &bridges, true), (1, 1));
         // A bridge's own restart only waits for its own runs.
         assert_eq!(under_way(&paths, &["idle".to_string()], false), (0, 0));

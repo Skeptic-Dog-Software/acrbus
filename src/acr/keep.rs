@@ -25,7 +25,9 @@ const HISTORY: &str = "history.jsonl";
 pub const HISTORY_RUNS: usize = 20;
 /// How long a review waiting for a person stays before it's taken as left.
 const UNFINISHED: Duration = crate::cleanup::KEEP;
-/// In a review's directory while a process is driving it: that process's ID.
+/// In a review's directory while a process is driving it: that process's
+/// ID, and on the next line when it started, as `ps` says it, so a later
+/// process given the same ID is never taken for it.
 const ACTIVE_MARK: &str = "pid";
 
 /// Marks a review as under way in this process until it's dropped, so an
@@ -42,7 +44,9 @@ pub fn active_guard(paths: &Paths, id: &str) -> Result<Active> {
     let review = dir(paths).join(id);
     fs::create_dir_all(&review)?;
     let mark = review.join(ACTIVE_MARK);
-    fs::write(&mark, std::process::id().to_string())?;
+    let pid = std::process::id();
+    let started = crate::bridge::process_started(pid as i32).unwrap_or_default();
+    fs::write(&mark, format!("{pid}\n{started}\n"))?;
     Ok(Active(mark))
 }
 
@@ -53,6 +57,58 @@ fn alive(pid: i32) -> bool {
     ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// The command line of process `pid`, as `ps` gives it.
+fn command_of(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The process driving review `id` now, if one is: the ID its mark names,
+/// only while that's still the process that wrote it. A mark from before
+/// marks said when their process started is trusted only for a process
+/// that's running an `acr` command.
+pub fn live(paths: &Paths, id: &str) -> Option<i32> {
+    let mark = fs::read_to_string(dir(paths).join(id).join(ACTIVE_MARK)).ok()?;
+    let mut lines = mark.lines();
+    let pid = lines.next()?.trim().parse::<i32>().ok()?;
+    if pid <= 0 || !alive(pid) {
+        return None;
+    }
+    let recorded = lines.next().unwrap_or_default().trim();
+    let same = if recorded.is_empty() {
+        command_of(pid).is_some_and(|c| c.split_whitespace().any(|w| w == "acr"))
+    } else {
+        crate::bridge::process_started(pid).as_deref() == Some(recorded)
+    };
+    same.then_some(pid)
+}
+
+/// Removes review `id`'s mark once no live process holds it: one a stopped
+/// process left behind, since stopping it skips what removes it.
+pub fn clear_stale(paths: &Paths, id: &str) {
+    if live(paths, id).is_none() {
+        let _ = fs::remove_file(dir(paths).join(id).join(ACTIVE_MARK));
+    }
+}
+
+/// Marks review `id` as driven by process `pid`, as its own process would
+/// mark it, with `started` in place of when it started, if given.
+#[cfg(test)]
+pub fn mark_for(paths: &Paths, id: &str, pid: i32, started: Option<&str>) {
+    let review = dir(paths).join(id);
+    fs::create_dir_all(&review).unwrap();
+    let started = match started {
+        Some(s) => s.to_string(),
+        None => crate::bridge::process_started(pid).unwrap_or_default(),
+    };
+    fs::write(review.join(ACTIVE_MARK), format!("{pid}\n{started}\n")).unwrap();
+}
+
 /// The reviews under way on this machine now.
 pub fn active(paths: &Paths) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir(paths)) else {
@@ -60,13 +116,9 @@ pub fn active(paths: &Paths) -> Vec<String> {
     };
     entries
         .flatten()
-        .filter(|e| {
-            fs::read_to_string(e.path().join(ACTIVE_MARK))
-                .ok()
-                .and_then(|pid| pid.trim().parse::<i32>().ok())
-                .is_some_and(alive)
-        })
+        .filter(|e| e.path().join(ACTIVE_MARK).exists())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|id| live(paths, id).is_some())
         .collect()
 }
 
