@@ -3,7 +3,7 @@
 version: 1
 human_gate: per-round
 max_rounds: 3
-review_scope: bottom-of-stack
+review_scope: whole-pr
 not_findings: not-findings.md
 always_escalate:
   - a change to a public HTTP endpoint

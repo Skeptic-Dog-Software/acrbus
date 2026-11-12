@@ -256,6 +256,10 @@ since by then it holds the change's context.
   copy of its own. Its file tools can't read outside that copy, though its
   shell can. So anything a reviewer runs must find its toolchain and
   caches there. `acrbus acr doctor` checks.
+- **What's reviewed.** `review_scope` is `whole-pr` unless the config says
+  otherwise: all of base..head as one diff, which is what merging puts on
+  the base. Choose `bottom-of-stack` only where each pull request in a stack
+  merges on its own; it reviews just the first commit after the base.
 - **`{tests}`.** It's replaced with the test files to run, each quoted, with
   spaces between them. Left empty, the command should run the whole suite.
 - **The gate without coverage.** With no `tests.coverage`, the gate still
