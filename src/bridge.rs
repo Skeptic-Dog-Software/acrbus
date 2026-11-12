@@ -86,11 +86,20 @@ pub struct Settings {
     /// Who a message must come from: a Tailscale login, or a local bus's
     /// `owner`. Anything else is acknowledged without an answer.
     pub owner: String,
+    /// The agent CLI it runs, when it's one acrbus ships defaults for: its
+    /// args, options, environment and usage come from acrbus, and this
+    /// table says only what's this machine's and what differs.
+    #[serde(default)]
+    pub kind: Option<Kind>,
     /// The agent's program.
     pub command: PathBuf,
     /// Its arguments, with the placeholders `expand` fills in.
     #[serde(default)]
     pub args: Vec<String>,
+    /// More arguments, after `args`: what this machine adds to its kind's
+    /// defaults, such as a provider's extension.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
     /// What the agent is asked. It gets this on stdin, and at
     /// `{MESSAGE_FILE}`, never on the command line, where other users of
     /// the machine could read it.
@@ -230,6 +239,8 @@ struct Plan {
     effort: Option<String>,
     /// Set when the request narrowed the tools.
     tools: Option<Vec<String>>,
+    /// Part of an ACR review: its agent gets ACR's system prompt.
+    review: bool,
 }
 
 impl Plan {
@@ -295,8 +306,8 @@ pub fn load(paths: &Paths, agent: &str) -> Result<Settings> {
         .bridges
         .get(agent)
         .ok_or_else(|| anyhow!("{} has no [bridges.{agent}]", paths.config.display()))?;
-    let settings: Settings = table
-        .clone()
+    let settings: Settings = with_defaults(table.clone())
+        .with_context(|| format!("in [bridges.{agent}]"))?
         .try_into()
         .with_context(|| format!("in [bridges.{agent}]"))?;
     settings
@@ -305,7 +316,136 @@ pub fn load(paths: &Paths, agent: &str) -> Result<Settings> {
     Ok(settings)
 }
 
+/// An agent CLI acrbus ships a bridge's defaults for, in `src/bridges/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Claude Code.
+    Claude,
+    /// omp, the oh-my-pi coding agent.
+    Omp,
+    /// pi, the coding agent omp is built on.
+    Pi,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Claude => "claude",
+            Kind::Omp => "omp",
+            Kind::Pi => "pi",
+        }
+    }
+
+    /// Its defaults, as a bridge table.
+    fn defaults(self) -> &'static str {
+        match self {
+            Kind::Claude => include_str!("bridges/claude.toml"),
+            Kind::Omp => include_str!("bridges/omp.toml"),
+            Kind::Pi => include_str!("bridges/pi.toml"),
+        }
+    }
+
+    /// The kind a command is, by its program's name, for a bridge whose
+    /// table doesn't say.
+    fn of(command: &Path) -> Option<Kind> {
+        match command.file_name()?.to_str()? {
+            "claude" => Some(Kind::Claude),
+            "omp" => Some(Kind::Omp),
+            "pi" => Some(Kind::Pi),
+            _ => None,
+        }
+    }
+
+    /// The flag its CLI appends a system prompt with. omp keeps only the
+    /// last one given, so a prompt is added to the one already there.
+    fn system_prompt_flag(self) -> &'static str {
+        "--append-system-prompt"
+    }
+}
+
+/// The kind a bridge's table names, and the settings it gives itself, for
+/// saying what came from acrbus and what from the table.
+pub fn own_settings(paths: &Paths, agent: &str) -> Option<(Option<Kind>, Vec<String>)> {
+    let cfg = Config::load(&paths.config).ok()?;
+    let table = cfg.bridges.get(agent)?.as_table()?;
+    let kind = table.get("kind").and_then(|k| k.clone().try_into().ok());
+    let keys = table.keys().filter(|k| *k != "kind").cloned().collect();
+    Some((kind, keys))
+}
+
+/// A bridge's table over its kind's defaults, when it names a kind: what the
+/// table sets wins, and tables such as `env` and `options` merge key by key.
+pub(crate) fn with_defaults(table: toml::Value) -> Result<toml::Value> {
+    let Some(kind) = table.get("kind") else {
+        return Ok(table);
+    };
+    let kind: Kind = kind.clone().try_into().context(
+        "kind must be one of \"claude\", \"omp\" and \"pi\", or left out for any other agent",
+    )?;
+    let mut merged: toml::Value =
+        toml::from_str(kind.defaults()).context("reading acrbus's own bridge defaults")?;
+    merge(&mut merged, table);
+    Ok(merged)
+}
+
+fn merge(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(base), toml::Value::Table(over)) => {
+            for (key, value) in over {
+                match base.get_mut(&key) {
+                    Some(b) if b.is_table() && value.is_table() => merge(b, value),
+                    _ => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over,
+    }
+}
+
+/// Puts ACR's system prompt first in the agent's system prompt: into the
+/// flag's value when its args already give one, which an agent that keeps
+/// only one needs, or as the flag itself. A value naming a file stands for
+/// that file's text. Args that already hold it are left as they are.
+fn add_system_prompt(args: &mut Vec<String>, kind: Kind, prompt: &str) {
+    let first = prompt.lines().next().unwrap_or(prompt);
+    if args.iter().any(|a| a.contains(first)) {
+        return;
+    }
+    let flag = kind.system_prompt_flag();
+    let with = |theirs: &str| {
+        let theirs = match Path::new(theirs) {
+            p if !theirs.contains('\n') && p.is_file() => {
+                fs::read_to_string(p).unwrap_or_else(|_| theirs.to_owned())
+            }
+            _ => theirs.to_owned(),
+        };
+        format!("{prompt}\n\n{theirs}")
+    };
+    let joined = format!("{flag}=");
+    for i in 0..args.len() {
+        if args[i] == flag && i + 1 < args.len() {
+            args[i + 1] = with(&args[i + 1]);
+            return;
+        }
+        if let Some(theirs) = args[i].strip_prefix(&joined) {
+            args[i] = format!("{joined}{}", with(theirs));
+            return;
+        }
+    }
+    args.push(flag.to_owned());
+    args.push(prompt.to_owned());
+}
+
 impl Settings {
+    /// Its kind, named or known from its program, for what acrbus adds to
+    /// every run: ACR's system prompt to a review's.
+    pub fn agent_kind(&self) -> Option<Kind> {
+        self.kind.or_else(|| Kind::of(&self.command))
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.owner.trim().is_empty() {
             bail!("owner is empty");
@@ -354,7 +494,11 @@ impl Settings {
         {
             bail!("env {name} can't carry the message; it goes to stdin");
         }
-        let on_command_line = self.args.iter().chain(&self.continue_args);
+        let on_command_line = self
+            .args
+            .iter()
+            .chain(&self.extra_args)
+            .chain(&self.continue_args);
         if on_command_line
             .clone()
             .any(|a| a.contains("{BODY}") || a.contains("{MESSAGE}"))
@@ -369,14 +513,28 @@ impl Settings {
         if per_sender && !on_command_line.clone().any(|a| a.contains("{SESSION_DIR}")) {
             bail!("a per-sender session needs {{SESSION_DIR}} in args, to keep senders apart");
         }
-        let wants_model = self.args.iter().any(|a| a.contains("{MODEL}"));
+        let wants_model = self
+            .args
+            .iter()
+            .chain(&self.extra_args)
+            .any(|a| a.contains("{MODEL}"));
         if wants_model && self.model.is_none() {
             bail!("args use {{MODEL}}, so `model` has to say which one is the default");
         }
-        if self.args.iter().any(|a| a.contains("{EFFORT}")) {
+        if self
+            .args
+            .iter()
+            .chain(&self.extra_args)
+            .any(|a| a.contains("{EFFORT}"))
+        {
             bail!("{{EFFORT}} belongs in options.effort_args, used only when a request names one");
         }
-        if self.args.iter().any(|a| a.contains("{TOOLS}")) {
+        if self
+            .args
+            .iter()
+            .chain(&self.extra_args)
+            .any(|a| a.contains("{TOOLS}"))
+        {
             bail!("{{TOOLS}} belongs in options.tools_args, used only when a request names tools");
         }
         self.options.check(wants_model, self.timeout_secs)?;
@@ -459,10 +617,12 @@ impl Settings {
             model: self.model.clone(),
             effort: None,
             tools: None,
+            review: false,
         };
         let Some(options) = options else {
             return Ok(plan);
         };
+        plan.review = options.review == Some(true);
         if let Some(tools) = &options.tools {
             if tools.is_empty() {
                 return Err("tools can't be empty".into());
@@ -2553,25 +2713,34 @@ impl Bridge {
             ("BODY", msg.body.as_str()),
         ];
         create_private(&message_file)?.write_all(expand(&self.cfg.message, &vars)?.as_bytes())?;
-        let mut command = Command::new(&self.cfg.command);
-        for arg in &self.cfg.args {
-            command.arg(expand(arg, &vars)?);
+        let mut args: Vec<String> = Vec::new();
+        for arg in self.cfg.args.iter().chain(&self.cfg.extra_args) {
+            args.push(expand(arg, &vars)?);
         }
         if continuing {
             for arg in &self.cfg.continue_args {
-                command.arg(expand(arg, &vars)?);
+                args.push(expand(arg, &vars)?);
             }
         }
         if tools.is_some() {
             for arg in &self.cfg.options.tools_args {
-                command.arg(expand(arg, &vars)?);
+                args.push(expand(arg, &vars)?);
             }
         }
         if plan.effort.is_some() {
             for arg in &self.cfg.options.effort_args {
-                command.arg(expand(arg, &vars)?);
+                args.push(expand(arg, &vars)?);
             }
         }
+        // Every role of a review gets ACR's system prompt, the way its agent
+        // takes one.
+        if plan.review
+            && let Some(kind) = self.cfg.agent_kind()
+        {
+            add_system_prompt(&mut args, kind, crate::setup::SYSTEM_PROMPT);
+        }
+        let mut command = Command::new(&self.cfg.command);
+        command.args(&args);
         command
             .current_dir(&plan.workdir)
             .env_clear()
@@ -4686,6 +4855,118 @@ mod tests {
         let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
         until("the log to go", || (!dir.exists()).then_some(()));
         bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_reviews_every_role_gets_acrs_system_prompt_and_nothing_else_does() {
+        let rig = Rig::new();
+        let script = r#"shift 2; printf '%s\n' "$@" | head -3"#;
+        let bridge = rig.start(rig.settings(script, r#"kind = "claude""#));
+        let review = with(RunOptions {
+            review: Some(true),
+            ..RunOptions::default()
+        });
+        let reply = rig.reply_to(&rig.ask_with(review));
+        let plain = rig.reply_to(&rig.ask("not a review"));
+        bridge.stop().unwrap();
+        let first = crate::setup::SYSTEM_PROMPT.lines().next().unwrap();
+        assert!(
+            reply.starts_with(&format!("--append-system-prompt\n{first}")),
+            "{reply}"
+        );
+        assert!(!plain.contains("--append-system-prompt"), "{plain}");
+    }
+
+    #[test]
+    fn an_agent_that_keeps_one_system_prompt_gets_acrs_first_in_it() {
+        let rig = Rig::new();
+        let theirs = rig.dir.join("theirs.md");
+        fs::write(&theirs, "Their own prompt.").unwrap();
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done"#;
+        let extra = format!(
+            r#"kind = "omp"
+            extra_args = ["--append-system-prompt", "{{FILE:{}}}"]"#,
+            theirs.display()
+        );
+        let bridge = rig.start(rig.settings(script, &extra));
+        let review = with(RunOptions {
+            review: Some(true),
+            ..RunOptions::default()
+        });
+        let reply = rig.reply_to(&rig.ask_with(review));
+        bridge.stop().unwrap();
+        assert_eq!(
+            reply.matches("--append-system-prompt").count(),
+            1,
+            "{reply}"
+        );
+        let first = crate::setup::SYSTEM_PROMPT.lines().next().unwrap();
+        let at = reply.find(first).expect("ACR's prompt");
+        let after = reply.find("Their own prompt.").expect("theirs, kept");
+        assert!(at < after, "{reply}");
+    }
+
+    #[test]
+    fn a_system_prompt_goes_into_the_flag_however_its_written_and_only_once() {
+        let prompt = "# ACR\nRules.";
+        let mut joined = vec![
+            "-p".to_string(),
+            "--append-system-prompt=Theirs.".to_string(),
+        ];
+        add_system_prompt(&mut joined, Kind::Omp, prompt);
+        assert_eq!(
+            joined,
+            ["-p", "--append-system-prompt=# ACR\nRules.\n\nTheirs."]
+        );
+        let again = joined.clone();
+        add_system_prompt(&mut joined, Kind::Omp, prompt);
+        assert_eq!(joined, again, "never twice");
+        let mut none = vec!["-p".to_string()];
+        add_system_prompt(&mut none, Kind::Pi, prompt);
+        assert_eq!(none, ["-p", "--append-system-prompt", prompt]);
+    }
+
+    #[test]
+    fn a_bridge_that_names_its_kind_says_only_whats_its_own() {
+        let table: toml::Value = toml::from_str(
+            r#"
+            kind = "omp"
+            owner = "o"
+            command = "/usr/local/bin/omp"
+            model = "gateway/model-a"
+            extra_args = ["-e", "/x/provider.ts"]
+            max_concurrent = 25
+            [options]
+            models = ["gateway/model-a"]
+            [env]
+            EXTRA = "yes"
+            "#,
+        )
+        .unwrap();
+        let merged = with_defaults(table).unwrap();
+        let args = merged["args"].as_array().unwrap();
+        assert_eq!(args[0].as_str(), Some("-p"));
+        assert!(args.iter().any(|a| a.as_str() == Some("--session-dir")));
+        assert_eq!(
+            merged["max_concurrent"].as_integer(),
+            Some(25),
+            "its own wins"
+        );
+        assert_eq!(merged["timeout_secs"].as_integer(), Some(14400));
+        let options = &merged["options"];
+        assert_eq!(options["models"][0].as_str(), Some("gateway/model-a"));
+        assert_eq!(options["tools_args"][0].as_str(), Some("--tools"));
+        assert_eq!(options["effort_args"][0].as_str(), Some("--thinking"));
+        assert_eq!(merged["env"]["EXTRA"].as_str(), Some("yes"));
+        assert!(merged.get("usage").is_some());
+        // Every kind's defaults are a bridge's table.
+        for kind in [Kind::Claude, Kind::Omp, Kind::Pi] {
+            let defaults: toml::Value = toml::from_str(kind.defaults()).unwrap();
+            assert!(defaults.get("owner").is_none(), "{kind:?}: the machine's");
+        }
+        let unknown: toml::Value = toml::from_str("kind = \"codex\"").unwrap();
+        let e = format!("{:#}", with_defaults(unknown).unwrap_err());
+        assert!(e.contains("\"claude\", \"omp\" and \"pi\""), "{e}");
     }
 
     #[test]

@@ -220,8 +220,10 @@ path = "/usr/local/bin:/usr/bin:/bin"
 
 | Setting | Means |
 | --- | --- |
+| `kind` | `"claude"`, `"omp"` or `"pi"`: an agent acrbus ships defaults for. See [Agents acrbus knows](#agents-acrbus-knows). |
 | `owner` | Who a message must come from: the bus's `owner`. Required. |
 | `command`, `args` | What to run. `args` can use the placeholders below. |
+| `extra_args` | More arguments, after `args`: what this machine adds to its kind's defaults, such as a provider's extension. |
 | `working_directory` | Where it runs. Required. |
 | `home`, `path` | Its `HOME` and `PATH`. Required. `home` can't be your own. |
 | `session` | `"fresh"`, the default, gives every request a new session. `"per-sender"` keeps one conversation with each sender. |
@@ -241,6 +243,34 @@ path = "/usr/local/bin:/usr/bin:/bin"
 A bridge isn't a sandbox: the agent runs as you, with what its own settings
 allow.
 
+### Agents acrbus knows
+
+For Claude Code, omp and pi, acrbus ships a bridge's defaults: the args that
+run the agent headless with a fresh session, its options for models,
+tools and effort, its environment, and where its usage is read. They're in
+[`src/bridges/`](src/bridges/). A bridge that names its `kind` gets them,
+and its own table says only what's this machine's:
+
+```toml
+[bridges.reviewers]
+kind = "omp"
+owner = "you@example.com"
+command = "/Users/you/.local/bin/omp"
+working_directory = "/Users/you/agent-work"
+home = "/Users/you/agent-home"
+path = "/Users/you/.local/bin:/usr/bin:/bin"
+model = "gateway/glm-5.3"
+extra_args = ["-e", "/path/to/your-provider-extension.ts"]
+
+[bridges.reviewers.options]
+models = ["gateway/glm-5.3", "gateway/glm-5.3-flash"]
+```
+
+Anything the table sets wins over the defaults, and its tables, such as
+`env` and `options`, merge with theirs key by key. `acrbus setup acr` writes
+its Claude Code bridge this way. `acrbus acr doctor` says, for each bridge a
+review uses, what it takes from the defaults and what from its own table.
+
 ### The system prompt
 
 Every role a review starts gets ACR's system prompt, the same kind of
@@ -256,19 +286,18 @@ judgment and fences nothing in. It says:
 - when doing its role seems to need any of that, it says so, and you
   decide.
 
-The prompt is kept in `~/.config/acrbus/acr/system-prompt.md`, and every
-`acrbus acr` command rewrites it to match the installed version. A bridge
-gives it to its agent with a placeholder in `args`:
+The text is [`src/acr/system-prompt.md`](src/acr/system-prompt.md). A bridge
+for an agent acrbus knows adds it to every request that's part of a review,
+and to nothing else. That's by its `kind`, or by its program's name when
+the table doesn't name one. It goes first in the agent's system prompt, in
+the same argument as a prompt the bridge already gives, since omp keeps
+only the last one.
 
-```toml
-args = ["-p", "--append-system-prompt", "{FILE:/Users/you/.config/acrbus/acr/system-prompt.md}"]
-```
-
-`acrbus setup acr` adds that to its own bridge. For another agent, use what
-its CLI takes for a system prompt. An agent that keeps only one system
-prompt gets yours and ACR's in one argument,
-`"{FILE:<acr's>}\n\n{FILE:<yours>}"`. `acrbus acr doctor` says, for each
-bridge a review uses, whether its agent gets the prompt.
+For any other agent, acrbus keeps the text in
+`~/.config/acrbus/acr/system-prompt.md`, as the installed version has it.
+Put `{FILE:<that path>}` in the argument the agent takes a system prompt in.
+`acrbus acr doctor` says, for each bridge a review uses, whether its agent
+gets the prompt.
 
 ## The bus
 

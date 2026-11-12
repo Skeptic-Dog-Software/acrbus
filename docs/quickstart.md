@@ -62,8 +62,9 @@ Check: step 3's `service install` says the bus is "owned by" you.
   toolchains, such as cargo, go, node and python3;
 - writes `acr/confine.json`, which keeps reviewers' file tools to the code
   under review;
-- writes `acr/system-prompt.md`, ACR's system prompt, and gives it to every
-  session the bridge starts;
+- names the bridge's kind, `claude`, so its args, options and environment
+  are acrbus's defaults, and the bridge gives every review role ACR's
+  system prompt;
 - writes the bindings, `acr.yaml`, which say which model each role uses;
 - starts the bridge.
 
@@ -351,7 +352,7 @@ Things that matter for an agent other than Claude Code:
 | exit 1 | Its last line says what's left: fix it and review again. |
 | a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
 | a review seems stuck | Read its progress, on stderr or in `progress.log` in its folder: every call at work, how long it has run, and when it last did anything. A call that goes quiet for its bridge's `idle_secs` is ended and tried again by the bridge. `acrbus bridge status` shows the same. |
-| the doctor says a bridge doesn't give its agent ACR's system prompt | Add the placeholder it names to that bridge's `args`, or to the argument its agent already takes a system prompt in, then restart the bridge. See "The system prompt" in the README. |
+| the doctor says a bridge doesn't give its agent ACR's system prompt | If its agent is Claude Code, omp or pi, set `kind` in its table. Otherwise put the placeholder the doctor names in the argument its agent takes a system prompt in. Then restart the bridge. See "The system prompt" in the README. |
 | a call "timed out" | It ran as long as its bridge allows. Raise the bridge's `timeout_secs` and `max_timeout_secs`, and restart it. |
 
 [Setting up ACR review for a repository](acr-repo-setup.md) is the reference
