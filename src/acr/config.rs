@@ -1605,6 +1605,34 @@ impl Config {
     /// that a person can decide: a time budget, or a fallback from before.
     pub fn time_notes(&self) -> Vec<String> {
         let mut out = Vec::new();
+        // An easy group's blockers are at or below `max_severity`; if no
+        // lens blocks at any severity that low, no group can be easy.
+        if let Some(f) = &self.savings.fixer {
+            let can = self.lenses.iter().any(|l| {
+                [
+                    Severity::Critical,
+                    Severity::High,
+                    Severity::Medium,
+                    Severity::Low,
+                ]
+                .into_iter()
+                .filter(|s| *s >= f.max_severity)
+                .any(|s| {
+                    matches!(
+                        self.action(l, s),
+                        Action::Blocks | Action::BlocksUnlessWaived
+                    )
+                })
+            });
+            if !can {
+                out.push(format!(
+                    "savings.fixer routes no fix to {}: its max_severity, {:?}, is below every \
+                     severity that blocks here, so every group is hard. Raise max_severity, or \
+                     have a severity that low block in a lens",
+                    f.binding, f.max_severity
+                ));
+            }
+        }
         for (name, b) in self.chosen_bindings() {
             if b.fallback.is_some() {
                 out.push(format!(
@@ -2298,6 +2326,41 @@ mod tests {
         let read: FactsConfig = serde_json::from_str(old).unwrap();
         assert_eq!(read, FactsConfig::default());
         assert!(read.learned && read.learned_bytes == 24 * 1024);
+    }
+
+    #[test]
+    fn a_fixer_whose_max_severity_no_blocker_reaches_is_said_to_route_nothing() {
+        let mut user = parse_user(USER).unwrap();
+        user.allowed_bindings.get_mut("small").unwrap().writes = true;
+        let repo = |extra: &str| {
+            format!(
+                "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
+                 lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}{extra}}}]\n\
+                 savings: {{fixer: {{binding: small}}}}\n"
+            )
+        };
+        let at_defaults =
+            resolve(&user, parse_repo(&repo("")).unwrap(), &Flags::default()).unwrap();
+        assert!(
+            at_defaults
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("savings.fixer routes no fix to small")),
+            "{:?}",
+            at_defaults.time_notes()
+        );
+        let medium_blocks = resolve(
+            &user,
+            parse_repo(&repo(", severity: {Medium: blocks}")).unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        assert!(
+            !medium_blocks
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("routes no fix"))
+        );
     }
 
     #[test]

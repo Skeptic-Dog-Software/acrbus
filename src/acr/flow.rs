@@ -587,6 +587,10 @@ pub struct Run {
     /// person at the scope gate chose. None: nobody chose, so `blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reattack: Option<Reattack>,
+    /// The builder's brief the run started with, kept so a resumed run
+    /// briefs its reviewers as one that never stopped does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_brief: Option<stages::BuilderBrief>,
     /// What the run's flags made weaker than the repository's config, each
     /// said at its start, at every gate and in the report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2380,6 +2384,7 @@ pub fn start(
         steelmans: Vec::new(),
         fix_briefs: None,
         reattack: s.cfg.reattack,
+        builder_brief: s.builder_brief.clone(),
         weakened: Vec::new(),
         answered_by: Vec::new(),
         fix: None,
@@ -3416,7 +3421,16 @@ fn attack(
                 Ok((mut spent_now, mut ratings)) => {
                     restarter.mark(&mut spent_now);
                     usages.append(&mut spent_now);
-                    if !ratings
+                    // A finding it left unrated isn't settled: the Judge
+                    // rules on every one, rather than one being lost.
+                    let unrated = findings.saturating_sub(ratings.len());
+                    if unrated > 0 {
+                        caller.say(&format!(
+                            "{label}: the first pass rated {} of the {findings} finding(s) it \
+                             was given, so the Judge rules on them all",
+                            ratings.len()
+                        ));
+                    } else if !ratings
                         .iter()
                         .any(|r| first_pass_escalates(cfg, lens, r, changed_now))
                     {
@@ -3427,11 +3441,12 @@ fn attack(
                             "{label}: the first pass ({name}) settled it, so no Judge call"
                         ));
                         return Ok((usages, ratings));
+                    } else {
+                        caller.say(&format!(
+                            "{label}: the first pass sends it on to the Judge, which rules on \
+                             it fresh"
+                        ));
                     }
-                    caller.say(&format!(
-                        "{label}: the first pass sends it on to the Judge, which rules on it \
-                         fresh"
-                    ));
                 }
                 // An outage leaves the lens's ruling for the review's
                 // continuing.
@@ -8352,6 +8367,39 @@ lenses:
     }
 
     #[test]
+    fn a_runs_builder_brief_is_kept_so_a_resume_after_the_scope_gate_still_briefs_round_one() {
+        let cfg = plain("ends", 3, 1);
+        let fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
+        let mut s = setting(&cfg);
+        s.builder_brief = Some(stages::BuilderBrief {
+            scope: Some("It makes x one, in a.src.".into()),
+            lenses: BTreeMap::from([("alpha".to_string(), "Break the lookup.".to_string())]),
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Scope));
+        // Saved and read back, as `acr resume` does, with a Setting made
+        // afresh, which has no brief of its own.
+        let mut run: Run = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        assert!(run.builder_brief.is_some());
+        let mut later = setting(&cfg);
+        later.builder_brief = run.builder_brief.clone();
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &later, &fake, &|_| Ok(c.clone())).unwrap();
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(alpha[0].contains("Break the lookup."), "round 1 is briefed");
+    }
+
+    #[test]
     fn the_builder_briefs_round_one_and_the_steelman_the_next() {
         let cfg = config("exception", 20, 1, "", "stages: [brief]");
         let fixed = Mutex::new(false);
@@ -12815,6 +12863,36 @@ lenses:
                 _ => NOTHING.to_string(),
             })
         }
+    }
+
+    #[test]
+    fn a_finding_the_first_pass_leaves_unrated_goes_on_to_the_judge() {
+        let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
+        let two = r#"{"findings": [{"title": "a defect", "file": "a.src"}, {"title": "another", "file": "a.src", "line": 9}]}"#;
+        let fake = Fake::new(move |role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => two.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                // It rates one of the two, Low: nothing it rated escalates.
+                Role::Judge if prompt.contains("You're the first pass") => {
+                    r#"{"findings": [{"title": "a defect", "file": "a.src", "severity": "Low"}]}"#
+                        .to_string()
+                }
+                Role::Judge => r#"{"findings": [{"title": "a defect", "file": "a.src", "severity": "Low"}, {"title": "another", "file": "a.src", "line": 9, "severity": "Low"}]}"#.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let judged = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == Role::Judge && c.1 == "large")
+            .count();
+        assert_eq!(judged, 1, "the Judge rules on them all");
+        assert!(said(&fake).contains("the first pass rated 1 of the 2 finding(s)"));
+        assert_eq!(run.lenses["alpha"].rounds[0].findings.len(), 2, "none lost");
     }
 
     #[test]

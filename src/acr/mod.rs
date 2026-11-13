@@ -3565,6 +3565,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             }
             let mut s = setting(paths, &cfg, &run_id, None)?;
             s.description = run.description.clone();
+            // The builder's brief it started with: round 1 runs under a
+            // resume whenever the scope gate stopped it.
+            s.builder_brief = run.builder_brief.clone();
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
             following(&caller, paths, &run_id, &cfg, "resumed");

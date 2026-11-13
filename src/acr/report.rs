@@ -430,19 +430,39 @@ pub fn fix_routes(run: &super::flow::Run) -> Vec<FixBinding> {
             }
         }
     }
-    for b in &mut out {
-        let tag = if b.easy { "easy" } else { "hard" };
-        for u in run
-            .usage
+    // Every routed call, on its binding's row: a restart of an easy group
+    // runs on the Orchestrator's binding, as hard, whether or not a group
+    // was routed there from the start.
+    for u in &run.usage {
+        let Some(tag) = u.route.as_deref() else {
+            continue;
+        };
+        let easy = tag == "easy";
+        let at = match out
             .iter()
-            .filter(|u| u.route.as_deref() == Some(tag) && u.binding == b.binding)
+            .position(|b| b.binding == u.binding && b.easy == easy)
         {
-            b.calls += 1;
-            b.usd = match (b.usd, u.usd) {
-                (Some(a), Some(c)) => Some(a + c),
-                _ => None,
-            };
-        }
+            Some(at) => at,
+            None => {
+                out.push(FixBinding {
+                    binding: u.binding.clone(),
+                    easy,
+                    groups: 0,
+                    calls: 0,
+                    usd: Some(0.0),
+                    blockers: 0,
+                    judged: 0,
+                    held: 0,
+                });
+                out.len() - 1
+            }
+        };
+        let b = &mut out[at];
+        b.calls += 1;
+        b.usd = match (b.usd, u.usd) {
+            (Some(a), Some(c)) => Some(a + c),
+            _ => None,
+        };
     }
     out
 }
@@ -1128,6 +1148,34 @@ mod tests {
             "label": label, "fan_out": fan_out, "first": first,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_restarted_easy_fix_is_counted_on_the_orchestrators_row_even_with_no_hard_group() {
+        let mut run: super::super::flow::Run = serde_json::from_value(serde_json::json!({
+            "id": "r", "repo": ".", "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 2, "stage": "review",
+            "status": "running", "waiting": null, "lenses": {},
+            "escalations": [], "disagreements": [], "usage": [],
+            "routes": [{"round": 1, "ids": ["l-r1-1"], "binding": "small", "easy": true, "why": "easy"}]
+        }))
+        .unwrap();
+        let mut easy = call("orchestrator", 1, Some("fix group 1"), None, true);
+        easy.binding = "small".into();
+        easy.route = Some("easy".into());
+        let mut again = call("orchestrator", 1, Some("fix group 1, again"), None, true);
+        again.binding = "large".into();
+        again.route = Some("hard".into());
+        run.usage = vec![easy, again];
+        let rows = fix_routes(&run);
+        let row = |binding: &str| rows.iter().find(|b| b.binding == binding).unwrap();
+        assert_eq!((row("small").groups, row("small").calls), (1, 1));
+        assert_eq!(
+            (row("large").groups, row("large").calls),
+            (0, 1),
+            "its restart counts"
+        );
+        assert!(!row("large").easy);
     }
 
     #[test]
