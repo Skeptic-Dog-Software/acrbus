@@ -84,7 +84,11 @@ result, and whenever something is your call: a values call, a split, a lens
 that didn't finish. Each ask is a short multiple-choice question: a
 question carousel in Claude Code, a numbered prompt in a terminal, or a
 message on your phone through [Grayboard](grayboard.md). A defect found by
-several lenses is asked about once.
+several lenses is asked about once, even when they found it at different
+places: findings at different places that name the same symbol, field or
+function are put to the dedupe call as possible pairs, and it decides
+whether one fix would fix both. Merged, the question names every lens and
+place, and the fixer is told to fix it at each place.
 
 Your verdicts, and the defects you say were missed, become feedback for the
 calibration. The rules guide; you decide.

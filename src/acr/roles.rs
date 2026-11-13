@@ -229,7 +229,13 @@ pub fn read_sized(text: &str) -> Result<Sized> {
 /// What the Sizer is asked of a round's findings: which of them, found by
 /// different lenses, are the same defect. `found` is (lens, id, where,
 /// title, detail).
-pub fn same_prompt(found: &[(String, String, String, String, String)]) -> String {
+/// `found`: (lens, id, place, title, detail). `pairs`: findings at
+/// different places that name the same thing in the code, as (id, place,
+/// id, place, the names), for the call to rule on.
+pub fn same_prompt(
+    found: &[(String, String, String, String, String)],
+    pairs: &[(String, String, String, String, Vec<String>)],
+) -> String {
     let mut list = String::new();
     for (lens, id, at, title, detail) in found {
         let detail: String = detail.chars().take(300).collect();
@@ -238,11 +244,30 @@ pub fn same_prompt(found: &[(String, String, String, String, String)]) -> String
             detail.trim()
         ));
     }
+    let pairs = if pairs.is_empty() {
+        String::new()
+    } else {
+        let listed: String = pairs
+            .iter()
+            .map(|(a, at_a, b, at_b, names)| {
+                format!(
+                    "- {a} at {at_a} and {b} at {at_b}: both name `{}`\n",
+                    names.join("`, `")
+                )
+            })
+            .collect();
+        format!(
+            "\nThese pairs were reported at different places, but name the same thing in the \
+             code. One cause can show at more than one place, such as where a value is added \
+             and where it should be removed. Rule on each: put both in one group only if one \
+             fix would fix both; otherwise leave them apart.\n{listed}"
+        )
+    };
     format!(
         "Reviewers of different lenses each reported the findings below. Group the ones that \
-         are the same defect: the same cause in the same place, which one fix would fix. \
-         Findings that are only near each other, or alike in kind, are different defects. \
-         Leave out a finding that's like no other.\n\n{list}\nAnswer with JSON only: \
+         are the same defect: the same cause, which one fix would fix. Findings that are only \
+         near each other, or alike in kind, are different defects. Leave out a finding that's \
+         like no other.\n\n{list}{pairs}\nAnswer with JSON only: \
          {{\"same\": [[\"<id>\", \"<id>\"], ...]}}, or {{\"same\": []}} if none are the same."
     )
 }

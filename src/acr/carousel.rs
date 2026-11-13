@@ -7,7 +7,7 @@
 //! The rules guide; the person decides. A ruling is offered as it stands,
 //! with what each other choice does, and nothing is chosen for them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -523,19 +523,58 @@ fn scope(run: &Run, cfg: &Config) -> Question {
     )
 }
 
-fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
-    let also: Vec<String> = run
+/// The findings in each lens's latest round that are the same defect as
+/// `f`, as (lens, place), and what to say of them in its question:
+/// " (also found by beta)", with each place when it differs from `f`'s,
+/// and how many lenses and places in all.
+fn found_also(run: &Run, f: &Finding) -> String {
+    let same: Vec<(String, String)> = run
         .lenses
         .values()
-        .filter(|l| {
-            l.rounds.last().is_some_and(|r| {
+        .flat_map(|l| {
+            l.rounds.last().into_iter().flat_map(move |r| {
                 r.findings
                     .iter()
-                    .any(|g| g.same_as.as_deref() == Some(&f.id))
+                    .filter(|g| g.same_as.as_deref() == Some(&f.id))
+                    .map(move |g| (l.id.clone(), super::flow::place(g)))
             })
         })
-        .map(|l| l.id.clone())
         .collect();
+    if same.is_empty() {
+        return String::new();
+    }
+    let here = super::flow::place(f);
+    let also: Vec<String> = same
+        .iter()
+        .map(|(l, at)| {
+            if *at == here {
+                l.clone()
+            } else {
+                format!("{l} at {at}")
+            }
+        })
+        .collect();
+    let mut places = vec![here];
+    for (_, at) in &same {
+        if !places.contains(at) {
+            places.push(at.clone());
+        }
+    }
+    let lenses: BTreeSet<&str> = same.iter().map(|(l, _)| l.as_str()).collect();
+    if places.len() > 1 {
+        format!(
+            " (also found by {}: found by {} lenses at {} places)",
+            also.join(", "),
+            lenses.len() + 1,
+            places.len()
+        )
+    } else {
+        format!(" (also found by {})", also.join(", "))
+    }
+}
+
+fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
+    let also = found_also(run, f);
     let at = match (&f.file, f.line) {
         (Some(file), Some(line)) => format!("At {file}:{line}. "),
         (Some(file), None) => format!("In {file}. "),
@@ -550,11 +589,7 @@ fn blocker(run: &Run, n: usize, lens: &str, f: &Finding) -> Question {
          to the fixer, or answer \"{DEFER}: <your note>\" to defer it with a note.{}",
         f.id,
         f.severity,
-        if also.is_empty() {
-            String::new()
-        } else {
-            format!(" (also found by {})", also.join(", "))
-        },
+        also,
         f.title,
         cut(&f.detail, DETAIL),
         if waivable {
