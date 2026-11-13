@@ -665,11 +665,18 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
 /// tools are matched, every tool their calls are given, holding it to its
 /// own.
 fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
+    let b = call.binding;
+    // A fix's sessions, one per group, all open the same way: its cache's
+    // key keeps them on the replica that holds that opening. Nothing else
+    // of the round's: the facts are of the change before the fix.
+    if call.role == Role::Orchestrator && call.writes {
+        options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
+        return;
+    }
     if !matches!(call.role, Role::Reviewer | Role::Judge) || call.writes {
         return;
     }
     options.facts = Some(shared.facts.display().to_string());
-    let b = call.binding;
     options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
     if call.no_tools {
         return;
@@ -5698,6 +5705,14 @@ mod tests {
                 "{role:?}"
             );
         }
+        // A fix gets the key alone, so its groups' sessions share their
+        // opening: not the facts, which a fix outdates, nor other tools.
+        let fixing = given(&call(Role::Orchestrator, &reviewer, true, false));
+        assert_eq!(fixing.cache_key.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            (fixing.facts, fixing.allowed_tools, fixing.tools),
+            (None, None, reviewer.tools.clone())
+        );
         assert!(tools_note(&["read".into()]).contains("The tools you may use: read."));
         assert!(tools_note(&[]).contains("The tools you may use: none."));
     }

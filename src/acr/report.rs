@@ -80,6 +80,8 @@ pub struct Sessions {
     /// Reviewers that scouted, and the suspicions they had checked.
     pub scouts: usize,
     pub verifies: usize,
+    /// The groups a fix was split into, one session each before any relay.
+    pub groups: usize,
     /// Every one of those sessions' tokens, and dollars where priced.
     pub tokens: u64,
     pub usd: Option<f64>,
@@ -89,9 +91,14 @@ impl Sessions {
     pub fn line(&self) -> String {
         let role = format!("{:?}", self.role).to_lowercase();
         let usd = self.usd.map_or_else(String::new, |d| format!(", ${d:.2}"));
+        let groups = if self.groups > 0 {
+            format!("; {} fix group(s)", self.groups)
+        } else {
+            String::new()
+        };
         format!(
             "sessions: {role}: {} call(s) relayed, {} session(s) in all; {} scout(s), {} \
-             suspicion(s) checked; {} tokens{usd}",
+             suspicion(s) checked{groups}; {} tokens{usd}",
             self.relayed, self.legs, self.scouts, self.verifies, self.tokens
         )
     }
@@ -124,6 +131,13 @@ pub fn sessions(usage: &[Usage]) -> Vec<Sessions> {
                     .filter(|u| {
                         let p = part(u);
                         p.starts_with("verify") && (!p.contains(", leg ") || first_leg(&p))
+                    })
+                    .count(),
+                groups: calls
+                    .iter()
+                    .filter(|u| {
+                        let p = part(u);
+                        p.starts_with("group ") && (!p.contains(", leg ") || first_leg(&p))
                     })
                     .count(),
                 tokens: calls.iter().map(|u| u.tokens()).sum(),

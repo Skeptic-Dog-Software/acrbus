@@ -1100,11 +1100,52 @@ pub fn read_blast(text: &str) -> Result<Vec<Blast>> {
     Ok(json_in::<BlastAnswer>(text)?.lenses)
 }
 
+/// What every fixer is told about the reach of its fix: the same for every
+/// fix, so a group's session shares it with the rest.
+pub const FIX_SCOPE: &str = "Change code, tests and docs, not what's built from them. Don't \
+     rebuild, regenerate or reformat build artifacts, binaries or generated files the repository \
+     tracks, and don't run a command that rewrites tracked files beyond what the fix needs: a \
+     formatter over the whole tree, a build or release step that rewrites what's checked in, a \
+     lockfile update. If the fix needs one of those, say so in your answer instead of running \
+     it. Every file you change is listed after you're done, and a person is asked about each \
+     binary, and each file the blockers don't point at.";
+
+/// A fixer's brief: what every fix is told first, so that each group of a
+/// fix in groups shares it as a cached opening, and only its own blockers
+/// last.
 pub fn fix_prompt(blockers: &str) -> String {
     format!(
-        "Fix these blockers in the working directory. Change only what fixing them needs, and \
-         don't commit.\n\n{blockers}\n\n\
-         Answer with only JSON: {{\"done\": \"<what you changed, in a line or two>\"}}."
+        "Fix these blockers in the working directory: the ones listed at the end of this brief. \
+         Change only what fixing them needs, and don't commit.\n\n{FIX_SCOPE}\n\n\
+         Answer with only JSON: {{\"done\": \"<what you changed, in a line or two>\"}}.\n\n\
+         # The blockers\n\n{blockers}"
+    )
+}
+
+/// What a fixer's fresh session is told, after the fix's own brief, so it
+/// shares that brief's cached prefix: what the earlier sessions changed,
+/// which is in the checkout already, and what's left.
+pub fn fix_continuation(done: &[String], left: &str, session: u32) -> String {
+    let done: String = done
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let d = d.trim();
+            format!(
+                "- Session {}: {}\n",
+                i + 1,
+                if d.is_empty() { "nothing it said" } else { d }
+            )
+        })
+        .collect();
+    format!(
+        "\n\n# Carrying on from an earlier session\n\n\
+         This fix's earlier session ran out of room and handed off to you: you are session \
+         {session}. What it changed is in the working directory already: build on it, and don't \
+         undo or redo it. Answer with only what you change from here, in the same JSON.\n\n\
+         What the earlier sessions changed:\n{done}\n\
+         What's left to fix, and where the last one was going next: {left}",
+        left = left.trim(),
     )
 }
 
@@ -1152,7 +1193,7 @@ pub fn steelman_prompt(
          Fold in these and nothing else: what the Judge upheld without blocking goes to a \
          person, not into the work. Keep the change to what it's for. Where the work claims \
          something about itself, in a comment, a test name, a doc or a ledger row, make the \
-         claim true or take it out. {pins} Don't commit.\n\n\
+         claim true or take it out. {pins} Don't commit.\n\n{FIX_SCOPE}\n\n\
          A declined finding is recorded as a disagreement, not a resolution.\n\n\
          # Brief the next round\n\n\
          You know what you just changed better than anyone the next round sends. For each \

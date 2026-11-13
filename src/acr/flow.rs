@@ -559,6 +559,29 @@ pub struct Run {
     /// `savings.reuse_rulings`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rulings: Vec<PastRuling>,
+    /// A fix in groups that stopped part way: the groups it did, so a fix
+    /// tried again carries on from the first it didn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_fix: Option<PartialFix>,
+}
+
+/// A fix in groups that stopped at a group: the round's, with the checkout
+/// from before its first group and each group done since.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialFix {
+    pub round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub groups: Vec<GroupDone>,
+}
+
+/// One group of a fix, done: its blockers' IDs, and what its fixer said it
+/// changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupDone {
+    pub ids: Vec<String>,
+    pub done: String,
 }
 
 /// A Judge's ruling that didn't block, kept so a later round's finding that
@@ -950,6 +973,9 @@ pub fn relayed(
     let mut checked: Vec<String> = Vec::new();
     let mut earlier: Vec<roles::Earlier> = Vec::new();
     let mut last_left: Option<String> = None;
+    // A fixer's sessions: what each said it changed, which is in the
+    // checkout for the next.
+    let mut changed: Vec<String> = Vec::new();
     let mut prompt = call.prompt.to_string();
     let mut session: u32 = 1;
     loop {
@@ -991,8 +1017,34 @@ pub fn relayed(
             });
         };
         let (body, h) = handoff.with_context(|| label.clone())?;
-        let new = roles::earlier_of(&body);
         let left = h.left.trim().to_string();
+        if call.writes {
+            let done = roles::read_fixed(&body)
+                .map(|f| f.done.trim().to_string())
+                .unwrap_or_default();
+            let more = !done.is_empty() && changed.last() != Some(&done);
+            if !more && last_left.as_deref() == Some(left.as_str()) {
+                bail!(
+                    "{label}: handed off again with nothing more done and the same left to fix, \
+                     so its relay stopped there and what's left went unfixed"
+                );
+            }
+            last_left = Some(left.clone());
+            caller.say(&format!(
+                "{label}: out of room, so it handed off what it changed to session {}",
+                session + 1
+            ));
+            changed.push(done);
+            handed.push(body);
+            session += 1;
+            prompt = format!(
+                "{}{}",
+                call.prompt,
+                roles::fix_continuation(&changed, &left, session)
+            );
+            continue;
+        }
+        let new = roles::earlier_of(&body);
         if new.is_empty() && last_left.as_deref() == Some(left.as_str()) {
             bail!(
                 "{label}: handed off again with nothing new found and the same left to check, \
@@ -1036,6 +1088,41 @@ fn merged<T>(
 
 fn raw_key(f: &Raw) -> (String, Option<String>, Option<u64>) {
     (f.title.clone(), f.file.clone(), f.line)
+}
+
+/// A fix from every session its call took: what each changed, in order,
+/// and what the last declined and briefed, after any earlier session's.
+fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
+    let last = roles::read_fixed(&legs.last)?;
+    if legs.handed.is_empty() {
+        return Ok(last);
+    }
+    let earlier: Vec<roles::Fixed> = legs
+        .handed
+        .iter()
+        .filter_map(|text| roles::read_fixed(text).ok())
+        .collect();
+    let done: Vec<String> = earlier
+        .iter()
+        .chain(std::iter::once(&last))
+        .map(|f| f.done.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let mut declined: Vec<roles::Declined> = Vec::new();
+    let mut briefs = BTreeMap::new();
+    for f in earlier.into_iter().chain(std::iter::once(last)) {
+        for d in f.declined {
+            if !declined.iter().any(|e| e.finding == d.finding) {
+                declined.push(d);
+            }
+        }
+        briefs.extend(f.briefs);
+    }
+    Ok(roles::Fixed {
+        done: done.join("\n"),
+        declined,
+        briefs,
+    })
 }
 
 /// A Judge's ratings from every session its call took, each once.
@@ -1419,6 +1506,7 @@ pub fn start(
         head_copy: s.head_copy.clone(),
         pr: s.pr,
         rulings: Vec::new(),
+        partial_fix: None,
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -4269,24 +4357,6 @@ fn fix(
     } else {
         String::new()
     };
-    let prompt = if run.converge {
-        let earlier: String = run
-            .steelmans
-            .iter()
-            .map(|m| format!("- After round {}: {}\n", m.round, m.done))
-            .collect();
-        {
-            let lenses: String = run
-                .lenses
-                .keys()
-                .filter_map(|id| s.cfg.lenses.iter().find(|l| &l.id == id))
-                .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
-                .collect();
-            roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses)
-        }
-    } else {
-        roles::fix_prompt(&list(&folded))
-    };
     // The code as it is before the fixes, for the pins to fail on.
     let before = Copies::fresh(
         s.copies
@@ -4298,41 +4368,47 @@ fn fix(
         let copy = dir.join(run.repo.file_name().unwrap_or_default());
         super::change::copy_of(&run.repo, &copy).ok().map(|_| copy)
     });
-    let cfg = s.cfg;
-    let name = cfg.binding_name(Role::Orchestrator, None)?;
-    let repo = run.repo.clone();
-    let call = Call {
-        role: Role::Orchestrator,
-        binding_name: name,
-        binding: cfg.binding(Role::Orchestrator, None)?,
-        prompt: &prompt,
-        artifact: None,
-        writes: true,
-        no_tools: false,
-        relay_tokens: None,
-        repo: &repo,
-        label: if run.converge {
-            format!("the steelman, folding in {} finding(s)", folded.len())
-        } else {
-            format!("the Orchestrator, fixing {} blocker(s)", folded.len())
-        },
-    };
     // The checkout before the fixes, to see what they changed: for the next
-    // round's focus and the blast-radius check too, when they're on.
+    // round's focus and the blast-radius check, when they're on. A fix in
+    // groups tried again keeps the one from before its first group.
     let saving = s.cfg.savings.focus_after_fix || s.cfg.savings.blast_radius;
-    let before_fix = (run.converge || saving)
-        .then(|| caller.snapshot(&run.repo))
-        .flatten();
-    let fixed = caller.call(&call).and_then(|answer| {
-        record(run, cfg, &call, prompt.len(), &answer);
-        roles::read_fixed(&answer.text)
+    let carried = run
+        .partial_fix
+        .as_ref()
+        .filter(|p| p.round == run.round)
+        .and_then(|p| p.from.clone());
+    let before_fix = carried.or_else(|| {
+        (run.converge || saving)
+            .then(|| caller.snapshot(&run.repo))
+            .flatten()
     });
+    let fixed = if run.converge {
+        let earlier: String = run
+            .steelmans
+            .iter()
+            .map(|m| format!("- After round {}: {}\n", m.round, m.done))
+            .collect();
+        let lenses: String = run
+            .lenses
+            .keys()
+            .filter_map(|id| s.cfg.lenses.iter().find(|l| &l.id == id))
+            .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
+            .collect();
+        let prompt = roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses);
+        let label = format!("the steelman, folding in {} finding(s)", folded.len());
+        fix_call(run, s, caller, &prompt, label, None)
+    } else {
+        fix_in_groups(run, s, caller, &folded, &reported, before_fix.as_deref())
+    };
     match fixed {
         Ok(fixed) => {
-            for (id, _) in &folded {
-                let lens = run.lenses.get_mut(id).expect("found above");
-                if !lens.done.contains(&fixed.done) {
-                    lens.done.push(fixed.done.clone());
+            // A fix in groups told each group's lenses what it did.
+            if run.converge {
+                for (id, _) in &folded {
+                    let lens = run.lenses.get_mut(id).expect("found above");
+                    if !lens.done.contains(&fixed.done) {
+                        lens.done.push(fixed.done.clone());
+                    }
                 }
             }
             for r in run.reported.iter_mut() {
@@ -4384,15 +4460,235 @@ fn fix(
             run.stage = Stage::Review;
         }
         Err(e) => {
+            let carries = run
+                .partial_fix
+                .as_ref()
+                .is_some_and(|p| !p.groups.is_empty());
             escalate_about(
                 run,
-                format!("the Orchestrator couldn't fix the blockers: {e:#}"),
+                format!(
+                    "the Orchestrator couldn't fix the blockers: {e:#}{}",
+                    if carries {
+                        ". What the groups before it changed stays in the checkout, and trying \
+                         again carries on from the first group not done"
+                    } else {
+                        ""
+                    }
+                ),
                 Some(About::Unfixed),
             );
             run.stage = Stage::Done;
         }
     }
     Ok(())
+}
+
+/// One session's share of a fix: blockers by lens, and defects a person
+/// reported the reviewers missed.
+#[derive(Debug, Clone, Default)]
+struct FixGroup {
+    findings: Vec<(String, Finding)>,
+    reported: Vec<Reported>,
+}
+
+impl FixGroup {
+    /// Its blockers' IDs, sorted, to know it again.
+    fn ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .findings
+            .iter()
+            .map(|(_, f)| f.id.clone())
+            .chain(self.reported.iter().map(|r| r.id.clone()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// How many blockers it fixes: a defect found by several lenses once.
+    fn blockers(&self) -> usize {
+        let primary = |f: &Finding| {
+            f.same_as
+                .as_ref()
+                .is_none_or(|p| !self.findings.iter().any(|(_, g)| &g.id == p))
+        };
+        self.findings.iter().filter(|(_, f)| primary(f)).count() + self.reported.len()
+    }
+}
+
+/// A fix's blockers in groups, one session each: those that point at the
+/// same file together, since one session fixing them can't collide with
+/// itself, and every other alone. A finding that's the same defect as
+/// another goes with it. A defect a person reported, which points at no
+/// file, goes alone, as does a finding that points at none.
+fn fix_groups(findings: &[(String, Finding)], reported: &[Reported]) -> Vec<FixGroup> {
+    let primary_of = |f: &Finding| -> String {
+        f.same_as
+            .clone()
+            .filter(|p| findings.iter().any(|(_, g)| &g.id == p))
+            .unwrap_or_else(|| f.id.clone())
+    };
+    let mut groups: Vec<FixGroup> = Vec::new();
+    let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_primary: BTreeMap<String, usize> = BTreeMap::new();
+    for (lens, f) in findings.iter().filter(|(_, f)| primary_of(f) == f.id) {
+        let at = f
+            .file
+            .as_deref()
+            .map(|p| p.trim().trim_start_matches("./").to_string())
+            .filter(|p| !p.is_empty());
+        let n = match at.as_ref().and_then(|p| by_file.get(p)) {
+            Some(&n) => n,
+            None => {
+                groups.push(FixGroup::default());
+                if let Some(p) = at {
+                    by_file.insert(p, groups.len() - 1);
+                }
+                groups.len() - 1
+            }
+        };
+        groups[n].findings.push((lens.clone(), f.clone()));
+        by_primary.insert(f.id.clone(), n);
+    }
+    for (lens, f) in findings.iter().filter(|(_, f)| primary_of(f) != f.id) {
+        let n = by_primary[&primary_of(f)];
+        groups[n].findings.push((lens.clone(), f.clone()));
+    }
+    for r in reported {
+        groups.push(FixGroup {
+            findings: Vec::new(),
+            reported: vec![r.clone()],
+        });
+    }
+    groups
+}
+
+/// A fix outside a review to convergence: in groups when
+/// `savings.group_fixes` is on, each a fresh session from the same opening
+/// with only its own blockers, one after another in the checkout, so each
+/// sees what the ones before it changed. Each group's lenses are told what
+/// it did as it finishes, and a group that fails leaves the ones before it
+/// done, for a fix tried again to carry on from.
+fn fix_in_groups(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    folded: &[(String, Finding)],
+    reported: &[Reported],
+    from: Option<&str>,
+) -> Result<roles::Fixed> {
+    let groups = if s.cfg.savings.group_fixes {
+        fix_groups(folded, reported)
+    } else {
+        vec![FixGroup {
+            findings: folded.to_vec(),
+            reported: reported.to_vec(),
+        }]
+    };
+    let n = groups.len();
+    let mut partial = run
+        .partial_fix
+        .take()
+        .filter(|p| p.round == run.round)
+        .unwrap_or_else(|| PartialFix {
+            round: run.round,
+            from: from.map(str::to_string),
+            groups: Vec::new(),
+        });
+    let mut done = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        let ids = group.ids();
+        if let Some(g) = partial.groups.iter().find(|g| g.ids == ids) {
+            done.push(g.done.clone());
+            continue;
+        }
+        let prompt = roles::fix_prompt(&fix_list(&group.findings, &group.reported));
+        let (label, part) = if n > 1 {
+            (
+                format!(
+                    "the Orchestrator, fixing group {} of {n}: {} blocker(s)",
+                    i + 1,
+                    group.blockers()
+                ),
+                Some(format!("group {}", i + 1)),
+            )
+        } else {
+            (
+                format!("the Orchestrator, fixing {} blocker(s)", group.blockers()),
+                None,
+            )
+        };
+        match fix_call(run, s, caller, &prompt, label, part) {
+            Ok(fixed) => {
+                for (id, _) in &group.findings {
+                    if let Some(lens) = run.lenses.get_mut(id)
+                        && !lens.done.contains(&fixed.done)
+                    {
+                        lens.done.push(fixed.done.clone());
+                    }
+                }
+                partial.groups.push(GroupDone {
+                    ids,
+                    done: fixed.done.clone(),
+                });
+                done.push(fixed.done);
+            }
+            Err(e) => {
+                let e = if n > 1 {
+                    e.context(format!("group {} of {n} ({})", i + 1, ids.join(", ")))
+                } else {
+                    e
+                };
+                if !partial.groups.is_empty() {
+                    run.partial_fix = Some(partial);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(roles::Fixed {
+        done: done.join("\n"),
+        declined: Vec::new(),
+        briefs: BTreeMap::new(),
+    })
+}
+
+/// One fixer's call on the Orchestrator's binding, relayed when its calls
+/// relay, each session on the record, marked with `part` when it's one of
+/// several groups.
+fn fix_call(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    prompt: &str,
+    label: String,
+    part: Option<String>,
+) -> Result<roles::Fixed> {
+    let cfg = s.cfg;
+    let repo = run.repo.clone();
+    let call = Call {
+        role: Role::Orchestrator,
+        binding_name: cfg.binding_name(Role::Orchestrator, None)?,
+        binding: cfg.binding(Role::Orchestrator, None)?,
+        prompt,
+        artifact: None,
+        writes: true,
+        no_tools: false,
+        relay_tokens: cfg.sessions.relay(Role::Orchestrator),
+        repo: &repo,
+        label,
+    };
+    let used = |c: &Call, a: &Answer| usage(cfg, c, c.prompt.len(), a);
+    let legs = relayed(caller, &call, &used)?;
+    for mut u in legs.usage.iter().cloned() {
+        u.round = run.round;
+        u.part = match (&part, u.part.take()) {
+            (Some(group), Some(leg)) => Some(format!("{group}, {leg}")),
+            (Some(group), None) => Some(group.clone()),
+            (None, leg) => leg,
+        };
+        run.usage.push(u);
+    }
+    fixed_of(&legs)
 }
 
 /// What's to be fixed, as the fixer reads it: each finding with what a
@@ -4652,10 +4948,33 @@ fn to_fix(run: &Run) -> Vec<(String, Finding)> {
         .collect()
 }
 
-/// What the session that ran the review is to fix, as it reads it.
+/// What the session that ran the review is to fix, as it reads it: less
+/// what groups of the Orchestrator's fix already did, which it's told.
 pub fn fix_brief(run: &Run) -> String {
-    let reported: Vec<Reported> = run.reported.iter().filter(|r| !r.fixed).cloned().collect();
-    fix_list(&to_fix(run), &reported)
+    let partial = run
+        .partial_fix
+        .as_ref()
+        .filter(|p| p.round == run.round && !p.groups.is_empty());
+    let done =
+        |id: &str| partial.is_some_and(|p| p.groups.iter().any(|g| g.ids.iter().any(|i| i == id)));
+    let reported: Vec<Reported> = run
+        .reported
+        .iter()
+        .filter(|r| !r.fixed && !done(&r.id))
+        .cloned()
+        .collect();
+    let left: Vec<(String, Finding)> = to_fix(run)
+        .into_iter()
+        .filter(|(_, f)| !done(&f.id))
+        .collect();
+    let mut out = fix_list(&left, &reported);
+    if let Some(p) = partial {
+        out.push_str("\nAlready fixed by the Orchestrator, in the working tree:\n");
+        for g in &p.groups {
+            out.push_str(&format!("- {}: {}\n", g.ids.join(", "), g.done.trim()));
+        }
+    }
+    out
 }
 
 /// The session that ran the review has fixed what was folded in, in the
@@ -4689,7 +5008,14 @@ pub fn fixed_by_session(
     for r in run.reported.iter_mut() {
         r.fixed = true;
     }
-    let from = run.fixing.take().and_then(|f| f.from);
+    // From before the Orchestrator's first group, if some were done.
+    let carried = run
+        .partial_fix
+        .take()
+        .filter(|p| p.round == run.round)
+        .and_then(|p| p.from);
+    let from = carried.or_else(|| run.fixing.take().and_then(|f| f.from));
+    run.fixing = None;
     if run.converge {
         run.steelmans.push(Steelman {
             round: run.round,
@@ -9998,5 +10324,312 @@ lenses:
                 .filter(|r| r.0 == Role::Judge)
                 .all(|r| r.1 == Some(40_000))
         );
+    }
+
+    /// Three blockers, two in a.src, from alpha, and one in b.src, from
+    /// beta, until a fix has run; the fixer answers with what its blockers
+    /// were.
+    fn three_blockers(fixed: &Mutex<bool>) -> impl Fn(Role, &str) -> Result<String> + Sync + '_ {
+        move |role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if !*fixed.lock().unwrap() => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge if prompt.contains("alpha criteria") => r#"{"findings": [
+                    {"title": "first defect", "file": "a.src", "severity": "High"},
+                    {"title": "second defect", "file": "./a.src", "severity": "High"}]}"#
+                    .to_string(),
+                Role::Judge => {
+                    r#"{"findings": [{"title": "third defect", "file": "b.src", "severity": "High"}]}"#
+                        .to_string()
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() = true;
+                    let which: Vec<&str> = ["first", "second", "third"]
+                        .into_iter()
+                        .filter(|w| prompt.contains(&format!("{w} defect")))
+                        .collect();
+                    format!(r#"{{"done": "fixed {}"}}"#, which.join(" and "))
+                }
+                _ => NOTHING.to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_fix_goes_in_groups_by_file_each_a_fresh_session_with_only_its_blockers() {
+        let cfg = plain("exception", 3, 1);
+        assert!(cfg.savings.group_fixes, "on by default");
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(three_blockers(&fixed));
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let fixes: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Orchestrator)
+            .map(|c| &c.3)
+            .collect();
+        assert_eq!(fixes.len(), 2, "a.src's two together, b.src's alone");
+        assert!(fixes[0].contains("first defect") && fixes[0].contains("second defect"));
+        assert!(!fixes[0].contains("third defect"));
+        assert!(fixes[1].contains("third defect") && !fixes[1].contains("first defect"));
+        // Both open the same way, with only their blockers last, so the
+        // second reads the opening from the cache.
+        let opening = fixes[0].find("# The blockers").unwrap();
+        assert_eq!(fixes[0][..opening], fixes[1][..opening]);
+        assert!(fixes[0][..opening].contains(roles::FIX_SCOPE));
+        drop(calls);
+        let told = fake.told.lock().unwrap();
+        assert!(told.contains(&"call: the Orchestrator, fixing group 1 of 2: 2 blocker(s)".into()));
+        assert!(told.contains(&"call: the Orchestrator, fixing group 2 of 2: 1 blocker(s)".into()));
+        drop(told);
+        // Each group is a leg of its own, on the record.
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Orchestrator)
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("group 1".into()), Some("group 2".into())]);
+        let sessions = report::sessions(&run.usage);
+        let o = sessions
+            .iter()
+            .find(|x| x.role == Role::Orchestrator)
+            .unwrap();
+        assert_eq!((o.groups, o.relayed), (2, 0));
+        assert!(o.line().contains("2 fix group(s)"), "{}", o.line());
+        // Each lens is told what its own group did.
+        assert_eq!(run.lenses["alpha"].done, ["fixed first and second"]);
+        assert_eq!(run.lenses["beta"].done, ["fixed third"]);
+    }
+
+    #[test]
+    fn a_fix_in_one_group_is_one_call_as_before_and_grouping_can_be_turned_off() {
+        let cfg = config("exception", 3, 1, "", "savings: {group_fixes: false}");
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(three_blockers(&fixed));
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        assert_eq!(fake.count(Role::Orchestrator), 1);
+        assert!(
+            fake.told
+                .lock()
+                .unwrap()
+                .contains(&"call: the Orchestrator, fixing 3 blocker(s)".into())
+        );
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Orchestrator)
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![None]);
+    }
+
+    #[test]
+    fn fix_groups_put_one_files_blockers_and_a_same_defect_together_and_the_rest_alone() {
+        let f = |id: &str, file: Option<&str>, same_as: Option<&str>| Finding {
+            id: id.into(),
+            title: format!("{id} title"),
+            detail: String::new(),
+            file: file.map(str::to_string),
+            line: None,
+            severity: Severity::High,
+            action: Action::Blocks,
+            reason: String::new(),
+            state: FindingState::Folded,
+            note: String::new(),
+            same_as: same_as.map(str::to_string),
+            reused_from: None,
+            ruled_by: None,
+        };
+        let findings = vec![
+            ("alpha".to_string(), f("a1", Some("x.rs"), None)),
+            ("alpha".to_string(), f("a2", None, None)),
+            ("beta".to_string(), f("b1", Some("y.rs"), None)),
+            // The same defect as a1, pointing elsewhere: it goes with a1.
+            ("beta".to_string(), f("b2", Some("z.rs"), Some("a1"))),
+            ("beta".to_string(), f("b3", Some("./x.rs"), None)),
+            ("beta".to_string(), f("b4", None, None)),
+        ];
+        let reported = vec![Reported {
+            id: "you-1".into(),
+            round: 1,
+            text: "the dates are off".into(),
+            fixed: false,
+        }];
+        let groups = fix_groups(&findings, &reported);
+        let ids: Vec<Vec<String>> = groups.iter().map(FixGroup::ids).collect();
+        assert_eq!(
+            ids,
+            vec![
+                vec!["a1", "b2", "b3"],
+                vec!["a2"],
+                vec!["b1"],
+                vec!["b4"],
+                vec!["you-1"],
+            ]
+        );
+        assert_eq!(groups[0].blockers(), 2, "the same defect counts once");
+        let list = fix_list(&groups[0].findings, &groups[0].reported);
+        assert!(
+            list.contains("The same defect was found by: beta"),
+            "{list}"
+        );
+    }
+
+    #[test]
+    fn a_group_that_fails_is_tried_again_from_where_it_stopped() {
+        let cfg = plain("exception", 3, 1);
+        let fixed = Mutex::new(false);
+        let fail = Mutex::new(true);
+        let inner = three_blockers(&fixed);
+        let fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator
+                && prompt.contains("third defect")
+                && std::mem::replace(&mut *fail.lock().unwrap(), false)
+            {
+                bail!("the fixer's agent went away");
+            }
+            inner(role, prompt)
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src", "b.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.status, Status::Waiting);
+        let reason = &run.escalations.last().unwrap().reason;
+        assert!(reason.contains("group 2 of 2"), "{reason}");
+        assert!(reason.contains("beta-r1-1"), "{reason}");
+        assert!(
+            reason.contains("carries on from the first group not done"),
+            "{reason}"
+        );
+        // What group 1 did is kept for its lens.
+        assert_eq!(run.lenses["alpha"].done, ["fixed first and second"]);
+        let a = answered(&run, &cfg, &[("Unfixed", "Try it again".into())]);
+        assert_eq!(a.len(), 1);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let fixes: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Orchestrator)
+            .map(|c| &c.3)
+            .collect();
+        assert_eq!(fixes.len(), 3, "group 1 once, group 2 twice");
+        assert!(fixes[2].contains("third defect") && !fixes[2].contains("first defect"));
+        assert!(run.partial_fix.is_none(), "done with");
+        assert_eq!(run.lenses["beta"].done, ["fixed third"]);
+    }
+
+    #[test]
+    fn the_orchestrators_fix_relays_and_its_next_session_carries_on_from_what_was_changed() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "savings: {group_fixes: false}\nsessions: {relay_tokens: {orchestrator: 60000}}",
+        );
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator && !prompt.contains("# Carrying on") {
+                return Ok("ACRBUS-HANDOFF\n{\"done\": \"fixed first\", \"handoff\": {\"checked\": \"first\", \"left\": \"second and third\"}}".into());
+            }
+            inner(role, prompt)
+        });
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let fixes: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Orchestrator)
+            .map(|c| &c.3)
+            .collect();
+        assert_eq!(fixes.len(), 2);
+        assert!(fixes[1].starts_with(fixes[0].as_str()), "the same opening");
+        assert!(fixes[1].contains("What it changed is in the working directory already"));
+        assert!(fixes[1].contains("- Session 1: fixed first"));
+        assert!(fixes[1].contains("second and third"));
+        assert!(!fixes[1].contains("What they already have, not to repeat"));
+        drop(calls);
+        assert!(
+            fake.relays
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == Role::Orchestrator)
+                .all(|r| r.1 == Some(60_000))
+        );
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Orchestrator)
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("leg 1".into()), Some("leg 2".into())]);
+        // Every session's work is the fix's.
+        assert_eq!(
+            run.lenses["alpha"].done,
+            ["fixed first\nfixed first and second and third"]
+        );
+    }
+
+    #[test]
+    fn a_fixer_that_hands_off_twice_with_nothing_more_done_stops_its_relay() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "savings: {group_fixes: false}\nsessions: {relay_tokens: {orchestrator: 60000}}",
+        );
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator {
+                return Ok("ACRBUS-HANDOFF\n{\"done\": \"fixed first\", \"handoff\": {\"checked\": \"first\", \"left\": \"the rest\"}}".into());
+            }
+            inner(role, prompt)
+        });
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(fake.count(Role::Orchestrator), 2);
+        let reason = &run.escalations.last().unwrap().reason;
+        assert!(reason.contains("nothing more done"), "{reason}");
+        assert!(reason.contains("went unfixed"), "{reason}");
+    }
+
+    #[test]
+    fn a_session_that_takes_over_a_fix_in_groups_gets_only_whats_left() {
+        let cfg = plain("exception", 3, 1);
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator && prompt.contains("third defect") {
+                bail!("the fixer's agent went away");
+            }
+            inner(role, prompt)
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src", "b.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let a = answered(&run, &cfg, &[("Unfixed", "This session".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        let brief = fix_brief(&run);
+        assert!(brief.contains("third defect"), "{brief}");
+        assert!(!brief.contains("- alpha-r1-1 ("), "{brief}");
+        assert!(
+            brief.contains("Already fixed by the Orchestrator, in the working tree:\n- alpha-r1-1, alpha-r1-2: fixed first and second"),
+            "{brief}"
+        );
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        assert!(run.partial_fix.is_none());
+        assert_eq!(run.stage, Stage::Review);
     }
 }
