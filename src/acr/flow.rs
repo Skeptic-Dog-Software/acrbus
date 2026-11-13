@@ -2691,6 +2691,11 @@ struct Alive<'a> {
 /// it: a minimal call with the same prefix, through the same binding, only
 /// when its bridge has a slot to spare. Its use is kept apart from the
 /// roles' work.
+///
+/// Each role's refreshes are its own: one after another, never two at once,
+/// and the next due an interval after the last one answered, not after it
+/// went. A slow provider's answer is then never followed at once by another,
+/// and one role's slow refresh never holds up another role's.
 fn keep_alive(
     caller: &dyn Caller,
     cfg: &Config,
@@ -2700,20 +2705,35 @@ fn keep_alive(
     out: &std::sync::Mutex<Vec<Usage>>,
 ) {
     let every = std::time::Duration::from_secs(cfg.facts.keep_alive_secs);
-    let mut last: Vec<Option<std::time::Instant>> = vec![None; alive.len()];
+    thread::scope(|scope| {
+        for a in alive {
+            scope.spawn(move || keep_one_alive(caller, cfg, a, every, repo, stop, out));
+        }
+    });
+}
+
+/// One role's refreshes, for [`keep_alive`].
+fn keep_one_alive(
+    caller: &dyn Caller,
+    cfg: &Config,
+    a: &Alive,
+    every: std::time::Duration,
+    repo: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+    out: &std::sync::Mutex<Vec<Usage>>,
+) {
+    // When the last refresh answered: the next is due an interval after.
+    let mut answered: Option<std::time::Instant> = None;
+    let mut said_slow = false;
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        for (i, a) in alive.iter().enumerate() {
-            let Some(since) = a.warm.started() else {
-                continue;
-            };
-            if a.till_done && a.warm.running() == 0 {
-                continue;
-            }
-            let due = last[i].unwrap_or(since) + every;
-            if std::time::Instant::now() < due || !caller.has_room(a.binding) {
-                continue;
-            }
-            last[i] = Some(std::time::Instant::now());
+        let due = a.warm.started().and_then(|since| {
+            let live = !(a.till_done && a.warm.running() == 0);
+            live.then(|| answered.unwrap_or(since) + every)
+        });
+        if let Some(due) = due
+            && std::time::Instant::now() >= due
+            && caller.has_room(a.binding)
+        {
             let call = Call {
                 role: a.role,
                 binding_name: a.name,
@@ -2726,11 +2746,25 @@ fn keep_alive(
                 repo,
                 label: format!("cache keep-alive: {}", a.what),
             };
-            if let Ok(answer) = caller.call(&call) {
+            let went = std::time::Instant::now();
+            let result = caller.call(&call);
+            answered = Some(std::time::Instant::now());
+            let took = went.elapsed();
+            if let Ok(answer) = result {
                 let mut u = usage(cfg, &call, roles::KEEP_ALIVE.len(), &answer);
                 u.fan_out = Some("keep-alive".into());
                 lock_vec(out).push(u);
                 caller.say(&format!("cache: refreshed the {}' prefix", a.what));
+            }
+            if took >= every && !said_slow {
+                said_slow = true;
+                caller.say(&format!(
+                    "cache: the {}' keep-alive took {}s to answer, past its {}s interval: the \
+                     next waits its interval after the answer, and none goes while one is out",
+                    a.what,
+                    took.as_secs(),
+                    every.as_secs()
+                ));
             }
         }
         for _ in 0..10 {
@@ -8562,6 +8596,8 @@ lenses:
         answered: Mutex<BTreeSet<String>>,
         said: Mutex<Vec<String>>,
         reviewer_ms: u64,
+        /// How long a keep-alive takes to answer: a slow provider's.
+        keep_alive_ms: u64,
     }
 
     /// A call as it was seen: its label, role and prompt, when it started
@@ -8580,6 +8616,7 @@ lenses:
                 answered: Mutex::new(BTreeSet::new()),
                 said: Mutex::new(Vec::new()),
                 reviewer_ms,
+                keep_alive_ms: 0,
             }
         }
 
@@ -8600,6 +8637,7 @@ lenses:
                 && matches!(call.role, Role::Reviewer | Role::Judge);
             let text = if call.label.starts_with("cache keep-alive") {
                 assert_eq!(call.prompt, roles::KEEP_ALIVE);
+                std::thread::sleep(Duration::from_millis(self.keep_alive_ms));
                 "ok".to_string()
             } else {
                 match call.role {
@@ -9106,6 +9144,44 @@ lenses:
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn a_slow_keep_alive_is_never_followed_at_once_by_another_nor_overlapped() {
+        // The provider takes 2.5s to answer a keep-alive due every 2s.
+        let mut caller = Cached::new(7500);
+        caller.keep_alive_ms = 2500;
+        let (_run, dir) = cached_run("facts: {keep_alive_secs: 2, warm_secs: 0}", 1, &caller);
+        let calls = caller.calls.lock().unwrap().clone();
+        let mut kept: Vec<(Instant, Instant)> = calls
+            .iter()
+            .filter(|c| c.0 == "cache keep-alive: reviewers")
+            .map(|c| (c.3, c.4))
+            .collect();
+        kept.sort();
+        assert!(kept.len() >= 2, "{kept:?}");
+        for pair in kept.windows(2) {
+            let (_, ended) = pair[0];
+            let (next, _) = pair[1];
+            assert!(
+                next >= ended,
+                "a keep-alive went out while the last was still in flight"
+            );
+            assert!(
+                next.duration_since(ended) >= Duration::from_millis(1800),
+                "the next keep-alive followed {:?} after the last answered, not its interval",
+                next.duration_since(ended)
+            );
+        }
+        let said = caller.said.lock().unwrap().clone();
+        assert!(
+            said.iter().any(|l| l.starts_with(
+                "cache: the reviewers' keep-alive took 2s to answer, past its 2s interval: the \
+                 next waits its interval after the answer"
+            )),
+            "{said:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

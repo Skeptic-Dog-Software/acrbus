@@ -338,11 +338,13 @@ pub struct Policy {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionsPolicy {
-    /// By role, `reviewer` or `judge`: the prompt tokens of one turn past
-    /// which a call hands off to a fresh session. It writes its findings so
-    /// far, what it has checked and what's left, and a fresh session on the
-    /// same binding carries on from that. Only agents acrbus can steer
-    /// mid-call relay; others run whole.
+    /// By role, `reviewer`, `judge` or `orchestrator`: the prompt tokens of
+    /// one turn past which a call hands off to a fresh session. It writes
+    /// its findings so far, what it has checked and what's left, and a
+    /// fresh session on the same binding carries on from that. An
+    /// Orchestrator's relay is for its fixes: what it has fixed so far, and
+    /// what's left to fix. Only agents acrbus can steer mid-call relay;
+    /// others run whole.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub relay_tokens: BTreeMap<Role, u64>,
     /// Lenses whose reviewers scout first: one session lists what it
@@ -350,12 +352,19 @@ pub struct SessionsPolicy {
     /// dropped in a short session of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scout: Option<Vec<String>>,
+    /// Seconds a call may log no new turn before progress warns of it,
+    /// once, until it moves again: a call waiting on a slow provider uses no
+    /// CPU and changes no file, so its bridge's quiet-run watch never sees
+    /// it. Nothing is cut off for it. 0 turns the warning off. Default 180.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_warn_secs: Option<u64>,
 }
 
 impl SessionsPolicy {
     fn over(mut self, later: SessionsPolicy) -> SessionsPolicy {
         self.relay_tokens.extend(later.relay_tokens);
         self.scout = later.scout.or(self.scout);
+        self.stall_warn_secs = later.stall_warn_secs.or(self.stall_warn_secs);
         self
     }
 }
@@ -364,11 +373,27 @@ impl SessionsPolicy {
 /// session has room to work before it hands off.
 pub const RELAY_MIN_TOKENS: u64 = 32_000;
 
-/// The sessions settings, resolved.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How long a call may log no new turn before progress warns, unless set.
+pub const STALL_WARN_SECS: u64 = 180;
+
+/// The sessions settings, resolved. A run's stored config from before a
+/// field was added reads it as its default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionsConfig {
     pub relay_tokens: BTreeMap<Role, u64>,
     pub scout: Vec<String>,
+    pub stall_warn_secs: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        SessionsConfig {
+            relay_tokens: BTreeMap::new(),
+            scout: Vec::new(),
+            stall_warn_secs: STALL_WARN_SECS,
+        }
+    }
 }
 
 impl SessionsConfig {
@@ -377,6 +402,7 @@ impl SessionsConfig {
         SessionsConfig {
             relay_tokens: p.relay_tokens,
             scout: p.scout.unwrap_or_default(),
+            stall_warn_secs: p.stall_warn_secs.unwrap_or(STALL_WARN_SECS),
         }
     }
 
@@ -481,6 +507,13 @@ pub struct SavingsPolicy {
     /// Default false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blast_radius: Option<bool>,
+    /// Fix a round's blockers in groups, each in a fresh session on the
+    /// Orchestrator's binding: blockers in the same files together, the
+    /// rest each alone, one group after another in the checkout, each
+    /// seeing what the groups before it changed. One long session for every
+    /// blocker rereads all it has done on every turn. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_fixes: Option<bool>,
 }
 
 impl SavingsPolicy {
@@ -490,18 +523,22 @@ impl SavingsPolicy {
             first_pass_judge: later.first_pass_judge.or(self.first_pass_judge),
             focus_after_fix: later.focus_after_fix.or(self.focus_after_fix),
             blast_radius: later.blast_radius.or(self.blast_radius),
+            group_fixes: later.group_fixes.or(self.group_fixes),
         }
     }
 }
 
-/// The savings settings, resolved.
+/// The savings settings, resolved. A run's stored config from before a
+/// field was added reads it as its default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SavingsConfig {
     pub reuse_rulings: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_pass_judge: Option<String>,
     pub focus_after_fix: bool,
     pub blast_radius: bool,
+    pub group_fixes: bool,
 }
 
 impl Default for SavingsConfig {
@@ -511,6 +548,7 @@ impl Default for SavingsConfig {
             first_pass_judge: None,
             focus_after_fix: false,
             blast_radius: false,
+            group_fixes: true,
         }
     }
 }
@@ -524,6 +562,7 @@ impl SavingsConfig {
             first_pass_judge: p.first_pass_judge.or(d.first_pass_judge),
             focus_after_fix: p.focus_after_fix.unwrap_or(d.focus_after_fix),
             blast_radius: p.blast_radius.unwrap_or(d.blast_radius),
+            group_fixes: p.group_fixes.unwrap_or(d.group_fixes),
         }
     }
 }
@@ -1268,9 +1307,10 @@ impl Config {
     /// the framework's own included.
     fn check_sessions(&self) -> Result<()> {
         for (role, tokens) in &self.sessions.relay_tokens {
-            if !matches!(role, Role::Reviewer | Role::Judge) {
+            if !matches!(role, Role::Reviewer | Role::Judge | Role::Orchestrator) {
                 bail!(
-                    "sessions.relay_tokens.{}: only reviewers' and Judges' calls relay",
+                    "sessions.relay_tokens.{}: only reviewers', Judges' and the Orchestrator's \
+                     fix calls relay",
                     role.as_str()
                 );
             }
@@ -2083,8 +2123,8 @@ mod tests {
         );
         for (extra, says) in [
             (
-                "sessions: {relay_tokens: {orchestrator: 90000}}\n",
-                "only reviewers' and Judges'",
+                "sessions: {relay_tokens: {sizer: 90000}}\n",
+                "only reviewers', Judges' and the Orchestrator's",
             ),
             ("sessions: {relay_tokens: {reviewer: 1000}}\n", "too few"),
             ("sessions: {scout: [nope]}\n", "doesn't exist"),
@@ -2099,6 +2139,7 @@ mod tests {
         defaults.sessions = Some(SessionsPolicy {
             relay_tokens: BTreeMap::from([(Role::Reviewer, 100_000), (Role::Judge, 80_000)]),
             scout: None,
+            stall_warn_secs: None,
         });
         both.defaults = Some(defaults);
         let merged = resolve(
@@ -2113,5 +2154,39 @@ mod tests {
         assert_eq!(merged.sessions.relay(Role::Reviewer), Some(100_000));
         assert_eq!(merged.sessions.relay(Role::Judge), Some(60_000));
         assert!(merged.sessions.scouts("l"));
+    }
+
+    #[test]
+    fn fixes_group_and_relay_and_a_stall_is_warned_of_by_default_and_each_can_be_set() {
+        let user = parse_user(MODELS_USER).unwrap();
+        let load = |extra: &str| {
+            resolve(
+                &user,
+                parse_repo(&format!("{SMALL}{extra}"))?,
+                &Flags::default(),
+            )
+        };
+        let plain = load("").unwrap();
+        assert!(plain.savings.group_fixes, "grouping is on by default");
+        assert_eq!(plain.sessions.stall_warn_secs, STALL_WARN_SECS);
+        assert_eq!(plain.sessions.relay(Role::Orchestrator), None);
+        let set = load(
+            "savings: {group_fixes: false}\nsessions: {relay_tokens: {orchestrator: 90000}, \
+             stall_warn_secs: 0}\n",
+        )
+        .unwrap();
+        assert!(!set.savings.group_fixes);
+        assert_eq!(set.sessions.relay(Role::Orchestrator), Some(90_000));
+        assert_eq!(set.sessions.stall_warn_secs, 0, "0 turns the warning off");
+        // A run's config stored before these were added still reads, with
+        // each at its default.
+        let stored: SavingsConfig = serde_json::from_str(
+            r#"{"reuse_rulings": true, "focus_after_fix": false, "blast_radius": false}"#,
+        )
+        .unwrap();
+        assert!(stored.group_fixes);
+        let stored: SessionsConfig =
+            serde_json::from_str(r#"{"relay_tokens": {}, "scout": []}"#).unwrap();
+        assert_eq!(stored.stall_warn_secs, STALL_WARN_SECS);
     }
 }

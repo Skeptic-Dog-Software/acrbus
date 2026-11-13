@@ -8,6 +8,11 @@
 //! and warns once when a call passes its share of the most the plan allows,
 //! or the run passes that most.
 //!
+//! A call whose agent has logged no new turn for a while (three minutes by
+//! default) is warned of once, until it moves again: a call waiting on a
+//! slow provider uses no CPU and changes no file, so its bridge's watch for
+//! a quiet run never sees it.
+//!
 //! It decides nothing. A call is never cut off while it works: its bridge
 //! ends one that stalls, and a person can stop a review. This only tells
 //! them what they need to judge.
@@ -27,6 +32,11 @@ use crate::util::now_ms;
 
 /// The longest a person waits for a line while a review runs.
 pub const EVERY: Duration = Duration::from_secs(60);
+/// How long a call may log no new turn before progress warns of it, unless
+/// the review's config says otherwise.
+pub const STALL: Duration = Duration::from_secs(180);
+/// How often calls are looked at for a stall, whatever else is said.
+const STALL_LOOK: Duration = Duration::from_secs(20);
 
 /// Where a call stands, by its bridge's name and its request's ID.
 type Look = dyn Fn(&str, &str) -> Standing + Send + Sync;
@@ -40,6 +50,9 @@ struct Shared {
     state: Mutex<State>,
     stop: AtomicBool,
     every: Duration,
+    /// How long a call may log no new turn before it's warned of; None
+    /// never.
+    stall: Mutex<Option<Duration>>,
     look: Box<Look>,
     out: Mutex<Box<dyn Write + Send>>,
     log: Mutex<Option<PathBuf>>,
@@ -96,6 +109,11 @@ struct Live {
     share: Option<u64>,
     /// It passed its share, and was told so.
     warned: bool,
+    /// The turns its agent had logged when last looked at, and since when.
+    turns: u64,
+    turn_at: Instant,
+    /// It has logged no new turn for the stall time, and was told so.
+    stalled: bool,
 }
 
 /// A call at work, as the heartbeat reads it: its number, label, bridge,
@@ -139,6 +157,7 @@ impl Progress {
             }),
             stop: AtomicBool::new(false),
             every,
+            stall: Mutex::new(Some(STALL)),
             look,
             out: Mutex::new(out),
             log: Mutex::new(None),
@@ -150,6 +169,12 @@ impl Progress {
             .spawn(move || ticking.tick())
             .ok();
         Progress { shared, ticker }
+    }
+
+    /// How long a call may log no new turn before it's warned of; None
+    /// turns the warning off.
+    pub fn stall_after(&self, after: Option<Duration>) {
+        *lock(&self.shared.stall) = after;
     }
 
     /// Writes every line to `path` too, for whoever started the review in
@@ -196,6 +221,9 @@ impl Progress {
                     started: Instant::now(),
                     share,
                     warned: false,
+                    turns: 0,
+                    turn_at: Instant::now(),
+                    stalled: false,
                 },
             );
             Token(n)
@@ -246,6 +274,7 @@ impl Drop for Progress {
 impl Shared {
     fn tick(&self) {
         let step = (self.every / 10).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let mut looked = Instant::now();
         while !self.stop.load(Ordering::SeqCst) {
             thread::sleep(step);
             let due = lock(&self.state).said.elapsed() >= self.every;
@@ -253,7 +282,57 @@ impl Shared {
                 let lines = self.status();
                 self.say(&lines);
             }
+            // Apart from the heartbeat, which other lines put off.
+            let stall = *lock(&self.stall);
+            if let Some(stall) = stall
+                && looked.elapsed() >= STALL_LOOK.min(stall / 3)
+            {
+                looked = Instant::now();
+                let warnings = self.stalls(stall);
+                if !warnings.is_empty() {
+                    self.say(&warnings);
+                }
+            }
         }
+    }
+
+    /// A warning for each call that has logged no new turn for `stall`,
+    /// once a stall: a turn since ends it, and a later one is said again.
+    /// Only calls whose bridge counts their turns.
+    fn stalls(&self, stall: Duration) -> Vec<String> {
+        let looking: Vec<(u64, String, String)> = lock(&self.state)
+            .calls
+            .iter()
+            .filter_map(|(n, c)| c.id.clone().map(|id| (*n, c.bridge.clone(), id)))
+            .collect();
+        let mut out = Vec::new();
+        for (n, bridge, id) in looking {
+            let Standing::Running {
+                tokens: Some(t), ..
+            } = (self.look)(&bridge, &id)
+            else {
+                continue;
+            };
+            let mut state = lock(&self.state);
+            let Some(call) = state.calls.get_mut(&n) else {
+                continue;
+            };
+            if t.turns != call.turns {
+                call.turns = t.turns;
+                call.turn_at = Instant::now();
+                call.stalled = false;
+            } else if !call.stalled && call.turn_at.elapsed() >= stall {
+                call.stalled = true;
+                out.push(format!(
+                    "warning: {} has logged no new turn for {}, {} so far: its provider may be \
+                     slow, or a request lost; nothing cuts it off for that",
+                    call.label,
+                    took(call.turn_at.elapsed()),
+                    call.turns
+                ));
+            }
+        }
+        out
     }
 
     /// Everything at work now, a line for each call, and the run's total
@@ -689,6 +768,7 @@ mod tests {
             output,
             usd: Some(0.5),
             first_turn: None,
+            turns: 0,
         };
         let p = Progress::with(
             Box::new(seen.clone()),
@@ -785,6 +865,7 @@ mod tests {
             output: 120,
             usd: Some(0.008),
             first_turn: None,
+            turns: 0,
         };
         p.end(t, None, Some(used));
         p.line("probes: no findings, nothing for the Judge");
@@ -807,6 +888,7 @@ mod tests {
                     cache_read_tokens: 36_812,
                     cache_write_tokens: 0,
                 }),
+                turns: 0,
             }),
         );
         let text = seen.text();
@@ -831,5 +913,82 @@ mod tests {
             ),
             "no first turn, nothing said of one: {text}"
         );
+    }
+
+    #[test]
+    fn warns_once_when_a_call_logs_no_new_turn_for_a_while_and_again_after_it_moves() {
+        let seen = Seen::default();
+        // The call's turns, as its bridge would read them from its agent.
+        let turns = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let read = Arc::clone(&turns);
+        let p = Progress::with(
+            Box::new(seen.clone()),
+            Box::new(move |_, _| Standing::Running {
+                since: now_ms(),
+                active: Some(now_ms()),
+                idle_secs: 1200,
+                tokens: Some(LiveTokens {
+                    input: 1_000,
+                    cache_read: 30_000,
+                    cache_write: 0,
+                    output: 100,
+                    usd: None,
+                    first_turn: None,
+                    turns: read.load(Ordering::SeqCst),
+                }),
+            }),
+            Duration::from_secs(3600),
+        );
+        p.stall_after(Some(Duration::from_millis(300)));
+        let t = p.start("regression: Judge", "glm", "pi", None);
+        p.sent(t, "slow");
+        let text = waits_for(&seen, "no new turn");
+        let warning = text
+            .lines()
+            .find(|l| l.contains("no new turn"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            warning.contains("warning: regression: Judge has logged no new turn for ")
+                && warning.contains("s, 3 so far:"),
+            "{warning}"
+        );
+        assert!(
+            text.contains("its provider may be slow, or a request lost"),
+            "{text}"
+        );
+        assert!(text.contains("nothing cuts it off for that"), "{text}");
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            seen.text().matches("no new turn").count(),
+            1,
+            "once a stall"
+        );
+        // A new turn ends the stall; a later one is said again.
+        turns.store(4, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(5);
+        while seen.text().matches("no new turn").count() < 2 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let later = seen.text();
+        drop(p);
+        assert!(later.contains(", 4 so far:"), "{later}");
+        // Off: never said.
+        let quiet = Seen::default();
+        let p = Progress::with(
+            Box::new(quiet.clone()),
+            Box::new(|_, _| Standing::Running {
+                since: now_ms(),
+                active: Some(now_ms()),
+                idle_secs: 0,
+                tokens: Some(LiveTokens::default()),
+            }),
+            Duration::from_secs(3600),
+        );
+        p.stall_after(None);
+        let t = p.start("a: reviewer", "glm", "pi", None);
+        p.sent(t, "x");
+        thread::sleep(Duration::from_millis(500));
+        drop(p);
+        assert!(!quiet.text().contains("no new turn"), "{}", quiet.text());
     }
 }

@@ -1421,6 +1421,11 @@ impl BridgeCaller {
         repo: &Path,
         before: &[flow::Usage],
     ) {
+        // A call that logs no new turn for this long is warned of: the
+        // repository's setting, 0 for never.
+        let stall = cfg.sessions.stall_warn_secs;
+        self.progress
+            .stall_after((stall > 0).then(|| std::time::Duration::from_secs(stall)));
         let Ok(plan) = plan::dry_run(cfg, change, &history(paths, repo)) else {
             return;
         };

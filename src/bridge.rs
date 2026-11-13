@@ -1581,6 +1581,11 @@ pub struct LiveTokens {
     /// Its first model call alone: what that turn read from a cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_turn: Option<crate::proto::TurnUsage>,
+    /// The model calls it has made so far: what tells a call waiting on a
+    /// slow provider, which a CPU and file watch never sees, from one at
+    /// work.
+    #[serde(default)]
+    pub turns: u64,
 }
 
 impl LiveTokens {
@@ -1592,6 +1597,7 @@ impl LiveTokens {
             output: u.output_tokens,
             usd: u.usd,
             first_turn: u.first_turn,
+            turns: u.calls,
         }
     }
 
@@ -5876,6 +5882,174 @@ console.log(JSON.stringify(out));
             assert!(review.contains(&format!("drop={value}")), "{review}");
             assert!(!plain.contains("[-e]"), "{plain}");
         }
+    }
+
+    #[test]
+    fn the_pi_extension_logs_how_each_turn_ended_where_it_went_and_what_effort_it_saw() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-ext-turn-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        // Every handler pi would run, in order, as pi keeps them.
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const handlers = {};
+acrbus({ on: (name, f) => { (handlers[name] ??= []).push(f); } });
+const emit = async (name, ev, ctx) => { let out; for (const f of handlers[name] ?? []) out = (await f(ev, ctx)) ?? out; return out; };
+const mode = process.argv[2];
+const chat = { model: "m", messages: [{ role: "user", content: "u" }] };
+const req = () => emit("before_provider_request", { payload: chat }, { model: { api: "openai-completions" } });
+const end = (usage, extra) => emit("message_end", { message: { role: "assistant", usage, ...extra } });
+if (mode === "headers") {
+  const user = await req();
+  console.log(JSON.stringify({ user: user?.user ?? null }));
+  await emit("after_provider_response", { status: 200, headers: {
+    "X-Bifrost-Provider": "fireworks", "x-bifrost-resolved-model": "accounts/f/models/glm-5p3",
+    "fireworks-prompt-tokens": "13644", "x-bifrost-routing-info-key": "the-routing-key",
+    "fireworks-conversation-options": '{"reasoning_effort": "high", "thinking_mode": null}' } });
+  await end({ input: 13644, output: 200, cacheRead: 0, cacheWrite: 0 }, { stopReason: "toolUse" });
+  // A request with no response: pi's 0/0 turn, then its retry.
+  await req();
+  await end({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    { stopReason: "error", errorMessage: "Request timed out\nafter 240s sk-abcdefghijklmnopqrstuvwxyz0123456789" });
+  await req();
+  await emit("after_provider_response", { status: 200, headers: { "x-other": "1" } });
+  await end({ input: 1356, output: 150, cacheRead: 12288, cacheWrite: 0 }, { stopReason: "stop" });
+  await emit("agent_end", {});
+} else if (mode === "silent") {
+  // Responses whose headers never reach the extension.
+  await req();
+  await end({ input: 100, output: 5, cacheRead: 0, cacheWrite: 0 }, { stopReason: "stop" });
+  await req();
+  await end({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, { stopReason: "error" });
+  await emit("agent_end", {});
+} else if (mode === "unsaid") {
+  await req();
+  await emit("after_provider_response", { status: 200, headers: { "content-type": "text/event-stream" } });
+  await end({ input: 100, output: 5, cacheRead: 0, cacheWrite: 0 }, { stopReason: "stop" });
+}
+"#,
+        )
+        .unwrap();
+        let run = |mode: &str, key: bool| -> (String, String) {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .arg(mode)
+                .env_remove("ACRBUS_CACHE_KEY")
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_EFFORT")
+                .env_remove("ACRBUS_RELAY_TOKENS")
+                .env("ACRBUS_TURNS", "1");
+            if key {
+                c.env("ACRBUS_CACHE_KEY", "acr-r1-0a1b2c");
+            }
+            let out = c.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            (String::from_utf8_lossy(&out.stdout).into_owned(), stderr)
+        };
+        let (stdout, said) = run("headers", true);
+        // Timing each request takes nothing from the key's own hook.
+        assert!(stdout.contains(r#""user":"acr-r1-0a1b2c""#), "{stdout}");
+        // The effort the provider applied, read from its header.
+        assert_eq!(
+            said.matches("acrbus effort: the provider applied reasoning_effort high")
+                .count(),
+            1,
+            "{said}"
+        );
+        // Each turn: how it ended, how long it took, and where it went, the
+        // routing key only as a hash.
+        let hash = {
+            use sha2::Digest;
+            let d = sha2::Sha256::digest(b"the-routing-key");
+            d.iter().map(|b| format!("{b:02x}")).collect::<String>()[..8].to_string()
+        };
+        let turn1 = said
+            .lines()
+            .find(|l| l.starts_with("acrbus cache: turn 1:"))
+            .unwrap_or_else(|| panic!("{said}"));
+        assert!(
+            turn1.starts_with(
+                "acrbus cache: turn 1: 0 of 13644 prompt tokens read from the cache (13644 \
+                 fresh, 0 written, 200 out); stop toolUse, "
+            ),
+            "{turn1}"
+        );
+        assert!(
+            turn1.ends_with(&format!(
+                "s, route: provider fireworks, model accounts/f/models/glm-5p3, provider prompt \
+                 13644, key #{hash}"
+            )),
+            "{turn1}"
+        );
+        assert!(
+            !said.contains("the-routing-key"),
+            "the key itself never: {said}"
+        );
+        // A turn with no response says so, with its error on one line and
+        // anything like a token cut out of it.
+        let turn2 = said
+            .lines()
+            .find(|l| l.starts_with("acrbus cache: turn 2:"))
+            .unwrap();
+        assert!(
+            turn2.contains(
+                "stop error, 0.0s, error: Request timed out after 240s …, no response, retried, \
+                 route: no response headers"
+            ) || turn2.contains("error: Request timed out after 240s …, no response, retried"),
+            "{turn2}"
+        );
+        assert!(!said.contains("abcdefghijklmnopqrstuvwxyz"), "{said}");
+        let turn3 = said
+            .lines()
+            .find(|l| l.starts_with("acrbus cache: turn 3:"))
+            .unwrap();
+        assert!(turn3.contains("stop stop, "), "{turn3}");
+        assert!(turn3.ends_with("route: the response named none"), "{turn3}");
+        // The call didn't end on an unanswered turn.
+        assert!(!said.contains("ended on a turn with no response"), "{said}");
+
+        // No response's headers ever arrived: said once, and a call that
+        // ends on an unanswered turn says that too.
+        let (_, silent) = run("silent", false);
+        assert_eq!(
+            silent
+                .matches(
+                    "acrbus effort: no response's headers reached acrbus's extension, so the \
+                     effort the provider applied is unknown"
+                )
+                .count(),
+            1,
+            "{silent}"
+        );
+        assert!(
+            silent.contains("acrbus cache: turn 1: 0 of 100 prompt tokens"),
+            "{silent}"
+        );
+        assert!(silent.contains("route: no response headers"), "{silent}");
+        assert!(
+            silent.contains("acrbus cache: the call ended on a turn with no response"),
+            "{silent}"
+        );
+
+        // Headers came, but none says the effort: said once, plainly.
+        let (_, unsaid) = run("unsaid", false);
+        assert!(
+            unsaid.contains(
+                "acrbus effort: the provider didn't say what effort it applied: no \
+                 fireworks-conversation-options among its 1 response headers"
+            ),
+            "{unsaid}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
