@@ -2357,12 +2357,10 @@ mod tests {
             at_defaults.time_notes()
         );
         // At the default, High, every High blocker can be easy.
-        let high = format!(
-            "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
-             lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}}}]\n\
-             savings: {{fixer: {{binding: small}}}}\n"
-        );
-        let by_default = resolve(&user, parse_repo(&high).unwrap(), &Flags::default()).unwrap();
+        let high = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n\
+                    savings: {fixer: {binding: small}}\n";
+        let by_default = resolve(&user, parse_repo(high).unwrap(), &Flags::default()).unwrap();
         assert!(
             !by_default
                 .time_notes()
