@@ -130,6 +130,8 @@ the config's schema in [schema/acr.schema.json](schema/acr.schema.json).
 
 - [How it works](docs/how-it-works.md): the design, step by step, and why
   each part is there.
+- [FAQ](docs/faq.md): questions and answers on every part, each with
+  where to check it in the code.
 - [Bindings](docs/bindings.md): which model and harness each role uses, and
   what a review reports while it runs.
 - [Bridges](docs/bridges.md): how acrbus runs a harness headless, and what
