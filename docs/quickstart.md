@@ -225,7 +225,7 @@ The gates:
 | --- | --- | --- |
 | scope | before any reviewer runs | approve the tier and lenses, one tier higher, or stop; and who fixes, this session or the Orchestrator |
 | fold | after a round with blockers | for each blocker: fix it (with your note to the fixer, in your own words), defer it to a ticket, not a blocker, or not a defect; which logged findings should block; and what the reviewers missed |
-| fix | when this session fixes | nothing: fold in what `acr ask` lists, write tests that pin it, then `acr resume <id> --fixed`, with `--brief <file>` for the next round |
+| fix | when this session fixes | nothing: fold in what `acr ask` lists, in the files it lists, write tests beside them that pin it, then `acr resume <id> --fixed`, with `--brief <file>` for the next round and `--notes <file>` for what the fix needs elsewhere or left stale. Anything changed outside those files is put back |
 | final | when every lens agrees | approve, or another round; and the same logged and missed questions |
 | escalation | whenever something must go to a person | a values call or split: as ruled, or the other way; a lens that didn't finish: try again or go on without it; otherwise go on or stop |
 

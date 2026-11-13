@@ -16,7 +16,10 @@ one. acrbus is what runs around them.
 Each lens, one dimension of review such as correctness or regression
 safety, gets reviewers of its own, in fresh sessions that see the change
 and that lens only. They don't inherit the reasoning that wrote the code,
-or each other's conclusions.
+or each other's conclusions. A reviewer spends its effort in its lens and
+doesn't go looking outside it, but a real defect it comes on there, above
+all one where another dimension interacts with its own, it still reports,
+saying which lens it belongs to, and the Judge rates it like any other.
 
 What the change says about itself, its description, commit messages and
 comments, reaches them as claims to check, not to take on trust.
@@ -71,7 +74,11 @@ tests.
 
 After a round with blockers, the blockers you choose are fixed. Either the
 session that started the review fixes them, since it holds the change's
-context, or the Orchestrator does, if its binding may write. A cheaper
+context, or the Orchestrator does, if its binding may write. Either way,
+each fix is held to the files its blockers point at and the tests beside
+them: what it changes elsewhere, and any binary no blocker points at, is
+put back before the next round reads it, and what it needs changed
+elsewhere, or a doc it left stale, comes to you as a note. A cheaper
 fixer binding can take the groups of blockers rules call easy: few files,
 not severe, their cause stated, no one's call, and not recurring. Then new
 reviewers attack again, until every lens's latest round has no blocker.
@@ -115,8 +122,10 @@ terminal or write the files acrbus reads; it closes the channels that
 don't need one.
 
 A spend cap, `spend_cap`, pauses a review once what its calls spent reaches
-it: no new call starts, calls at work finish, and you're asked to raise the
-cap, go on without it, or stop. It never cuts off a working call.
+it, each call priced as the report prices it: no new call starts, calls at
+work finish, and you're asked to raise the cap, go on without it, or stop.
+It never cuts off a working call. With nobody in the loop, as in a trial,
+the review ends there.
 
 ## It's sized to the change
 

@@ -36,8 +36,9 @@ acrbus, carries the same bus between machines over Tailscale.
    mutants of the changed code, and the tests again in random order. Nobody
    has to take a model's word that the tests ran.
 5. **Reviewers attack.** Each lens gets its own reviewers, in fresh sessions
-   that see the change and that lens only. What the change says about
-   itself is a claim to check, not a fact.
+   that see the change and that lens only. A real defect one comes on
+   outside its lens, it still reports. What the change says about itself
+   is a claim to check, not a fact.
 6. **The Judge rules.** A separate Judge checks each finding against the
    code and states facts about it: is it real, was it there before, does the
    change make it worse. Fixed rules turn those facts into a ruling.

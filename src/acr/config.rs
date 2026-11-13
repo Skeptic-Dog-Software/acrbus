@@ -903,7 +903,15 @@ impl Policy {
         self.max_rounds = later.max_rounds.or(self.max_rounds);
         self.reattack = later.reattack.or(self.reattack);
         self.answers = later.answers.or(self.answers);
-        self.spend_cap = later.spend_cap.or(self.spend_cap);
+        // Field by field: a later layer's dollar cap doesn't drop an
+        // earlier one's token cap, as `--spend-cap-usd` once did.
+        self.spend_cap = match (self.spend_cap, later.spend_cap) {
+            (Some(earlier), Some(later)) => Some(SpendCap {
+                usd: later.usd.or(earlier.usd),
+                tokens: later.tokens.or(earlier.tokens),
+            }),
+            (earlier, later) => later.or(earlier),
+        };
         self.always_escalate = later.always_escalate.or(self.always_escalate);
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
@@ -1938,6 +1946,28 @@ mod tests {
                 assert!(!lower.contains(word), "{word} in the framework");
             }
         }
+    }
+
+    #[test]
+    fn a_spend_cap_flag_keeps_the_configs_other_limit() {
+        let repo = "version: 1\nspend_cap: {usd: 20, tokens: 5000000}\n\
+                    tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let flags = Flags {
+            spend_cap_usd: Some(5.0),
+            ..Flags::default()
+        };
+        let cfg = resolve(&user(), parse_repo(repo).unwrap(), &flags).unwrap();
+        assert_eq!(
+            cfg.spend_cap,
+            Some(SpendCap {
+                usd: Some(5.0),
+                tokens: Some(5_000_000)
+            }),
+            "the flag sets the dollars, and the token cap stays"
+        );
+        let cfg = resolve(&user(), parse_repo(repo).unwrap(), &Flags::default()).unwrap();
+        assert_eq!(cfg.spend_cap.and_then(|c| c.usd), Some(20.0));
     }
 
     #[test]
