@@ -41,6 +41,44 @@ path = "/usr/local/bin:/usr/bin:/bin"
 A bridge isn't a sandbox: the agent runs as you, with what its own settings
 allow.
 
+## What a bridge runs
+
+`accepts = "review"` runs only an ACR review's calls, and refuses any
+other request: outside a review an agent gets no ACR system prompt, and
+one with write tools would run with all of them. `acrbus setup acr` writes
+it for its bridge. Left out, as for a bridge you write, it's `"any"`: give
+that to a bridge made for other work, such as an agent other sessions ask
+things of.
+
+## Tools and MCP
+
+A pi review call is held to its binding's tools: acrbus's pi extension
+refuses any other, whatever its name, and says so on stderr. A name ending
+in `*` covers every tool it starts.
+
+pi connects none of the host's MCP servers unless the call names them
+(`options.no_mcp_args`, `--no-mcp` for the pi kind). A binding names
+servers with `mcp: [name]`; the bridge's `options.mcp` lists the ones a
+request may name, from pi's own `mcp.json` in the bridge's home, and the
+call then keeps only their tools (`options.mcp_tool`, `mcp__{SERVER}__*`
+for pi). Claude Code's `--strict-mcp-config`, with no `--mcp-config`, gives
+none; a Claude Code bridge that needs servers gives `--mcp-config` in its
+`extra_args`. omp has no flag that turns MCP off, so its servers are what
+its config in the bridge's home names.
+
+A gateway between pi and its provider may add tools to requests itself.
+`ACRBUS_REQUEST_HEADERS`, one `name=value` a line, puts headers on every
+model request a pi call makes; give it the gateway's own switch for not
+adding them, for example:
+
+```toml
+[bridges.pi-acr.env]
+ACRBUS_REQUEST_HEADERS = "x-gateway-tools=none"
+```
+
+Any tool a call's model asks for that its binding doesn't name, refused or
+not, is said in progress, and listed by `acr usage` and the report.
+
 ## What's kept
 
 Nothing a run or a review leaves is deleted as it finishes, so you can see

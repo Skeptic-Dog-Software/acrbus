@@ -251,6 +251,28 @@ Each reviewer gets its own lens's part. The `brief` stage covers any lens
 the builder left out. After a fix, the steelman briefs the next round,
 since by then it holds the change's context.
 
+## 5a2. Intensity, answers and a spend cap
+
+```yaml
+reattack: all          # after each fix: blocked (the default) or all
+answers: person        # answers only from a terminal or Grayboard
+spend_cap: {usd: 20}   # or {tokens: 30000000}, or both
+```
+
+- `reattack`: which lenses attack again after a fix. `blocked`, those
+  that had blockers (and any whose round didn't finish or the fix now
+  triggers); `all`, every lens, after every fix, which costs about a first
+  round each time. Unset, the scope gate asks. `--reattack` sets it for a
+  run.
+- `answers: person`: refuses `acr resume --answers` and its decision
+  flags, taking answers only from a terminal or a Grayboard reply from your
+  human handle, and needs run flags that weaken the review confirmed at a
+  terminal. Every review records where each gate's answers came from, and
+  what its flags weakened.
+- `spend_cap`: once the review's calls have spent it, no new call starts,
+  and you're asked to raise it, go on without it, or stop.
+  `--spend-cap-usd` sets one for a run.
+
 ## 5b. What acrbus does, so the config needn't
 
 - **Where commands run.** acrbus runs `tests.setup`, `tests.command`

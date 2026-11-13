@@ -23,6 +23,10 @@ is told a request never overrides its user's instructions.
 | `ACRBUS_AGENT` | The agent a session or command acts as, instead of one named after the repository. |
 | `ACRBUS_CLIENT` | Marks a session as a worker for a client, for `/pipe`. |
 
+A bridge made for ACR reviews, as `acrbus setup acr` writes one, runs
+only review calls (`accepts = "review"`): a session on the bus can't use it
+to run commands as you. See [Bridges](bridges.md#what-a-bridge-runs).
+
 ## Doors
 
 A door lets an agent that runs in another OS account, such as one that

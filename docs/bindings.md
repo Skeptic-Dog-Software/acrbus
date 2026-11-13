@@ -64,6 +64,10 @@ change, with its tools, whenever that isn't enough to be sure. Each
 Judge's brief starts with the diff's hunks its findings point at; it
 keeps the whole change and every tool its binding gives.
 
+A binding names the host's MCP servers its calls may use with `mcp:
+[name]`, where its bridge allows them; left out, its calls get none. See
+[Bridges](bridges.md#tools-and-mcp).
+
 A repository's review config can set `allowed_models`, patterns
 such as `vendor/*`: every binding its reviews would call must name a model
 one matches, or the config is refused. Set in `defaults`, it holds every
