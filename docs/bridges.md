@@ -50,6 +50,14 @@ it for its bridge. Left out, as for a bridge you write, it's `"any"`: give
 that to a bridge made for other work, such as an agent other sessions ask
 things of.
 
+Only an ACR review's own calls are marked as reviews. A session's bus
+tools, and `acrbus send` and `acrbus call`, can't mark a request as one, nor
+send the options only a review sends (facts, a cache key, allowed tools or
+paths, a relay), so they can't reach a review-only bridge. That narrows
+what a session can do through the bus; it isn't a wall. Any process running
+as you can write to the daemon's socket, and one that speaks its protocol
+can mark a request as a review itself.
+
 ## Tools and MCP
 
 A pi review call is held to its binding's tools: acrbus's pi extension
