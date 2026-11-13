@@ -459,7 +459,11 @@ mod tests {
             "{:#}",
             r.call(serde_json::json!({ "op": "hello" })).unwrap_err()
         );
-        assert!(e.contains("closed") || e.contains("Broken pipe"), "{e}");
+        // Under load the close can reach the client as a reset instead.
+        assert!(
+            e.contains("closed") || e.contains("Broken pipe") || e.contains("reset"),
+            "{e}"
+        );
         // Its own account's processes do.
         let ok = rig(me());
         ok.call(serde_json::json!({ "op": "hello" })).unwrap();
