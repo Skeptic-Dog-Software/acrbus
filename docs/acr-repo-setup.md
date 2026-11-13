@@ -407,7 +407,7 @@ savings:
   blast_radius: true         # off by default
   fixer:                     # off unless set
     binding: small           # a cheaper binding that may write
-    max_severity: Medium     # the default
+    max_severity: High       # the default; never Critical
     max_files: 1             # the default
 ```
 
@@ -468,7 +468,8 @@ savings:
   writing, and the rest) stay on its own binding. With `group_fixes`, each
   group is routed by its blockers' facts. A group is easy only if all of
   these hold for every blocker in it: its severity is at or below
-  `max_severity` (default Medium); the group's blockers cite at most
+  `max_severity` (default High; a Critical blocker always goes to the
+  Orchestrator's binding); the group's blockers cite at most
   `max_files` distinct files (default 1); the Judge stated its cause, with a
   file, a line and a detail; it isn't a person's call (a values call, a
   split, or a pre-existing Critical); it isn't a defect a person reported

@@ -564,7 +564,8 @@ pub struct SavingsPolicy {
 pub struct FixerPolicy {
     /// A binding in `allowed_bindings` that may write.
     pub binding: String,
-    /// The most severe a blocker in an easy group may be. Default Medium.
+    /// The most severe a blocker in an easy group may be: High by default,
+    /// and never Critical, which always goes to the Orchestrator's binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<Severity>,
     /// The most files an easy group's blockers may cite. Default 1.
@@ -635,7 +636,7 @@ impl SavingsConfig {
                 .fixer
                 .map(|f| FixerConfig {
                     binding: f.binding,
-                    max_severity: f.max_severity.unwrap_or(Severity::Medium),
+                    max_severity: f.max_severity.unwrap_or(Severity::High),
                     max_files: f.max_files.unwrap_or(1),
                 })
                 .or(d.fixer),
@@ -1742,6 +1743,12 @@ impl Config {
         let Some(f) = self.savings.fixer.as_ref() else {
             return Ok(None);
         };
+        if f.max_severity == Severity::Critical {
+            bail!(
+                "savings.fixer: max_severity can't be Critical: a Critical blocker always goes to \
+                 the Orchestrator's binding"
+            );
+        }
         let name = &f.binding;
         let binding = self.allowed_bindings.get(name).with_context(|| {
             format!("savings.fixer: binding {name} isn't in your allowed_bindings")
@@ -2336,7 +2343,7 @@ mod tests {
             format!(
                 "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
                  lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}{extra}}}]\n\
-                 savings: {{fixer: {{binding: small}}}}\n"
+                 savings: {{fixer: {{binding: small, max_severity: Medium}}}}\n"
             )
         };
         let at_defaults =
@@ -2348,6 +2355,19 @@ mod tests {
                 .any(|n| n.contains("savings.fixer routes no fix to small")),
             "{:?}",
             at_defaults.time_notes()
+        );
+        // At the default, High, every High blocker can be easy.
+        let high = format!(
+            "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
+             lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}}}]\n\
+             savings: {{fixer: {{binding: small}}}}\n"
+        );
+        let by_default = resolve(&user, parse_repo(&high).unwrap(), &Flags::default()).unwrap();
+        assert!(
+            !by_default
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("routes no fix"))
         );
         let medium_blocks = resolve(
             &user,

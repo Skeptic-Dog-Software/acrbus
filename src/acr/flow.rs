@@ -6224,7 +6224,7 @@ fn fix_route(run: &Run, fixer: &super::config::FixerConfig, group: &FixGroup) ->
     let mut files = BTreeSet::new();
     let mut worst: Option<Severity> = None;
     for (lens, f) in &group.findings {
-        if f.severity < fixer.max_severity {
+        if f.severity < fixer.max_severity || f.severity == Severity::Critical {
             hard.push(format!("a {:?} blocker", f.severity));
         }
         worst = Some(worst.map_or(f.severity, |w| w.min(f.severity)));
@@ -9854,7 +9854,7 @@ lenses:
 
         // An easy group whose fix failed isn't easy: its restart goes to
         // the Orchestrator's binding.
-        let cfg = with_fixer(Severity::Critical);
+        let cfg = with_fixer(Severity::High);
         let (fixed, fixes) = (Mutex::new(false), Mutex::new(0));
         let fake = Fake::new(routed_blockers(&fixed, &fixes, true));
         let (run, _) = go(&cfg, &["a.src"], &fake);
@@ -9894,7 +9894,14 @@ lenses:
         };
         let cfg = resolved("{binding: large}").unwrap();
         let f = cfg.savings.fixer.clone().unwrap();
-        assert_eq!((f.max_severity, f.max_files), (Severity::Medium, 1));
+        assert_eq!((f.max_severity, f.max_files), (Severity::High, 1));
+        assert!(
+            format!(
+                "{:#}",
+                resolved("{binding: large, max_severity: Critical}").unwrap_err()
+            )
+            .contains("can't be Critical")
+        );
         assert!(cfg.chosen_bindings().iter().any(|(n, _)| *n == "large"));
         let cfg = resolved("{binding: large, max_severity: High, max_files: 2}").unwrap();
         let f = cfg.savings.fixer.unwrap();

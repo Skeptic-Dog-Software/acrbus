@@ -217,7 +217,7 @@
           "description": "A cheaper binding for the fix groups the rules call easy: every blocker in the group at or below max_severity, the group citing at most max_files files, each with its cause stated (file, line and detail), none a person's call or a defect a person reported missed, and none like one fixed in an earlier round. Every other group, and an easy group's restart after its fix failed, goes to the Orchestrator's binding, as do its other calls. Left out, the Orchestrator's binding fixes every group.",
           "properties": {
             "binding": {"type": "string", "description": "A binding in allowed_bindings that may write."},
-            "max_severity": {"enum": ["Critical", "High", "Medium", "Low"], "description": "The most severe a blocker in an easy group may be. Default Medium."},
+            "max_severity": {"enum": ["High", "Medium", "Low"], "description": "The most severe a blocker in an easy group may be. Default High. Never Critical: a Critical blocker always goes to the Orchestrator's binding."},
             "max_files": {"type": "integer", "minimum": 1, "description": "The most files an easy group's blockers may cite. Default 1."}
           }
         }
