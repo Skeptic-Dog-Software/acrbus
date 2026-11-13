@@ -111,12 +111,13 @@ Code: src/acr/flow.rs::drive; src/acr/config.rs::Config | Config: lenses, tiers,
 ### Can a designed workflow hand its review step to acrbus?
 
 Yes. A step runs `acrbus acr run` and reads its exit code: 0 when every lens
-agrees, 3 when the review waits for an answer, 4 when it escalates. The step
+agrees, 3 when the review waits for an answer, 4 when it escalates, 5 when an
+outage paused it, to go on with `acr resume`. The step
 can read the questions with `acr ask`, answer with `acr resume --answers`,
 and read the report as JSON. With `--human-gate exception`, only
 escalations stop it.
 
-Code: src/acr/mod.rs::WAITING; src/acr/mod.rs::ESCALATED; src/acr/config.rs::HumanGate; src/acr/report.rs::Report | CLI: acrbus acr run --human-gate, acrbus acr ask --text, acrbus acr resume --answers, acrbus acr usage --json, acrbus acr plan --json | Tests: the_report_can_be_read_by_a_machine, always_escalate_reaches_a_person_whatever_the_gate
+Code: src/acr/mod.rs::WAITING; src/acr/mod.rs::ESCALATED; src/acr/mod.rs::OUTAGE; src/acr/config.rs::HumanGate; src/acr/report.rs::Report | CLI: acrbus acr run --human-gate, acrbus acr ask --text, acrbus acr resume --answers, acrbus acr usage --json, acrbus acr plan --json | Tests: the_report_can_be_read_by_a_machine, always_escalate_reaches_a_person_whatever_the_gate
 
 ### Isn't a fixed method rigid?
 
@@ -317,14 +318,17 @@ nothing is grouped, and progress says so.
 
 Code: src/acr/flow.rs::same_defects; src/acr/flow.rs::identifiers; src/acr/flow.rs::DEDUPE | Tests: one_defect_two_lenses_found_is_decided_once_and_fixed_once, one_defect_two_lenses_found_at_two_places_is_one_blocker_with_both_places, a_shared_common_word_or_different_names_make_no_candidate, a_pair_the_dedupe_rules_different_stays_two_blockers, findings_go_ungrouped_and_say_so_when_the_grouping_fails
 
-### What if a reviewer answers in the wrong format?
+### What if a reviewer or Judge answers in the wrong format?
 
-A report written in prose is put into the asked-for form by a quick call on
-the Sizer's binding, which adds and drops nothing, and is counted as a
-repair. A report that still can't be read is an error, never an empty
-result. A binding whose answers keep needing repair is named in progress.
+Every reviewer's and Judge's prompt ends with a one-line reminder of its
+answer's form, after everything its calls share. An answer in prose, or in
+JSON of another shape, is put into the asked-for form by a quick call on the
+Sizer's binding, told why it couldn't be read, which adds and drops nothing,
+and is counted as a repair. One that still can't be read is an error, never
+an empty result, and its unit is restarted once, fresh. A binding whose
+answers keep needing repair is named in progress.
 
-Code: src/acr/flow.rs::findings_of; src/acr/roles.rs::reformat_prompt; src/acr/flow.rs::REPAIR_WARN_SHARE | Tests: a_reviewer_that_reports_in_prose_is_put_in_form_not_failed, an_unreadable_answer_is_an_error_not_an_empty_result, a_binding_whose_answers_keep_needing_repair_is_said_in_progress
+Code: src/acr/flow.rs::findings_of; src/acr/flow.rs::ratings_repaired; src/acr/flow.rs::repaired; src/acr/roles.rs::reformat_prompt; src/acr/roles.rs::Shape; src/acr/roles.rs::FINDINGS_REMINDER; src/acr/roles.rs::RATINGS_REMINDER; src/acr/flow.rs::REPAIR_WARN_SHARE | Tests: a_reviewer_that_reports_in_prose_is_put_in_form_not_failed, a_judges_answer_is_put_in_form_and_one_that_cant_be_is_restarted, an_unreadable_answer_is_an_error_not_an_empty_result, a_binding_whose_answers_keep_needing_repair_is_said_in_progress
 
 ### When does `acr run` end?
 
@@ -670,11 +674,12 @@ Code: src/acr/plan.rs::Plan; src/acr/plan.rs::estimate; src/acr/config.rs::PerCa
 
 `acr usage <run id>` sums a review's calls by round and role: fresh,
 cached and output tokens, dollars and times, with dedupe, repairs,
-keep-alives and relay sessions apart. Progress says each call's tokens so
+restarts, keep-alives and relay sessions apart, and, with `savings.fixer`,
+fixes by binding. Progress says each call's tokens so
 far and the run's total against its plan. On a subscription, with no
 prices, it counts tokens and no dollars.
 
-Code: src/acr/report.rs::Report; src/acr/report.rs::session_lines; src/acr/progress.rs::Progress | CLI: acrbus acr usage, acrbus acr usage --json | Tests: calls_are_summed_by_round_and_role_with_dedupe_and_keep_alive_apart, says_each_calls_tokens_so_far_and_the_runs_against_the_plan_and_warns_once, on_a_subscription_it_counts_tokens_and_no_dollars, a_call_without_a_price_leaves_the_total_unknown
+Code: src/acr/report.rs::Report; src/acr/report.rs::session_lines; src/acr/report.rs::restarts; src/acr/report.rs::fix_routes; src/acr/progress.rs::Progress | CLI: acrbus acr usage, acrbus acr usage --json | Tests: calls_are_summed_by_round_and_role_with_dedupe_and_keep_alive_apart, says_each_calls_tokens_so_far_and_the_runs_against_the_plan_and_warns_once, on_a_subscription_it_counts_tokens_and_no_dollars, a_call_without_a_price_leaves_the_total_unknown
 
 ### What is the change map, or shared facts?
 
@@ -721,12 +726,16 @@ Code: src/acr/learned.rs::Learned; src/acr/learned.rs::MIN_OPENS; src/acr/facts.
 
 A role's first call goes alone until its turn shows it read its prompt, or
 for `warm_secs` (60 by default), so the rest of its fan-out start on a
-cached prefix. A keep-alive is a minimal call that refreshes a prefix still
+cached prefix. Then the rest start `stagger_secs` apart (3 by default; 0 for
+all at once): a burst of new sessions can be spread over a provider's
+replicas, of which only one holds the prefix. Progress says when they're
+staggered, and `acr usage` gives each call's first turn's cached share. A
+keep-alive is a minimal call that refreshes a prefix still
 in use every `keep_alive_secs` (240 by default), sent only when the bridge
 has a slot to spare, never while the last one is still going, and counted
 apart.
 
-Code: src/acr/flow.rs::CacheWarm; src/acr/flow.rs::keep_alive; src/acr/roles.rs::KEEP_ALIVE; src/acr/config.rs::FactsConfig | Config: facts.warm_secs, facts.keep_alive_secs | Tests: a_fan_outs_first_call_warms_the_cache_before_the_rest_and_all_share_the_facts, a_keep_alive_refreshes_a_live_prefix_and_is_counted_apart, a_slow_keep_alive_is_never_followed_at_once_by_another_nor_overlapped
+Code: src/acr/flow.rs::CacheWarm; src/acr/flow.rs::keep_alive; src/acr/roles.rs::KEEP_ALIVE; src/acr/config.rs::FactsConfig; src/acr/report.rs::first_turns | Config: facts.warm_secs, facts.stagger_secs, facts.keep_alive_secs | Tests: a_fan_outs_first_call_warms_the_cache_before_the_rest_and_all_share_the_facts, a_fan_outs_other_calls_start_a_stagger_apart_once_the_first_has_warmed_the_cache, a_keep_alive_refreshes_a_live_prefix_and_is_counted_apart, a_slow_keep_alive_is_never_followed_at_once_by_another_nor_overlapped
 
 ### What is the cache key, and how does it reach the provider?
 
@@ -838,6 +847,22 @@ judge-check --per-finding` sets the two against a key before you switch.
 
 Code: src/acr/config.rs::JudgeMode; src/acr/roles.rs::judge_finding_parts | Config: facts.judges | CLI: acrbus acr judge-check --per-finding | Tests: per_finding_judges_rate_each_claim_alone
 
+### What does `savings.fixer` do?
+
+It sends the fix groups the rules call easy to a cheaper binding that may
+write, while every other group, and the Orchestrator's other calls, its
+briefs, steelman and tests, stay on the Orchestrator's binding. A group is
+easy only if every blocker in it is at or below `max_severity` (Medium by
+default), the group cites at most `max_files` files (1 by default), the
+Judge stated each cause with a file, line and detail, none is a person's
+call or a defect a person reported missed, and none is like one an earlier
+round's fix fixed. An easy group whose fix fails is restarted on the
+Orchestrator's binding. Progress says each group's route and why, and `acr
+usage` gives each binding's groups, calls, dollars and how many of their
+blockers held the next round. It's off unless set.
+
+Code: src/acr/flow.rs::fix_route; src/acr/flow.rs::fix_call; src/acr/flow.rs::FixRoute; src/acr/config.rs::FixerPolicy; src/acr/config.rs::FixerConfig; src/acr/report.rs::fix_routes | Config: savings.fixer, savings.fixer.binding, savings.fixer.max_severity, savings.fixer.max_files | CLI: acrbus acr plan, acrbus acr validate, acrbus acr doctor, acrbus acr usage | Tests: a_fix_group_is_easy_only_if_every_rule_holds, savings_fixer_sends_easy_groups_to_its_binding_and_hard_ones_to_the_orchestrators, savings_fixer_names_a_binding_that_may_write_and_defaults_its_rules
+
 ### Does any saving take a tool or a file away from a reviewer?
 
 No. Every role keeps its tools and what it may read, and whatever a saving
@@ -890,7 +915,8 @@ Code: src/acr/roles.rs::handoff_of; src/acr/report.rs::Sessions | Config: sessio
 ### Who fixes the blockers?
 
 By default, a fresh agent on the Orchestrator's binding, when that binding
-has `writes: true`. If it can't write, the session that ran the review
+has `writes: true`, or, for a group the rules call easy, on `savings.fixer`'s
+binding if it's set. If it can't write, the session that ran the review
 fixes them, since it holds the change's context, and resumes with `acr
 resume --fixed`. When the Orchestrator can write, the scope gate asks you
 which.
@@ -948,22 +974,23 @@ Code: src/acr/roles.rs::FIX_TESTS; src/acr/roles.rs::fix_prompt | Tests: a_fixer
 
 ### What if a fix fails?
 
-It escalates to you, with three choices: the Orchestrator tries again, the
+It's restarted once, fresh, on the Orchestrator's binding, even if it was an
+easy group's on `savings.fixer`'s. If that fails too, it escalates to you,
+with both reasons and three choices: the Orchestrator tries again, the
 session that ran the review fixes and resumes with `--fixed`, or the review
-stops. A fix that leaves the
-checkout as it found it did no work and fails, unless it declines each of
-its blockers with a reason.
+stops. A fix that leaves the checkout as it found it did no work and fails,
+unless it declines each of its blockers with a reason.
 
-Code: src/acr/flow.rs::fix_call; src/acr/flow.rs::About; src/acr/carousel.rs::AGAIN | Tests: a_fix_group_that_changes_nothing_did_no_work_unless_it_declines_each_blocker, a_fixer_is_told_what_its_handoff_holds_and_how_to_decline
+Code: src/acr/flow.rs::fix_call; src/acr/flow.rs::fix_once; src/acr/flow.rs::Restarter; src/acr/flow.rs::About; src/acr/carousel.rs::AGAIN | Tests: a_fix_group_that_changes_nothing_did_no_work_unless_it_declines_each_blocker, a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, savings_fixer_sends_easy_groups_to_its_binding_and_hard_ones_to_the_orchestrators, a_fixer_is_told_what_its_handoff_holds_and_how_to_decline
 
 ## When things fail
 
 ### Can a failed step pass as clean?
 
-No. A failed reviewer or Judge leaves its lens open, never a clean pass, and
-an answer that can't be read is an error, never an empty result. A lens with
-nothing for its Judge says so. Failures are recorded, and an unfinished lens
-is put to you.
+No. A unit that comes back unusable is restarted once, fresh, and one that
+fails again leaves its lens open, never a clean pass; an answer that can't
+be read is an error, never an empty result. A lens with nothing for its
+Judge says so. Failures are recorded, and an unfinished lens is put to you.
 
 Code: src/acr/flow.rs::LensResult; src/acr/flow.rs::escalate_about; src/acr/flow.rs::About | Tests: a_failed_reviewer_is_never_a_clean_pass, a_failed_judge_leaves_the_lens_open, one_failed_reviewer_of_several_leaves_the_lens_open, each_lens_judge_starts_as_its_own_reviewers_answer_and_one_with_nothing_says_so
 
@@ -971,8 +998,8 @@ Code: src/acr/flow.rs::LensResult; src/acr/flow.rs::escalate_about; src/acr/flow
 
 A step is judged by what it must do, never by what it found: a reviewer
 that read the change and found nothing did its work. A step observed doing
-none fails, to be tried again or escalated, and progress says "did no work"
-and why:
+none fails, to be restarted once, fresh, and then escalated, and progress
+says "did no work" and why:
 
 - a fix, or one session of it, that leaves the checkout unchanged, unless
   it declines each blocker with a reason;
@@ -1002,7 +1029,8 @@ No. A call asks its bridge for as long as the bridge allows:
 `max_timeout_secs`, or else `timeout_secs`, 600 unless set; the Claude Code,
 omp and pi kinds set 14400, 4 hours, as a cap no review should reach. A
 binding's `timeout`, if set, is also a cap, not a budget. A call that runs
-out of time is a failure, and nothing tries it elsewhere.
+out of time is a failure: its unit is restarted once, fresh, on the same
+binding, and nothing tries it elsewhere.
 
 Code: src/bridge.rs::default_timeout; src/bridges/claude.toml; src/bridges/pi.toml; src/acr/config.rs::Binding | Config: timeout_secs, max_timeout_secs, timeout | Tests: a_call_asks_its_bridge_for_as_long_as_it_allows_not_its_default, a_call_out_of_time_is_a_failure_and_nothing_tries_it_elsewhere, a_config_with_time_budgets_still_loads_and_says_what_they_do
 
@@ -1021,19 +1049,43 @@ A model request from a pi call that gets no response, no headers or, once
 its stream has begun, no event, for `ACRBUS_NO_RESPONSE_SECS` (300 by
 default) is aborted as timed out, and pi retries it. After
 `ACRBUS_NO_RESPONSE_TRIES` (3) in a row the call ends with exit code 75,
-which its bridge fails, so the review retries or escalates it. Bytes with no
-event don't count as a response, and a request that's answering is never
-cut off.
+which its bridge fails. The review restarts its unit once, fresh, with a new
+cache key, so it may land on another replica, or pauses the round if it's
+an outage. Bytes with no event don't count as a response, and a request
+that's answering is never cut off.
 
-Code: src/bridges/acrbus-pi.js::guard; src/bridges/acrbus-pi.js::NO_RESPONSE_EXIT; src/bridges/pi.toml | Config: ACRBUS_NO_RESPONSE_SECS, ACRBUS_NO_RESPONSE_TRIES | Tests: the_pi_extension_ends_a_request_with_no_response_and_retries_it
+Code: src/bridges/acrbus-pi.js::guard; src/bridges/acrbus-pi.js::NO_RESPONSE_EXIT; src/bridges/pi.toml; src/acr/mod.rs::NO_RESPONSE_EXIT; src/acr/flow.rs::Failure; src/acr/mod.rs::rekey | Config: ACRBUS_NO_RESPONSE_SECS, ACRBUS_NO_RESPONSE_TRIES | Tests: the_pi_extension_ends_a_request_with_no_response_and_retries_it, a_call_that_lost_its_requests_is_restarted_fresh_with_a_new_cache_key
+
+### What is a fresh restart?
+
+A unit of work that comes back unusable is run once more in a fresh
+session, on the same binding, with the same inputs and none of the failed
+session's context: a reviewer, a prober in a fresh copy without the probes
+the failed one wrote, a mutant proposer, a scout or one of its checks, a
+Judge, a first pass, or a fix. It's restarted when its answer can't be read
+even put in form, its run failed or lost its requests, or it did no work;
+not for a refusal, a cancel or a config error, which a fresh session would
+only repeat. Progress says `restarted fresh: <unit>, attempt 2, because
+<why>`, and the other lenses don't wait. One restart, then a failure
+naming both reasons, put to you. Restarts are marked in usage with why, and
+said apart from repairs at each round's end and in `acr usage`.
+
+Code: src/acr/flow.rs::Restarter; src/acr/flow.rs::restartable; src/acr/flow.rs::restarted_label; src/acr/flow.rs::restarted_copy; src/acr/flow.rs::CallFailed; src/acr/flow.rs::Failure; src/acr/flow.rs::Usage; src/acr/report.rs::Restarts | CLI: acrbus acr usage | Tests: a_reviewer_whose_answer_cant_be_read_even_put_in_form_is_asked_again_fresh, a_call_that_lost_its_requests_is_restarted_fresh_with_a_new_cache_key, a_restarted_prober_gets_a_fresh_copy_without_the_first_ones_probes, a_suspicion_whose_check_cant_be_read_is_checked_again_fresh, a_first_pass_that_rates_nothing_settles_nothing
 
 ### What happens during a network outage?
 
-There's no outage mode. Each call fails on its own, as above, and a lens
-whose reviewers failed is put to you as unfinished: try it again next round,
-go on without it, which is recorded as waived, or stop.
+The round pauses. When calls that couldn't reach their model, by lost
+requests or a connection refused, reset or unresolved, are at least two and
+at least half of those in flight, with none answered in between, the round
+starts no more calls and restarts none. A unit that couldn't reach its model
+first waits up to 60 seconds to tell an outage from its own failure. What
+the round's units finished is kept in the review's folder as each finishes,
+the review is saved, and `acr run` or `acr resume` says "gateway
+unreachable: saved, continue with acrbus acr resume <id>" and exits 5. `acr
+resume` goes on with the same round, running only what didn't finish, and
+doesn't run its tests gate again.
 
-Code: src/acr/flow.rs::About; src/acr/carousel.rs::AGAIN; src/acr/carousel.rs::WITHOUT | Tests: one_failed_reviewer_of_several_leaves_the_lens_open, a_failed_reviewer_is_never_a_clean_pass
+Code: src/acr/flow.rs::OutageWatch; src/acr/flow.rs::Watched; src/acr/flow.rs::Outage; src/acr/flow.rs::Units; src/acr/flow.rs::UnitDone; src/acr/flow.rs::Paused; src/acr/mod.rs::paused; src/acr/mod.rs::OUTAGE; src/acr/mod.rs::OUTAGE_WAIT_SECS; src/acr/mod.rs::unreachable_said | CLI: acrbus acr resume | Tests: an_outage_pauses_the_round_and_resuming_runs_only_what_didnt_finish, calls_that_cant_reach_their_model_together_are_an_outage_and_one_alone_isnt, a_call_that_couldnt_reach_its_model_is_told_by_what_its_agent_said
 
 ### What happens when the Sizer or Orchestrator fails?
 
