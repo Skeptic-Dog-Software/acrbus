@@ -822,6 +822,15 @@ pub fn ask(run: &Run, cfg: &Config, app: &str) -> Ask {
         ),
         _ => format!("Review {id} isn't waiting for anyone."),
     };
+    // Every gate says it, so whoever answers knows what they answer for.
+    let summary = if run.weakened.is_empty() {
+        summary
+    } else {
+        format!(
+            "{summary} This review runs weaker than its config: {}.",
+            run.weakened.join("; ")
+        )
+    };
     Ask {
         run: id.clone(),
         gate: run.waiting.map(Gate::as_str),

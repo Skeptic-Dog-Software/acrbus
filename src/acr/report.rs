@@ -66,6 +66,12 @@ pub struct Report<'a> {
     pub unnamed_tools: Vec<UnnamedTools>,
     /// Which lenses attacked again after a fix, and whose choice it was.
     pub reattack: String,
+    /// What the run's flags made weaker than its config.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub weakened: &'a [String],
+    /// Where each gate's answers came from.
+    #[serde(skip_serializing_if = "<[super::flow::AnswerSource]>::is_empty")]
+    pub answered_by: &'a [super::flow::AnswerSource],
     /// The blockers a person deferred to a ticket, each with a draft to
     /// file. Nothing is filed for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -938,6 +944,8 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         sessions: sessions(&run.usage),
         unnamed_tools: unnamed_tools(&run.usage),
         reattack: run.reattack_line(),
+        weakened: &run.weakened,
+        answered_by: &run.answered_by,
         tickets: tickets(run),
         flags: &run.flags,
     }

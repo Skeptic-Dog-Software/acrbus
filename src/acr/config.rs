@@ -75,6 +75,22 @@ pub enum HumanGate {
 }
 
 impl HumanGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HumanGate::InTheLoop => "in-the-loop",
+            HumanGate::PerRound => "per-round",
+            HumanGate::Ends => "ends",
+            HumanGate::Exception => "exception",
+        }
+    }
+
+    /// Where a person is asked that `other` doesn't ask them.
+    fn asks_more_than(self, other: HumanGate) -> bool {
+        (self.asks_scope() && !other.asks_scope())
+            || (self.asks_fold() && !other.asks_fold())
+            || (self.asks_final() && !other.asks_final())
+    }
+
     /// They approve the scope before any reviewer runs.
     pub fn asks_scope(self) -> bool {
         matches!(self, HumanGate::InTheLoop | HumanGate::Ends)
@@ -1044,6 +1060,50 @@ impl Reattack {
             Reattack::All => "all",
         }
     }
+}
+
+/// What a run's flags make weaker than `config`, the repository's config
+/// without them, each said: a gate that asks a person less, fewer rounds,
+/// another binding for a role, fewer lenses attacking after a fix, or less
+/// of the change in scope.
+pub fn weakened(config: &Config, run: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if config.human_gate.asks_more_than(run.human_gate) {
+        out.push(format!(
+            "--human-gate {}, where its config asks at more points ({})",
+            run.human_gate.as_str(),
+            config.human_gate.as_str()
+        ));
+    }
+    if run.max_rounds < config.max_rounds {
+        out.push(format!(
+            "--max-rounds {}, under its config's {}",
+            run.max_rounds, config.max_rounds
+        ));
+    }
+    for (role, name) in &run.bindings {
+        if config.bindings.get(role) != Some(name) {
+            out.push(format!(
+                "--binding {}={name}, in place of its config's {}",
+                role.as_str(),
+                config.bindings.get(role).map_or("default", String::as_str)
+            ));
+        }
+    }
+    if config.reattack == Some(Reattack::All) && run.reattack == Some(Reattack::Blocked) {
+        out.push(format!(
+            "--reattack {}, where its config re-attacks with every lens",
+            Reattack::Blocked.as_str()
+        ));
+    }
+    if config.review_scope == ReviewScope::WholePr && run.review_scope == ReviewScope::BottomOfStack
+    {
+        out.push(
+            "--review-scope bottom-of-stack, where its config reviews the whole pull request"
+                .into(),
+        );
+    }
+    out
 }
 
 /// Who may answer a review's questions.
@@ -2238,6 +2298,40 @@ mod tests {
         let read: FactsConfig = serde_json::from_str(old).unwrap();
         assert_eq!(read, FactsConfig::default());
         assert!(read.learned && read.learned_bytes == 24 * 1024);
+    }
+
+    #[test]
+    fn what_a_runs_flags_make_weaker_than_its_config_is_said() {
+        let user = parse_user(USER).unwrap();
+        let repo = "version: 1\nhuman_gate: in-the-loop\nmax_rounds: 3\nreattack: all\n\
+                    tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let own = resolve(&user, parse_repo(repo).unwrap(), &Flags::default()).unwrap();
+        assert!(weakened(&own, &own).is_empty(), "no flags, nothing weaker");
+        let flags = Flags {
+            human_gate: Some(HumanGate::Exception),
+            max_rounds: Some(1),
+            reattack: Some(Reattack::Blocked),
+            bindings: BTreeMap::from([(Role::Judge, "small".to_string())]),
+            ..Flags::default()
+        };
+        let run = resolve(&user, parse_repo(repo).unwrap(), &flags).unwrap();
+        let said = weakened(&own, &run).join("; ");
+        for part in [
+            "--human-gate exception, where its config asks at more points (in-the-loop)",
+            "--max-rounds 1, under its config's 3",
+            "--reattack blocked, where its config re-attacks with every lens",
+            "--binding judge=small",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        // A gate that asks more, or more rounds, isn't weaker.
+        let more = Flags {
+            max_rounds: Some(5),
+            ..Flags::default()
+        };
+        let stronger = resolve(&user, parse_repo(repo).unwrap(), &more).unwrap();
+        assert!(weakened(&own, &stronger).is_empty());
     }
 
     #[test]

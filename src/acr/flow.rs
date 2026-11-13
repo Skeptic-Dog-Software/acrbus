@@ -587,6 +587,13 @@ pub struct Run {
     /// person at the scope gate chose. None: nobody chose, so `blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reattack: Option<Reattack>,
+    /// What the run's flags made weaker than the repository's config, each
+    /// said at its start, at every gate and in the report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weakened: Vec<String>,
+    /// Where each gate's answers came from, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered_by: Vec<AnswerSource>,
     /// Defects a person reported the reviewers missed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<Reported>,
@@ -928,6 +935,28 @@ pub struct Steelman {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub briefs: BTreeMap<String, String>,
     pub declined: Vec<roles::Declined>,
+}
+
+/// Where a gate's answers came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerSource {
+    pub round: u32,
+    pub gate: String,
+    /// A terminal's prompt, a Grayboard reply and its sender, or
+    /// `acr resume` and its flags.
+    pub by: String,
+}
+
+impl Run {
+    /// Records that the gate it waits at was answered, and by what.
+    pub fn answered(&mut self, by: impl Into<String>) {
+        let gate = self.waiting.map_or("none", Gate::as_str).to_string();
+        self.answered_by.push(AnswerSource {
+            round: self.round,
+            gate,
+            by: by.into(),
+        });
+    }
 }
 
 /// A fixing session's briefs for the round after its fix, by lens.
@@ -2351,6 +2380,8 @@ pub fn start(
         steelmans: Vec::new(),
         fix_briefs: None,
         reattack: s.cfg.reattack,
+        weakened: Vec::new(),
+        answered_by: Vec::new(),
         fix: None,
         sweep: false,
         reported: Vec::new(),

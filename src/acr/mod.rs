@@ -622,6 +622,68 @@ fn outside_config(paths: &Paths, repo: &Path) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.yaml", change::name(repo)?)))
 }
 
+/// What `acr run`'s flags make weaker than the repository's config, each
+/// said. Under `answers: person`, in that config or the one the run uses,
+/// a person at a terminal confirms them, or the run is refused: an agent
+/// that runs the review can't weaken it on its own say.
+fn weakened_by_flags(
+    paths: &Paths,
+    target: &Target,
+    cfg: &Config,
+    unaccepted: bool,
+) -> Result<Vec<String>> {
+    let user = config::load_user(&user_config_path(paths))?;
+    let unflagged = |file: Option<&Path>| -> Option<Config> {
+        let (text, _) = repo_layer(paths, &target.repo, Some(&target.base), file).ok()?;
+        config::resolve(&user, config::parse_repo(&text).ok()?, &Flags::default()).ok()
+    };
+    let own = unflagged(None);
+    let given = match &target.config {
+        Some(file) => unflagged(Some(file)),
+        None => own.clone(),
+    };
+    let mut out = given
+        .as_ref()
+        .map(|g| config::weakened(g, cfg))
+        .unwrap_or_default();
+    if let (Some(file), Some(_)) = (&target.config, &own)
+        && outside_config(paths, &target.repo).ok().as_deref() != Some(file.as_path())
+    {
+        out.push(format!(
+            "--config {}, in place of the repository's own config",
+            file.display()
+        ));
+    }
+    if unaccepted {
+        out.push("--uncalibrated: nobody has accepted the config it uses".into());
+    }
+    let person = cfg.answers == config::Answers::Person
+        || own
+            .as_ref()
+            .is_some_and(|c| c.answers == config::Answers::Person);
+    if person && !out.is_empty() {
+        let said = out.join("; ");
+        if !at_terminal() {
+            bail!(
+                "this repository's config takes a person's word only (answers: person), and \
+                 this run's flags make the review weaker than its config: {said}. Run it at a \
+                 terminal to confirm them, or leave them out"
+            );
+        }
+        eprint!(
+            "{APP_NAME}: this run's flags make the review weaker than its config: {said}.\n\
+             Type yes to confirm them: "
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("yes") {
+            bail!("not confirmed, so the review didn't start");
+        }
+        out.push("confirmed by a person at the terminal".into());
+    }
+    Ok(out)
+}
+
 /// The config for a review of a change into `base`.
 fn load_config(paths: &Paths, t: &Target, flags: &Flags) -> Result<(Config, Source)> {
     let user = config::load_user(&user_config_path(paths))?;
@@ -2165,6 +2227,8 @@ fn attend(
                     }
                 }
             }
+            // Recorded at the gate it answers; taken back if they're refused.
+            run.answered("a person at the terminal");
             match carousel::apply(run, cfg, &answers, crate::util::now_ms()) {
                 Ok(applied) => {
                     keep_feedback(paths, run, &applied.feedback);
@@ -2173,6 +2237,7 @@ fn attend(
                     }
                 }
                 Err(e) => {
+                    run.answered_by.pop();
                     eprintln!("{APP_NAME}: {e:#}");
                     continue;
                 }
@@ -2501,6 +2566,18 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
         eprintln!("{APP_NAME}: {}", r.line());
     }
     eprintln!("{APP_NAME}: {}", run.reattack_line());
+    if !run.weakened.is_empty() {
+        eprintln!(
+            "{APP_NAME}: it ran weaker than its config: {}",
+            run.weakened.join("; ")
+        );
+    }
+    for a in &run.answered_by {
+        eprintln!(
+            "{APP_NAME}: round {}'s {} gate was answered by {}",
+            a.round, a.gate, a.by
+        );
+    }
     for u in &summary.unnamed_tools {
         eprintln!("{APP_NAME}: {}", u.line());
     }
@@ -3141,9 +3218,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             )?;
             let name = change::name(&target.repo)?;
             let now = fingerprint(&cfg, &text, &list)?;
-            if let Some(note) = calibrated(paths, &name, &now, uncalibrated)? {
+            let unaccepted = calibrated(paths, &name, &now, uncalibrated)?;
+            if let Some(note) = &unaccepted {
                 eprintln!("{note}");
             }
+            let weakened = weakened_by_flags(paths, &target, &cfg, unaccepted.is_some())?;
             check_machine(paths, &cfg, &target.repo, false)?;
             // The commit under review resolves before anything is made.
             let commit = change::reviewed_commit(
@@ -3185,6 +3264,13 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             caller.budget(paths, &cfg, &change, repo, &[]);
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             run.starter = starter;
+            if !weakened.is_empty() {
+                caller.note(&format!(
+                    "this review runs weaker than its config: {}",
+                    weakened.join("; ")
+                ));
+            }
+            run.weakened = weakened;
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
@@ -3382,6 +3468,38 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             // calibration, before anything is called.
             let mut stop = stop;
             let answered = answers.is_some();
+            // Where they came from: a Grayboard reply's sender, or the flag.
+            let from = answers
+                .as_deref()
+                .and_then(|a| a.strip_prefix('@'))
+                .and_then(|file| grayboard::answered_from(paths, Path::new(file)));
+            let deciding = !fold.is_empty() || !waive.is_empty() || !defer.is_empty() || approve;
+            if cfg.answers == config::Answers::Person && !stop {
+                if answered && from.is_none() {
+                    bail!(
+                        "{run_id}'s config takes answers from a person only (answers: person), \
+                         so --answers is refused: answer at a terminal with `{APP_NAME} acr \
+                         resume {run_id}`, or on Grayboard"
+                    );
+                }
+                if deciding {
+                    bail!(
+                        "{run_id}'s config takes answers from a person only (answers: person), \
+                         so --fold, --waive, --defer and --approve are refused: answer at a \
+                         terminal with `{APP_NAME} acr resume {run_id}`, or on Grayboard"
+                    );
+                }
+            }
+            if answered || deciding {
+                let by = match (&from, answered) {
+                    (Some(sender), _) => format!("a Grayboard reply from {sender}"),
+                    (None, true) => "acr resume --answers".to_string(),
+                    (None, false) => {
+                        "acr resume's --fold, --waive, --defer or --approve".to_string()
+                    }
+                };
+                run.answered(by);
+            }
             if let Some(answers) = answers {
                 let applied = carousel::apply(
                     &mut run,
@@ -5332,6 +5450,57 @@ mod tests {
         );
         // Its mark, which stopping skips removing, is gone too.
         assert!(!run_dir(&paths, "r-stubborn").join("pid").exists());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+    }
+
+    #[test]
+    fn under_answers_person_resume_refuses_answers_and_decisions_from_anywhere_but_a_person() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\nanswers: person\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.answers, config::Answers::Person);
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-person", "repo": repo, "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "scope",
+            "status": "waiting", "waiting": "scope", "lenses": {},
+            "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        save(&paths, &run, &cfg).unwrap();
+        let resume = |answers: Option<String>, approve: bool| AcrCmd::Resume {
+            run_id: "r-person".into(),
+            answers,
+            fixed: false,
+            brief: None,
+            fold: Vec::new(),
+            waive: Vec::new(),
+            defer: Vec::new(),
+            approve,
+            stop: false,
+            post_pr: None,
+        };
+        let e = super::run(&paths, resume(Some("{}".into()), false), None).unwrap_err();
+        assert!(format!("{e:#}").contains("--answers is refused"), "{e:#}");
+        let e = super::run(&paths, resume(None, true), None).unwrap_err();
+        assert!(format!("{e:#}").contains("--approve are refused"), "{e:#}");
+        // Nothing was taken: it still waits at its scope gate.
+        let kept: Run = serde_json::from_slice(
+            &fs::read(run_dir(&paths, "r-person").join("run.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.waiting, Some(flow::Gate::Scope));
+        assert!(kept.answered_by.is_empty());
         let _ = fs::remove_dir_all(paths.config.parent().unwrap());
     }
 
