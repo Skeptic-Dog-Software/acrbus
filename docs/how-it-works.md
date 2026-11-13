@@ -7,7 +7,7 @@ fixes them in the structure of the review, not in a prompt.
 
 acrbus doesn't review anything itself. Every reviewer, Judge, Sizer and
 Orchestrator is a model running headless in a harness, such as Claude Code,
-pi or omp, or called through a model's API. A [binding](bindings.md) says
+pi or omp. A [binding](bindings.md) says
 which harness and model each role uses, and each role can use a different
 one. acrbus is what runs around them.
 
@@ -52,7 +52,8 @@ refuses a repository until you have.
 
 The proposal is a starting point, not a baseline. After each review you
 say how it did, finding by finding, and what it missed. Recalibrating folds
-that back into the config, so the next review gets it right. A repository
+that back into the config, aiming the next review at what this one got
+wrong. A repository
 with little history to go on gets a config from its code, and leans more on
 your feedback.
 
@@ -226,13 +227,14 @@ only what didn't.
 
 ## Reviewers stay in their lane
 
-Reviewers work in the code under review, and nothing they do is written
-back to the repository; with no sandbox, that's what their tools and
-prompt keep to, not a wall. A pi call is held to the tools its binding
-names: any other, one a gateway added to the request or one the model made
-up, is refused, and any call's model reaching for a tool its binding
-doesn't name is said, and listed in the report. The host's MCP servers
-reach a pi call only if its binding names them. A fix keeps to the source, and
+Reviewers are told to read the code under review, not your other files,
+and nothing they do is copied back to the repository. That's guidance and
+structure, not a sandbox: an agent with a shell runs as you. A pi call is
+held to the tools its binding names: any other, one a gateway added to the
+request or one the model made up, is refused, and any call's model reaching
+for a tool its binding doesn't name is said, and listed in the report. The
+host's MCP servers reach a pi call only if its binding names them. A fix
+keeps to the source, and
 every file it changes is listed: a binary, or a file none of its blockers
 points at, is put to you, to keep or revert.
 
