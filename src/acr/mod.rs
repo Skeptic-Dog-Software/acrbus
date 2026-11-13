@@ -4317,20 +4317,7 @@ fn pipeline_run(
         }
         reload(&cfg, repo, base, head.filter(|_| !fixed))
     };
-    loop {
-        for e in &mut run.escalations {
-            e.seen = true;
-        }
-        flow::drive(&mut run, &s, &caller, &reloading)?;
-        match run.waiting {
-            None => break,
-            Some(flow::Gate::Escalation) => {}
-            Some(gate) => bail!(
-                "run {} is waiting at {gate:?}, which nobody here answers",
-                run.id
-            ),
-        }
-    }
+    flow::drive_unattended(&mut run, &s, &caller, &reloading)?;
     for e in &mut run.escalations {
         e.seen = true;
     }

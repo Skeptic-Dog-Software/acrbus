@@ -8199,6 +8199,51 @@ pub fn drive(
     }
 }
 
+/// Carries a review on with nobody in the loop, as a trial does: each
+/// escalation is taken as seen and the review goes on. Except its spend
+/// cap, which nobody here can raise: driving again would only reach it
+/// again, so the review ends there, stopped, with the cap's escalation as
+/// its note.
+pub fn drive_unattended(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    reload: &dyn Fn(bool) -> Result<Change>,
+) -> Result<()> {
+    loop {
+        for e in &mut run.escalations {
+            e.seen = true;
+        }
+        drive(run, s, caller, reload)?;
+        match run.waiting {
+            None => return Ok(()),
+            Some(Gate::Escalation) => {
+                if run
+                    .escalations
+                    .iter()
+                    .any(|e| !e.seen && e.about == Some(About::SpendCap))
+                {
+                    caller.note(&format!(
+                        "review {}: its spend cap is reached, and nobody here raises it, so it \
+                         ends there, with what its calls finished",
+                        run.id
+                    ));
+                    run.status = Status::Stopped;
+                    run.waiting = None;
+                    for e in &mut run.escalations {
+                        e.seen = true;
+                    }
+                    return Ok(());
+                }
+            }
+            Some(gate) => bail!(
+                "run {} is waiting at {gate:?}, which nobody here answers",
+                run.id
+            ),
+        }
+    }
+}
+
 /// Everything that didn't finish its work in a run so far, lens by lens and
 /// round by round: what `stop_on_failure` stops at.
 pub fn failures(run: &Run) -> Vec<String> {
@@ -15587,6 +15632,37 @@ lenses:
                 .any(|c| c.0 == Role::Judge && c.3.contains("[G0]")),
             "the gate's Judge started past the cap"
         );
+    }
+
+    #[test]
+    fn with_nobody_in_the_loop_a_review_at_its_spend_cap_ends_there_rather_than_loops() {
+        let mut cfg = plain("exception", 3, 1);
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let mut fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached before any call: one reviewer that came in under it would
+        // let the review end confirmed, as a race.
+        fake.capped_after = Some(0);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive_unattended(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!((run.status, run.waiting), (Status::Stopped, None));
+        let caps = run
+            .escalations
+            .iter()
+            .filter(|e| e.about == Some(About::SpendCap))
+            .count();
+        assert_eq!(caps, 1, "reached once, not again and again");
+        assert!(run.escalations.iter().all(|e| e.seen));
+        assert!(said(&fake).contains("nobody here raises it"));
     }
 
     #[test]
