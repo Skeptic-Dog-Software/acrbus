@@ -17,7 +17,7 @@ use crate::proto::RunUsage;
 
 use super::change::{self, Change};
 use super::config::{
-    Action, Binding, Config, GateMode, JudgeMode, Lens, ReviewerInput, Role, Severity,
+    Action, Binding, Config, GateMode, JudgeMode, Lens, Reattack, ReviewerInput, Role, Severity,
     Stage as Kind,
 };
 use super::plan::{self, Why, tokens_in};
@@ -583,6 +583,10 @@ pub struct Run {
     /// outside a review to convergence, where a steelman's carry them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_briefs: Option<FixBriefs>,
+    /// Which lenses attack again after a fix, as the config, a flag or a
+    /// person at the scope gate chose. None: nobody chose, so `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
     /// Defects a person reported the reviewers missed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<Reported>,
@@ -870,6 +874,24 @@ pub(super) fn first_pass_escalates(
 }
 
 impl Run {
+    /// Which lenses attack again after a fix: as chosen, or `blocked`.
+    pub fn reattacks(&self) -> Reattack {
+        self.reattack.unwrap_or(Reattack::Blocked)
+    }
+
+    /// What the report says of it: the choice, and whose it was.
+    pub fn reattack_line(&self) -> String {
+        match self.reattack {
+            Some(Reattack::All) => "re-attack: every lens after each fix".into(),
+            Some(Reattack::Blocked) => {
+                "re-attack: only the lenses with blockers after each fix".into()
+            }
+            None => "re-attack: only the lenses with blockers after each fix, the default: \
+                     nobody chose"
+                .into(),
+        }
+    }
+
     /// Whether a fix has gone in. From then on the review is of the
     /// checkout's working tree, where the fixes are.
     pub fn fixed(&self) -> bool {
@@ -2328,6 +2350,7 @@ pub fn start(
         converge: s.converge,
         steelmans: Vec::new(),
         fix_briefs: None,
+        reattack: s.cfg.reattack,
         fix: None,
         sweep: false,
         reported: Vec::new(),
@@ -6029,8 +6052,11 @@ fn fix(
             } else if saving {
                 note_fix(run, s, caller, before_fix.as_deref());
             }
+            reattack(run, caller);
             run.round += 1;
-            blast_radius(run, s, caller);
+            if run.reattacks() == Reattack::Blocked {
+                blast_radius(run, s, caller);
+            }
             run.stage = Stage::Review;
         }
         Err(e) => {
@@ -6660,6 +6686,28 @@ fn fix_list(findings: &[(String, Finding)], reported: &[Reported]) -> String {
 
 /// Every lens attacks again: what a person asks for, or what a defect
 /// nobody's lens found needs, since any lens could own it.
+/// After a fix, with `reattack: all`, every lens attacks the new version,
+/// not only those that had blockers: a fix for one lens can break another.
+/// Said, so a round's size isn't a surprise.
+fn reattack(run: &mut Run, caller: &dyn Caller) {
+    if run.reattacks() != Reattack::All {
+        return;
+    }
+    let confirmed = run
+        .lenses
+        .values()
+        .filter(|l| l.outcome == Outcome::Confirmed)
+        .count();
+    reopen_all(run);
+    if confirmed > 0 {
+        caller.say(&format!(
+            "round {}'s fix: every lens attacks the new version, as reattack: all asks, {} \
+             that had passed included",
+            run.round, confirmed
+        ));
+    }
+}
+
 pub(super) fn reopen_all(run: &mut Run) {
     for lens in run.lenses.values_mut() {
         if lens.outcome == Outcome::Confirmed {
@@ -6985,8 +7033,11 @@ pub fn fixed_by_session(
             briefs,
         });
     }
+    reattack(run, caller);
     run.round += 1;
-    blast_radius(run, s, caller);
+    if run.reattacks() == Reattack::Blocked {
+        blast_radius(run, s, caller);
+    }
     run.stage = Stage::Review;
     run.status = Status::Running;
     run.waiting = None;
@@ -10304,9 +10355,10 @@ lenses:
         let reload = move |_| Ok(again.clone());
         let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
-        // The scope first, and who fixes, before any reviewer runs.
+        // The scope first, who fixes, and, with nothing chosen, which lenses
+        // attack again after a fix, before any reviewer runs.
         assert_eq!(run.waiting, Some(Gate::Scope));
-        assert_eq!(headers(&run, &cfg), ["Scope", "Fixer"]);
+        assert_eq!(headers(&run, &cfg), ["Scope", "Fixer", "Re-attack"]);
         assert_eq!(fake.count(Role::Reviewer), 0);
         // The default fixer comes first, marked: an Orchestrator that may
         // write is it.
@@ -13991,6 +14043,67 @@ lenses:
             "{}",
             listed[0].line()
         );
+    }
+
+    #[test]
+    fn reattack_all_attacks_every_lens_after_each_fix_and_blocked_only_those_with_blockers() {
+        // alpha blocks once; beta passes from the start.
+        let rounds_of = |cfg: &Config| -> (u32, usize, usize, Vec<String>) {
+            let fake = Fake::new(defect_in("alpha", 1));
+            let (run, _) = go(cfg, &["a.src"], &fake);
+            (
+                run.round,
+                run.lenses["alpha"].rounds.len(),
+                run.lenses["beta"].rounds.len(),
+                fake.told.lock().unwrap().clone(),
+            )
+        };
+        let blocked = config("exception", 3, 1, "", "reattack: blocked");
+        let (_, alpha, beta, _) = rounds_of(&blocked);
+        assert_eq!(
+            (alpha, beta),
+            (2, 1),
+            "beta passed, and isn't attacked again"
+        );
+        let all = config("exception", 3, 1, "", "reattack: all");
+        assert_eq!(all.reattack, Some(Reattack::All));
+        let (_, alpha, beta, told) = rounds_of(&all);
+        assert_eq!(
+            (alpha, beta),
+            (2, 2),
+            "every lens attacks the fixed version"
+        );
+        assert!(
+            told.iter()
+                .any(|t| t.contains("every lens attacks the new version, as reattack: all asks")),
+            "{told:?}"
+        );
+        // Unset, and nobody asked at scope: the default, said as nobody's.
+        let unset = plain("exception", 3, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        let (run, _) = go(&unset, &["a.src"], &fake);
+        assert_eq!(run.reattack, None);
+        assert_eq!(run.reattacks(), Reattack::Blocked);
+        assert!(run.reattack_line().contains("the default: nobody chose"));
+        // Asked at scope when unset, and the answer is kept.
+        let asked = plain("ends", 3, 1);
+        let s = setting(&asked);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert!(headers(&run, &asked).contains(&"Re-attack".to_string()));
+        let a = answered(
+            &run,
+            &asked,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+                ("Re-attack", "Every lens".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &asked, &a, 1).unwrap();
+        assert_eq!(run.reattack, Some(Reattack::All));
+        assert!(!headers(&run, &asked).contains(&"Re-attack".to_string()));
     }
 
     #[test]

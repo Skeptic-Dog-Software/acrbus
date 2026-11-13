@@ -78,6 +78,11 @@ pub struct Target {
     human_gate: Option<HumanGate>,
     #[arg(long)]
     max_rounds: Option<u32>,
+    /// After each fix, attack again with only the lenses that had blockers
+    /// (`blocked`), or with every lens (`all`). Left out, the config says,
+    /// or the review asks at its scope gate.
+    #[arg(long, value_parser = parse_reattack)]
+    reattack: Option<config::Reattack>,
     #[arg(long, value_parser = parse_scope)]
     review_scope: Option<ReviewScope>,
     /// Use a binding for a role, as `role=name`. Can be repeated.
@@ -134,6 +139,10 @@ fn description_of(target: &Target, post_pr: Option<u64>) -> Result<Option<String
 
 fn parse_gate(s: &str) -> Result<HumanGate, String> {
     serde_yaml_ng::from_str(s).map_err(|_| "use per-round, ends or exception".to_string())
+}
+
+fn parse_reattack(s: &str) -> Result<config::Reattack, String> {
+    serde_yaml_ng::from_str(s).map_err(|_| "use blocked or all".to_string())
 }
 
 fn parse_scope(s: &str) -> Result<ReviewScope, String> {
@@ -546,6 +555,7 @@ fn flags(t: &Target) -> Flags {
     Flags {
         human_gate: t.human_gate,
         max_rounds: t.max_rounds,
+        reattack: t.reattack,
         review_scope: t.review_scope,
         bindings: t.bindings.iter().cloned().collect(),
     }
@@ -2490,6 +2500,7 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
     }
+    eprintln!("{APP_NAME}: {}", run.reattack_line());
     for u in &summary.unnamed_tools {
         eprintln!("{APP_NAME}: {}", u.line());
     }
@@ -2979,6 +2990,25 @@ fn describe_plan(plan: &plan::Plan) {
         "  At most, with every lens through every round and a fix between: {}",
         figure(&plan.most)
     );
+    let reattack = match plan.reattack {
+        Some(config::Reattack::All) => "every lens attacks again after each fix (reattack: all)",
+        Some(config::Reattack::Blocked) => {
+            "only the lenses with blockers attack again after a fix (reattack: blocked)"
+        }
+        None => {
+            "which lenses attack again after a fix is asked at the scope gate; left unanswered, \
+             only those with blockers"
+        }
+    };
+    println!("Re-attack: {reattack}.");
+    if let (Some(e), Some(all)) = (&plan.expected, &plan.expected_all) {
+        println!(
+            "  Expected with every lens attacking after each fix: {}, against {} with only \
+             those that had blockers",
+            figure(all),
+            figure(e)
+        );
+    }
     if !plan.unpriced.is_empty() {
         println!(
             "No price for {}: add it under costs.prices, or mark its binding `subscription: true`",
@@ -3502,6 +3532,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 head: None,
                 human_gate: None,
                 max_rounds: None,
+                reattack: None,
                 review_scope: None,
                 bindings: Vec::new(),
                 description: None,
@@ -3780,6 +3811,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4082,6 +4114,7 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4118,6 +4151,7 @@ fn pipeline_arm(
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
         review_scope: None,
         bindings: if converge {
             vec![(Role::Orchestrator, STEELMAN_BINDING.to_string())]
@@ -4379,6 +4413,7 @@ fn calibrate(
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -5493,6 +5528,7 @@ mod tests {
             config,
             human_gate: None,
             max_rounds: None,
+            reattack: None,
             review_scope: None,
             bindings: Vec::new(),
             description: None,

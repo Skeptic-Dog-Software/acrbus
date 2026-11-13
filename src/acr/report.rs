@@ -64,6 +64,8 @@ pub struct Report<'a> {
     /// Calls whose model asked for tools their binding doesn't name.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unnamed_tools: Vec<UnnamedTools>,
+    /// Which lenses attacked again after a fix, and whose choice it was.
+    pub reattack: String,
     /// The blockers a person deferred to a ticket, each with a draft to
     /// file. Nothing is filed for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -935,6 +937,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         repairs: repairs(&run.usage),
         sessions: sessions(&run.usage),
         unnamed_tools: unnamed_tools(&run.usage),
+        reattack: run.reattack_line(),
         tickets: tickets(run),
         flags: &run.flags,
     }

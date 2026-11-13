@@ -288,6 +288,14 @@ pub struct Policy {
     pub human_gate: Option<HumanGate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// Which lenses attack again after a fix. Left out, the review asks at
+    /// its scope gate, or takes `blocked` if nobody is asked there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// Who may answer a review's questions: `person` takes answers only
+    /// from a terminal or Grayboard, never `acr resume --answers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Answers>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_escalate: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -872,6 +880,8 @@ impl Policy {
         self.not_findings = later.not_findings.or(self.not_findings);
         self.human_gate = later.human_gate.or(self.human_gate);
         self.max_rounds = later.max_rounds.or(self.max_rounds);
+        self.reattack = later.reattack.or(self.reattack);
+        self.answers = later.answers.or(self.answers);
         self.always_escalate = later.always_escalate.or(self.always_escalate);
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
@@ -1012,10 +1022,49 @@ pub struct UserConfig {
 }
 
 /// A run's flags, the last layer.
+/// Which lenses attack again after a fix: an intensity a review is asked
+/// for at its start when its config doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reattack {
+    /// The lenses that had blockers, and any whose round didn't finish or
+    /// the fixed change now triggers. A lens that passed isn't attacked
+    /// again, so a fix that breaks what it covers goes unseen until a
+    /// sweep, if the review has one.
+    Blocked,
+    /// Every lens, after every fix: a fix for one lens can break another.
+    /// Each round after a fix costs about as much as the first.
+    All,
+}
+
+impl Reattack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reattack::Blocked => "blocked",
+            Reattack::All => "all",
+        }
+    }
+}
+
+/// Who may answer a review's questions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Answers {
+    /// A terminal, Grayboard, or `acr resume --answers`, such as an agent
+    /// relaying its user's answers: the default.
+    #[default]
+    Anyone,
+    /// A person only: a terminal's prompt, or a Grayboard reply from the
+    /// owner's human handle. `--answers` and run flags that weaken the
+    /// review are refused, unless confirmed at a terminal.
+    Person,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
     pub human_gate: Option<HumanGate>,
     pub max_rounds: Option<u32>,
+    pub reattack: Option<Reattack>,
     pub review_scope: Option<ReviewScope>,
     pub bindings: BTreeMap<Role, String>,
 }
@@ -1028,6 +1077,12 @@ pub struct Config {
     pub not_findings: Option<String>,
     pub human_gate: HumanGate,
     pub max_rounds: u32,
+    /// Which lenses attack again after a fix; None until someone chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// Who may answer the review's questions.
+    #[serde(default)]
+    pub answers: Answers,
     pub always_escalate: Vec<String>,
     pub review_scope: ReviewScope,
     pub integrations: Integrations,
@@ -1156,6 +1211,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
     let flag_layer = Policy {
         human_gate: flags.human_gate,
         max_rounds: flags.max_rounds,
+        reattack: flags.reattack,
         review_scope: flags.review_scope,
         bindings: flags.bindings.clone(),
         ..Policy::default()
@@ -1176,6 +1232,8 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         not_findings: merged.not_findings,
         human_gate: merged.human_gate.expect("set by the framework"),
         max_rounds: merged.max_rounds.expect("set by the framework"),
+        reattack: merged.reattack,
+        answers: merged.answers.unwrap_or_default(),
         always_escalate: merged.always_escalate.unwrap_or_default(),
         review_scope: merged.review_scope.expect("set by the framework"),
         integrations: merged.integrations.unwrap_or_default(),
@@ -2200,6 +2258,8 @@ mod tests {
             not_findings: Some(String::new()),
             human_gate: Some(HumanGate::Ends),
             max_rounds: Some(1),
+            reattack: Some(Reattack::All),
+            answers: Some(Answers::Person),
             always_escalate: Some(Vec::new()),
             review_scope: Some(ReviewScope::WholePr),
             integrations: Some(Integrations::default()),

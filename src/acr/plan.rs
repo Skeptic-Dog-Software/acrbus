@@ -10,7 +10,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::change::{Change, LeftOut};
-use super::config::{Binding, Config, Lens, PerCall, Role, Tier};
+use super::config::{Binding, Config, Lens, PerCall, Reattack, Role, Tier};
 use super::flow::{Run, Status, Usage};
 
 /// Roughly how many bytes make a token.
@@ -195,6 +195,14 @@ pub struct Plan {
     /// `savings.fixer`: where easy fix groups go instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixer: Option<super::config::FixerConfig>,
+    /// Which lenses attack again after a fix, if the config or a flag says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// The expected cost with every lens attacking after each fix, as long
+    /// as the longest lens took before: what `reattack: all` would cost
+    /// here. None with no finished reviews to go by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_all: Option<Estimate>,
     /// With every lens done in one round.
     pub least: Estimate,
     /// With each lens taking the rounds it took before here, on average.
@@ -510,6 +518,15 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
             history.fixes().min(max - 1.0),
         )
     });
+    // Every lens as many rounds as the review's longest lens took.
+    let expected_all = (history.runs > 0).then(|| {
+        let longest = rounds
+            .iter()
+            .map(|(id, _)| history.rounds(id))
+            .fold(1.0_f64, f64::max)
+            .min(max);
+        at(&|_| longest, history.fixes().min(max - 1.0))
+    });
 
     let first_round: Vec<RoleCost> = [sizer, orchestrator]
         .into_iter()
@@ -559,6 +576,8 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         first_round,
         fix,
         fixer: cfg.savings.fixer.clone(),
+        reattack: cfg.reattack,
+        expected_all,
         least,
         expected,
         history_runs: history.runs,
@@ -727,6 +746,23 @@ mod tests {
         let want = setup + round * 2.0 + fix * 1.0;
         assert!((plan.expected.unwrap().usd.unwrap() - want).abs() < 1e-9);
         assert_eq!(plan.history_runs, 2);
+        // With every lens attacking after each fix, every lens takes as many
+        // rounds as the longest of the lenses chosen.
+        let all = plan.expected_all.unwrap().usd.unwrap();
+        assert!(all >= plan.expected.unwrap().usd.unwrap() - 1e-9);
+        let uneven = History {
+            runs: 2,
+            lens_rounds: BTreeMap::from([
+                ("correctness".to_string(), vec![2, 2]),
+                ("docs-accuracy".to_string(), vec![1, 1]),
+            ]),
+            fixes: vec![1, 1],
+        };
+        let p = dry_run(&cfg, &go, &uneven).unwrap();
+        assert!(
+            p.expected_all.unwrap().usd.unwrap() > p.expected.unwrap().usd.unwrap(),
+            "the others take the longest lens's rounds, not their own"
+        );
         // Never past max_rounds, whatever happened before.
         let long = History {
             runs: 1,

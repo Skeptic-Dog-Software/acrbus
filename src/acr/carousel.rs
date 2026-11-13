@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::config::{Action, Config, Severity};
+use super::config::{Action, Config, Reattack, Severity};
 use super::configure::{Feedback, Kept, Verdict};
 use super::flow::{
     About, Finding, FindingState, Fixer, FlagState, Gate, Outcome, Reported, Run, Stage, Status,
@@ -45,6 +45,8 @@ const NOTHING: &str = "Nothing missed";
 const NOT_NOW: &str = "Not now";
 const NONE: &str = "None of them";
 const SESSION: &str = "This session";
+const ONLY_BLOCKED: &str = "Only lenses with blockers";
+const EVERY_LENS: &str = "Every lens";
 const ORCHESTRATOR: &str = "The Orchestrator";
 const KEEP_THEM: &str = "Keep them";
 
@@ -72,6 +74,8 @@ enum Topic {
     Escalation(usize),
     Scope,
     Fixer,
+    /// Which lenses attack again after a fix, when nothing chose it.
+    Reattack,
     Blocker {
         lens: String,
         id: String,
@@ -89,7 +93,9 @@ impl Topic {
     /// should block is: an answer left out would keep them logged, and a
     /// review could end confirmed with a person's choice to block lost.
     fn required(&self) -> bool {
-        !matches!(self, Topic::Missed)
+        // Left unanswered, re-attack keeps its default, and the report says
+        // nobody chose.
+        !matches!(self, Topic::Missed | Topic::Reattack)
     }
 }
 
@@ -211,6 +217,32 @@ fn who(run: &Run) -> &'static str {
     }
 }
 
+/// Which lenses attack again after each fix: an intensity, asked when the
+/// config and the run's flags leave it unsaid.
+fn reattack_question(run: &Run) -> Question {
+    let lenses = run.lenses.len();
+    question(
+        "Re-attack",
+        format!(
+            "After each fix, which of the {lenses} lens(es) attack the new version? Set \
+             `reattack` in the config to stop being asked."
+        ),
+        vec![
+            choice(
+                ONLY_BLOCKED,
+                "The default. A lens that passed isn't attacked again: later rounds cost less, \
+                 and a fix that breaks what a passed lens covers can go unseen",
+            ),
+            choice(
+                EVERY_LENS,
+                "Every lens attacks every fixed version, so a fix that breaks another lens is \
+                 caught; each round after a fix costs about as much as the first",
+            ),
+        ],
+        false,
+    )
+}
+
 /// Who folds in what a review upholds: the default first, and marked, so
 /// the answer most people give is the one at hand.
 fn fixer(run: &Run) -> Question {
@@ -274,6 +306,12 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
                 out.push(Asked {
                     topic: Topic::Fixer,
                     question: fixer(run),
+                });
+            }
+            if run.reattack.is_none() {
+                out.push(Asked {
+                    topic: Topic::Reattack,
+                    question: reattack_question(run),
                 });
             }
         }
@@ -1047,6 +1085,8 @@ pub fn apply(
             }
             Topic::Fixer if chose(pick, SESSION) => run.fixer = Fixer::Session,
             Topic::Fixer if chose(pick, ORCHESTRATOR) => run.fixer = Fixer::Orchestrator,
+            Topic::Reattack if chose(pick, ONLY_BLOCKED) => run.reattack = Some(Reattack::Blocked),
+            Topic::Reattack if chose(pick, EVERY_LENS) => run.reattack = Some(Reattack::All),
             Topic::Blocker { id, .. } => {
                 let waivable =
                     finding(run, id).is_some_and(|(_, f)| f.action == Action::BlocksUnlessWaived);
