@@ -15,12 +15,17 @@
 //!
 //! The order is the cache's. A prompt cache hits on an identical prefix, so
 //! what stays the same comes first and what changes comes last: the pull
-//! request's title, description and issues, then files a fix hasn't touched
-//! since they were first mapped, in path order, then files touched in each
-//! later round, oldest touch first, then the round, the pull request's
-//! review comments, which can grow during a review, and this round's gate.
-//! Nothing that varies between rounds or calls, no round number, count of
-//! calls, time or path of a copy, sits before a fact that doesn't.
+//! request's title, description and issues, then each round's files in the
+//! order they were first mapped, then the round, the pull request's review
+//! comments, which can grow during a review, and this round's gate. A later
+//! round keeps every section an earlier one had, byte for byte, where it
+//! was: a file a fix touched keeps its earlier section, marked superseded
+//! but rendered as it was, and comes again after them all as it is now, as
+//! does a file the change has just begun to touch, and one it no longer
+//! touches says so there. So a round shares all of the last one's files,
+//! whichever a fix touched. Nothing that varies between rounds or calls, no
+//! round number, count of calls, time or path of a copy, sits before a fact
+//! that doesn't.
 //!
 //! With a record of what this repository's reviewers open (see
 //! `learned`), the files they keep opening come too, whole, after the
@@ -79,6 +84,18 @@ pub struct FileFacts {
     pub tests: Vec<String>,
     /// Its part of the diff, as the diff has it.
     pub diff: String,
+    /// A later round's section for the same file holds now: this one stays
+    /// where it was, rendered as it was, so the facts keep their prefix.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub superseded: bool,
+    /// The change no longer touches the file, as of `since`: said in place
+    /// of a section.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gone: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A file the change doesn't touch that this repository's reviewers keep
@@ -121,27 +138,72 @@ impl Facts {
     /// changed: their bytes then stay the same from round to round.
     pub fn build(repo: &Path, change: &Change, round: u32, prior: Option<&Facts>) -> Facts {
         let left_out: BTreeSet<&str> = change.generated.iter().map(|g| g.path.as_str()).collect();
-        let mut files = Vec::new();
+        let parts: Vec<(String, String)> = change::per_file(&change.diff)
+            .into_iter()
+            .filter(|(path, _)| !path.is_empty() && !left_out.contains(path.as_str()))
+            .collect();
         let mut searches = MAX_SEARCHES;
-        for (path, part) in change::per_file(&change.diff) {
-            if path.is_empty() || left_out.contains(path.as_str()) {
-                continue;
+        let Some(prior) = prior else {
+            let mut files: Vec<FileFacts> = parts
+                .iter()
+                .map(|(path, part)| {
+                    let blob = blob_of(repo, path);
+                    map_file(repo, path, part, &blob, round, &mut searches)
+                })
+                .collect();
+            files.sort_by(|a, b| (a.since, &a.path).cmp(&(b.since, &b.path)));
+            return Facts {
+                files,
+                learned: Vec::new(),
+            };
+        };
+        // Every earlier section stays, in place and as it was.
+        let mut files = prior.files.clone();
+        let mut added = Vec::new();
+        for (path, part) in &parts {
+            let blob = blob_of(repo, path);
+            let live = files
+                .iter()
+                .rposition(|f| &f.path == path && !f.superseded && !f.gone);
+            match live {
+                Some(at) if files[at].blob == blob && &files[at].diff == part => {}
+                Some(at) => {
+                    files[at].superseded = true;
+                    added.push(map_file(repo, path, part, &blob, round, &mut searches));
+                }
+                None => added.push(map_file(repo, path, part, &blob, round, &mut searches)),
             }
-            let blob = blob_of(repo, &path);
-            if let Some(old) = prior
-                .and_then(|p| p.files.iter().find(|f| f.path == path))
-                .filter(|f| f.blob == blob && f.diff == part)
-            {
-                files.push(old.clone());
-                continue;
-            }
-            files.push(map_file(repo, &path, &part, &blob, round, &mut searches));
         }
-        files.sort_by(|a, b| (a.since, &a.path).cmp(&(b.since, &b.path)));
+        // A file the change no longer touches says so, after the rest.
+        let touched: BTreeSet<&str> = parts.iter().map(|(p, _)| p.as_str()).collect();
+        for f in files.iter_mut() {
+            if !f.superseded && !f.gone && !touched.contains(f.path.as_str()) {
+                f.superseded = true;
+                added.push(FileFacts {
+                    path: f.path.clone(),
+                    blob: "gone".into(),
+                    since: round,
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                    tests: Vec::new(),
+                    diff: String::new(),
+                    superseded: false,
+                    gone: true,
+                });
+            }
+        }
+        added.sort_by(|a, b| a.path.cmp(&b.path));
+        files.extend(added);
         Facts {
             files,
             learned: Vec::new(),
         }
+    }
+
+    /// Each file's section that holds now: its latest, for a file the
+    /// change still touches.
+    pub fn current(&self) -> impl Iterator<Item = &FileFacts> {
+        self.files.iter().filter(|f| !f.superseded && !f.gone)
     }
 
     /// Adds the files `ranked` names, most opened first, to what `prior`
@@ -159,7 +221,7 @@ impl Facts {
         ranked: &[(String, u32)],
         budget: usize,
     ) -> LearnedAdded {
-        let changed: BTreeSet<&str> = self.files.iter().map(|f| f.path.as_str()).collect();
+        let changed: BTreeSet<&str> = self.current().map(|f| f.path.as_str()).collect();
         let mut learned: Vec<LearnedFile> = Vec::new();
         let mut bytes = 0usize;
         let read = |path: &str| -> Option<String> {
@@ -277,8 +339,10 @@ const HEAD: &str = "# The change's facts\n\n\
     Found in the code by tools, with nothing any model wrote: each changed file's diff, the \
     definitions its changed lines sit in, where those names appear, and the tests that name \
     them. Names are matched by text, so a reference may be a namesake. A file's references are \
-    as of the round it was first mapped; files a fix touched come after the rest, with their \
-    own. The change and its claims are also in the attached file.\n";
+    as of the round it was mapped. A file a fix touched keeps its earlier section where it was, \
+    and comes again after the rest as it is now: the later section is the one that holds. A \
+    file the change no longer touches says so, after the rest. The change and its claims are \
+    also in the attached file.\n";
 
 /// A pull request's words, as `gh` gave them: what it says, the issues it
 /// links, and its review comments, the last apart since they can grow.
@@ -468,6 +532,13 @@ fn render_learned(l: &LearnedFile) -> String {
 
 fn render_file(f: &FileFacts) -> String {
     let mut out = format!("\n## {}\n\n", f.path);
+    if f.gone {
+        out.push_str(&format!(
+            "No longer part of the change, as of round {}.\n",
+            f.since
+        ));
+        return out;
+    }
     if f.blob == DELETED {
         out.push_str("Deleted by the change.\n");
     }
@@ -527,6 +598,8 @@ fn map_file(
         references: Vec::new(),
         tests: Vec::new(),
         diff: part.to_string(),
+        superseded: false,
+        gone: false,
     };
     if blob == DELETED {
         return facts;
@@ -784,10 +857,11 @@ pub fn keep(dir: &Path, round: u32, facts: &Facts, text: &str) -> Result<std::pa
     Ok(path)
 }
 
-/// Facts' files by path, for a test or a report.
+/// Facts' files by path, each at its section that holds now, for a test or
+/// a report.
 #[cfg(test)]
 pub fn by_path(facts: &Facts) -> std::collections::BTreeMap<&str, &FileFacts> {
-    facts.files.iter().map(|f| (f.path.as_str(), f)).collect()
+    facts.current().map(|f| (f.path.as_str(), f)).collect()
 }
 
 #[cfg(test)]
@@ -890,6 +964,8 @@ mod tests {
             references: Vec::new(),
             tests: Vec::new(),
             diff: "+x\n".into(),
+            superseded: false,
+            gone: false,
         }
     }
 
@@ -1029,6 +1105,8 @@ mod tests {
                 references: Vec::new(),
                 tests: Vec::new(),
                 diff: "+retry\n".into(),
+                superseded: false,
+                gone: false,
             }],
             learned: Vec::new(),
         };
@@ -1072,6 +1150,83 @@ mod tests {
         long.body = "x".repeat(MAX_PR_TEXT + 10);
         let cut_text = facts.render_with(1, None, Some(&long));
         assert!(cut_text.contains(&format!("(cut here: {} bytes in all)", MAX_PR_TEXT + 10)));
+    }
+
+    #[test]
+    fn a_fix_to_the_first_file_keeps_every_earlier_section_and_adds_its_new_one_last() {
+        let repo = repo_with(&[
+            ("a.go", "package p\n\nfunc A() int {\n\treturn 0\n}\n"),
+            ("b.go", "package p\n\nfunc B() int {\n\treturn 0\n}\n"),
+            ("c.go", "package p\n\nfunc C() int {\n\treturn 0\n}\n"),
+        ]);
+        branch(&repo, "work");
+        commit(
+            &repo,
+            &[
+                ("a.go", "package p\n\nfunc A() int {\n\treturn 1\n}\n"),
+                ("b.go", "package p\n\nfunc B() int {\n\treturn 1\n}\n"),
+                ("c.go", "package p\n\nfunc C() int {\n\treturn 1\n}\n"),
+            ],
+            "the change",
+        );
+        let one = Facts::build(&repo, &change_of(&repo, "main"), 1, None);
+        let text1 = one.render(1, None);
+        // A fix touches a.go, the first file in round 1's facts.
+        commit(
+            &repo,
+            &[("a.go", "package p\n\nfunc A() int {\n\treturn 2\n}\n")],
+            "a fix",
+        );
+        let two = Facts::build(&repo, &change_of(&repo, "main"), 2, Some(&one));
+        let text2 = two.render(2, None);
+        // Round 2 shares all of round 1's file sections: everything before
+        // round 1's own round line.
+        let end_of_files = text1.find("\n# This round").unwrap();
+        assert!(
+            facts_shared(&text1, &text2) >= end_of_files,
+            "round 2 shares {} bytes of round 1's {end_of_files} before its round line",
+            facts_shared(&text1, &text2)
+        );
+        // a.go's earlier section stays where it was, and its new one comes
+        // after every file round 1 had, as the facts' head says.
+        let paths: Vec<&str> = two.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.go", "b.go", "c.go", "a.go"]);
+        assert!(two.files[0].superseded && !two.files[3].superseded);
+        assert_eq!(two.files[3].since, 2);
+        assert!(
+            text2.contains("comes again after the rest as it is now"),
+            "{text2}"
+        );
+        // What reads a file's facts reads its latest.
+        let now: Vec<&str> = two.current().map(|f| f.path.as_str()).collect();
+        assert_eq!(now, ["b.go", "c.go", "a.go"]);
+        assert!(two.current().all(|f| !f.superseded));
+        // Round 3, with no further fix, shares all of round 2's.
+        let three = Facts::build(&repo, &change_of(&repo, "main"), 3, Some(&two));
+        let text3 = three.render(3, None);
+        assert!(facts_shared(&text2, &text3) >= text2.find("\n# This round").unwrap());
+        assert_eq!(three.files, two.files, "nothing new: the same sections");
+        // A file the change no longer touches says so, last.
+        commit(
+            &repo,
+            &[("c.go", "package p\n\nfunc C() int {\n\treturn 0\n}\n")],
+            "c undone",
+        );
+        let four = Facts::build(&repo, &change_of(&repo, "main"), 4, Some(&three));
+        let text4 = four.render(4, None);
+        assert!(facts_shared(&text3, &text4) >= text3.find("\n# This round").unwrap());
+        assert!(
+            text4.contains("\n## c.go\n\nNo longer part of the change, as of round 4.\n"),
+            "{text4}"
+        );
+        let now: Vec<&str> = four.current().map(|f| f.path.as_str()).collect();
+        assert_eq!(now, ["b.go", "a.go"]);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// How many bytes two renders share, as the cache would serve them.
+    fn facts_shared(a: &str, b: &str) -> usize {
+        shared_prefix(a, b)
     }
 
     #[test]
@@ -1136,15 +1291,20 @@ mod tests {
         let fixed = change_of(&repo, "main");
         let two = Facts::build(&repo, &fixed, 2, Some(&one));
         let paths: Vec<&str> = two.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, ["src/lib.go", "z.go"], "untouched first");
+        assert_eq!(
+            paths,
+            ["src/lib.go", "z.go", "z.go"],
+            "every earlier section, then z.go again as it is now"
+        );
         assert_eq!(two.files[0], one.files[0], "reused as it was");
-        assert_eq!((two.files[0].since, two.files[1].since), (1, 2));
+        assert!(two.files[1].superseded);
+        assert_eq!((two.files[0].since, two.files[2].since), (1, 2));
         let text2 = two.render(2, None);
         let shared = shared_prefix(&text, &text2);
-        let z_at = text.find("\n## z.go").unwrap();
+        let files_end = text.find("\n# This round").unwrap();
         assert!(
-            shared >= z_at,
-            "round 2 shares round 1's prefix up to the first touched file"
+            shared >= files_end,
+            "round 2 shares all of round 1's file sections"
         );
         let mut sinces: Vec<u32> = two.files.iter().map(|f| f.since).collect();
         let sorted = {

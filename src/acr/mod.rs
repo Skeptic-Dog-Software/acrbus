@@ -665,11 +665,18 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
 /// tools are matched, every tool their calls are given, holding it to its
 /// own.
 fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
+    let b = call.binding;
+    // A fix's sessions, one per group, all open the same way: its cache's
+    // key keeps them on the replica that holds that opening. Nothing else
+    // of the round's: the facts are of the change before the fix.
+    if call.role == Role::Orchestrator && call.writes {
+        options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
+        return;
+    }
     if !matches!(call.role, Role::Reviewer | Role::Judge) || call.writes {
         return;
     }
     options.facts = Some(shared.facts.display().to_string());
-    let b = call.binding;
     options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
     if call.no_tools {
         return;
@@ -1421,6 +1428,11 @@ impl BridgeCaller {
         repo: &Path,
         before: &[flow::Usage],
     ) {
+        // A call that logs no new turn for this long is warned of: the
+        // repository's setting, 0 for never.
+        let stall = cfg.sessions.stall_warn_secs;
+        self.progress
+            .stall_after((stall > 0).then(|| std::time::Duration::from_secs(stall)));
         let Ok(plan) = plan::dry_run(cfg, change, &history(paths, repo)) else {
             return;
         };
@@ -1583,6 +1595,14 @@ impl Caller for BridgeCaller {
 
     fn delta(&self, repo: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
         change::tree_diff(repo, from, to).ok()
+    }
+
+    fn changed(&self, repo: &Path, from: &str, to: &str) -> Option<Vec<change::Changed>> {
+        change::tree_changes(repo, from, to).ok()
+    }
+
+    fn revert(&self, repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+        change::revert(repo, from, path, existed)
     }
 
     fn note(&self, what: &str) {
@@ -2272,6 +2292,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for p in &run.prefixes {
         eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
+    }
+    for f in &run.flags {
+        eprintln!("{APP_NAME}: {}", report::flag_line(f));
     }
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if let Some(pr) = pr {
@@ -5693,6 +5716,14 @@ mod tests {
                 "{role:?}"
             );
         }
+        // A fix gets the key alone, so its groups' sessions share their
+        // opening: not the facts, which a fix outdates, nor other tools.
+        let fixing = given(&call(Role::Orchestrator, &reviewer, true, false));
+        assert_eq!(fixing.cache_key.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            (fixing.facts, fixing.allowed_tools, fixing.tools),
+            (None, None, reviewer.tools.clone())
+        );
         assert!(tools_note(&["read".into()]).contains("The tools you may use: read."));
         assert!(tools_note(&[]).contains("The tools you may use: none."));
     }

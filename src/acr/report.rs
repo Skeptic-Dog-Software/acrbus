@@ -8,8 +8,8 @@ use serde::Serialize;
 use super::config::{CommentFormat, Config, Role, Severity};
 use super::facts::Prefix;
 use super::flow::{
-    Disagreement, Escalation, FactsRound, Finding, FindingState, Gate, LensResult, Outcome, Run,
-    Status, Usage,
+    Disagreement, Escalation, FactsRound, Finding, FindingState, Flag, FlagState, Gate, LensResult,
+    Outcome, Run, Status, Usage,
 };
 
 #[derive(Debug, Serialize)]
@@ -65,6 +65,30 @@ pub struct Report<'a> {
     /// file. Nothing is filed for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tickets: Vec<Ticket>,
+    /// The files fixes changed that were flagged for a person: binaries,
+    /// and files no blocker pointed at, each with what reverts it and what
+    /// they chose.
+    #[serde(skip_serializing_if = "<[Flag]>::is_empty")]
+    pub flags: &'a [Flag],
+}
+
+/// A flagged file, as said at a review's end.
+pub fn flag_line(f: &Flag) -> String {
+    let state = match f.state {
+        FlagState::Open => format!(
+            "not answered yet, so it stays as the fix left it; to revert it: {}",
+            f.command
+        ),
+        FlagState::Kept => "kept, as you chose".to_string(),
+        FlagState::Reverting => format!("to be reverted, as you chose: {}", f.command),
+        FlagState::Reverted => "reverted, as you chose".to_string(),
+    };
+    format!(
+        "flagged: round {}'s fix changed {} ({}): {state}",
+        f.round,
+        f.path,
+        f.why()
+    )
 }
 
 /// One role's calls broken into sessions, in a run: those that relayed and
@@ -80,6 +104,8 @@ pub struct Sessions {
     /// Reviewers that scouted, and the suspicions they had checked.
     pub scouts: usize,
     pub verifies: usize,
+    /// The groups a fix was split into, one session each before any relay.
+    pub groups: usize,
     /// Every one of those sessions' tokens, and dollars where priced.
     pub tokens: u64,
     pub usd: Option<f64>,
@@ -89,9 +115,14 @@ impl Sessions {
     pub fn line(&self) -> String {
         let role = format!("{:?}", self.role).to_lowercase();
         let usd = self.usd.map_or_else(String::new, |d| format!(", ${d:.2}"));
+        let groups = if self.groups > 0 {
+            format!("; {} fix group(s)", self.groups)
+        } else {
+            String::new()
+        };
         format!(
             "sessions: {role}: {} call(s) relayed, {} session(s) in all; {} scout(s), {} \
-             suspicion(s) checked; {} tokens{usd}",
+             suspicion(s) checked{groups}; {} tokens{usd}",
             self.relayed, self.legs, self.scouts, self.verifies, self.tokens
         )
     }
@@ -124,6 +155,13 @@ pub fn sessions(usage: &[Usage]) -> Vec<Sessions> {
                     .filter(|u| {
                         let p = part(u);
                         p.starts_with("verify") && (!p.contains(", leg ") || first_leg(&p))
+                    })
+                    .count(),
+                groups: calls
+                    .iter()
+                    .filter(|u| {
+                        let p = part(u);
+                        p.starts_with("group ") && (!p.contains(", leg ") || first_leg(&p))
                     })
                     .count(),
                 tokens: calls.iter().map(|u| u.tokens()).sum(),
@@ -545,6 +583,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         repairs: repairs(&run.usage),
         sessions: sessions(&run.usage),
         tickets: tickets(run),
+        flags: &run.flags,
     }
 }
 
@@ -688,6 +727,20 @@ pub fn comment(run: &Run, cfg: &Config) -> Option<String> {
             "\n**Disagreement on {}:** {}\n",
             d.finding,
             d.sides.join(" / ")
+        ));
+    }
+    // Without the command, which names a path on the reviewing machine.
+    for f in &run.flags {
+        let state = match f.state {
+            FlagState::Open => "not answered",
+            FlagState::Kept => "kept",
+            FlagState::Reverting | FlagState::Reverted => "reverted",
+        };
+        out.push_str(&format!(
+            "\n**Flagged:** round {}'s fix changed `{}` ({}): {state}\n",
+            f.round,
+            f.path,
+            f.why()
         ));
     }
     Some(out)

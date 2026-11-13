@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::config::{Action, Config, Severity};
 use super::configure::{Feedback, Kept, Verdict};
 use super::flow::{
-    About, Finding, FindingState, Fixer, Gate, Outcome, Reported, Run, Stage, Status,
+    About, Finding, FindingState, Fixer, FlagState, Gate, Outcome, Reported, Run, Stage, Status,
 };
 
 /// The most questions one carousel holds.
@@ -46,6 +46,7 @@ const NOT_NOW: &str = "Not now";
 const NONE: &str = "None of them";
 const SESSION: &str = "This session";
 const ORCHESTRATOR: &str = "The Orchestrator";
+const KEEP_THEM: &str = "Keep them";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Question {
@@ -76,6 +77,9 @@ enum Topic {
         id: String,
     },
     ShouldBlock(Vec<(String, String)>),
+    /// Files a fix changed that are flagged, by their place in the run's
+    /// list: each kept or reverted.
+    Flags(Vec<usize>),
     Missed,
     Final,
 }
@@ -256,6 +260,7 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
             question: escalation(run, &e.reason, e.about.as_ref()),
         });
     }
+    out.extend(flagged(run));
     match run.stage {
         Stage::Scope => {
             out.push(Asked {
@@ -307,6 +312,76 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
         _ => {}
     }
     unique(&mut out);
+    out
+}
+
+/// The files fixes changed that are flagged and not yet answered, a few to
+/// a question, by the round whose fix changed them: the person chooses any
+/// to revert, and the rest stay as the fix left them.
+fn flagged(run: &Run) -> Vec<Asked> {
+    let open: Vec<usize> = (0..run.flags.len())
+        .filter(|&i| run.flags[i].state == FlagState::Open)
+        .collect();
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    for &i in &open {
+        match chunks.last_mut() {
+            Some(c) if c.len() < PER_QUESTION && run.flags[c[0]].round == run.flags[i].round => {
+                c.push(i)
+            }
+            _ => chunks.push(vec![i]),
+        }
+    }
+    let mut out = Vec::new();
+    let mut first = 1;
+    for (n, chunk) in chunks.iter().enumerate() {
+        let round = run.flags[chunk[0]].round;
+        let mut options: Vec<Choice> = chunk
+            .iter()
+            .map(|&i| {
+                let f = &run.flags[i];
+                choice(
+                    &f.path,
+                    cut(
+                        &format!("{}. Reverting it runs: {}", f.why(), f.command),
+                        DETAIL,
+                    ),
+                )
+            })
+            .collect();
+        options.push(choice(KEEP_THEM, "They stay as the fix left them"));
+        let last = first + chunk.len() - 1;
+        let which = if open.len() == 1 {
+            String::new()
+        } else if first == last {
+            format!(" (flagged file {first} of {})", open.len())
+        } else {
+            format!(" (flagged files {first}-{last} of {})", open.len())
+        };
+        let what = if chunk.len() == 1 {
+            "a file that's a binary or that its blockers don't point at. Choose it to revert it \
+             to how it was before that fix, or keep it"
+        } else {
+            "these files, each a binary or a file its blockers don't point at. Choose any to \
+             revert to how it was before that fix; the rest stay as the fix left them"
+        };
+        out.push(Asked {
+            topic: Topic::Flags(chunk.clone()),
+            question: question(
+                &if chunks.len() > 1 {
+                    format!("Flagged {}", n + 1)
+                } else {
+                    "Flagged".to_string()
+                },
+                format!(
+                    "Round {round}'s fix changed {what}{which}. Reviewers who attacked the \
+                     change since saw it as the fix left it."
+                ),
+                options,
+                true,
+            ),
+        });
+        first = last + 1;
+    }
     out
 }
 
@@ -1022,6 +1097,20 @@ pub fn apply(
                         }
                         fold = true;
                     }
+                }
+            }
+            Topic::Flags(offered) => {
+                let chosen = match pick {
+                    Some(Picked::Chose(labels)) => labels.clone(),
+                    _ => Vec::new(),
+                };
+                for &i in offered {
+                    let f = &mut run.flags[i];
+                    f.state = if chosen.contains(&f.path) {
+                        FlagState::Reverting
+                    } else {
+                        FlagState::Kept
+                    };
                 }
             }
             Topic::Missed => {

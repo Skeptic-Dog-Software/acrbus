@@ -14,8 +14,15 @@
 // - ACRBUS_TURNS: set on every review's call. For each model call, stderr
 //   says what the prompt cache served, from pi's own usage: a provider such
 //   as Fireworks reports it in the response body, which pi reads, and never
-//   in a header. And, once a call, the effort the provider says it applied,
-//   where it echoes it, as Fireworks does in fireworks-conversation-options.
+//   in a header. The same line says how the turn ended (pi's stop reason,
+//   and its error if it had one), how long it took from request to answer,
+//   and where the request went: the gateway's provider and resolved model,
+//   the provider's own count of prompt tokens, and the gateway's routing
+//   key, as a hash, never as it is. A turn with no response, which pi
+//   retries, says so. And, once a call, the effort the provider says it
+//   applied, where it echoes it, as Fireworks does in
+//   fireworks-conversation-options, or, when it doesn't, that it didn't, or
+//   that no response's headers reached the extension at all.
 // - ACRBUS_EFFORT: the thinking level the call asked for. pi rounds a level
 //   the model doesn't have to one it does, and stderr says so.
 // - ACRBUS_ALLOWED_TOOLS: the tools this call may use, comma-separated, when
@@ -35,6 +42,8 @@
 //   finished review. A turn that calls no tools is the answer itself, and
 //   never hands off.
 
+import { createHash } from "node:crypto";
+
 // The headers the key goes in: the provider's own, and the same through a
 // gateway that forwards only what's prefixed for it.
 const KEY_HEADERS = ["x-session-affinity", "x-bf-eh-x-session-affinity"];
@@ -43,6 +52,16 @@ const KEY_HEADERS = ["x-session-affinity", "x-bf-eh-x-session-affinity"];
 const CACHED_HEADERS = ["fireworks-cached-prompt-tokens", "x-cached-prompt-tokens"];
 // The response header in which Fireworks echoes the effort it applied.
 const OPTIONS_HEADER = "fireworks-conversation-options";
+// Where a gateway says it sent a request, logged as they are: names a
+// gateway and a provider give to themselves, never anything secret.
+const ROUTE_PLAIN = [
+  ["provider", "x-bifrost-provider"],
+  ["model", "x-bifrost-resolved-model"],
+  ["provider prompt", "fireworks-prompt-tokens"],
+];
+// The gateway's routing key: logged only as the first 8 hex of its
+// sha256, enough to tell two keys apart, and nothing to reuse.
+const ROUTE_KEY = "x-bifrost-routing-info-key";
 
 // A count, as a whole number of tokens: 0 for anything that isn't one.
 function count(v) {
@@ -91,6 +110,39 @@ function applied(headers) {
   const budget = value("thinking_budget_tokens");
   if (budget) parts.push(`thinking_budget_tokens ${budget}`);
   return parts.join(", ");
+}
+
+// A header's value as a plain word or number: what's left of it after
+// anything but letters, digits and `_ . / : -` goes, cut to 80. None if
+// nothing's left.
+function plain(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).replace(/[^A-Za-z0-9_./:-]/g, "").slice(0, 80);
+  return s.length > 0 ? s : null;
+}
+
+// Where a response says its request went, from its headers: "provider p,
+// model m, provider prompt n, key #0a1b2c3d". None if it says nothing.
+function routeOf(headers) {
+  const parts = [];
+  for (const [label, name] of ROUTE_PLAIN) {
+    const v = plain(headers[name]);
+    if (v) parts.push(`${label} ${v}`);
+  }
+  const key = headers[ROUTE_KEY];
+  if (typeof key === "string" && key.length > 0) {
+    parts.push(`key #${createHash("sha256").update(key).digest("hex").slice(0, 8)}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : null;
+}
+
+// An error as one short line, with anything that looks like a token cut.
+function oneLine(text) {
+  return String(text)
+    .replace(/\s+/g, " ")
+    .replace(/[A-Za-z0-9_\-+/=]{32,}/g, "…")
+    .trim()
+    .slice(0, 200);
 }
 
 // pi's <docs> section, as pi writes it: what it says it's for, then its
@@ -145,20 +197,40 @@ function openaiChat(payload, model) {
 
 export default function acrbus(pi) {
   const key = process.env.ACRBUS_CACHE_KEY;
+  const turns = process.env.ACRBUS_TURNS === "1";
+  // This model call's request: when it went, and where its response, if
+  // one came, says it went. Reset as each request goes.
+  let requestAt = null;
+  let route = null;
+  let responded = false;
+  // Whether any response's headers reached this extension, and how many
+  // the last had; whether the effort the provider applied has been said,
+  // and whether, a turn having ended without it, that it wasn't.
+  let anyHeaders = false;
+  let lastCount = 0;
+  let appliedSaid = false;
+  let unsaidSaid = false;
   if (key) {
     pi.on("before_provider_headers", (event) => {
       for (const name of KEY_HEADERS) event.headers[name] = key;
     });
+  }
+  if (key || turns) {
+    // One handler: each request is timed for the turn log, and an OpenAI
+    // chat request gets the key as its `user`.
     pi.on("before_provider_request", (event, ctx) => {
+      if (turns) {
+        requestAt = Date.now();
+        route = null;
+        responded = false;
+      }
       const payload = event.payload;
-      if (!openaiChat(payload, ctx?.model) || payload.user !== undefined) return undefined;
+      if (!key || !openaiChat(payload, ctx?.model) || payload.user !== undefined) return undefined;
       return { ...payload, user: key };
     });
   }
-  const turns = process.env.ACRBUS_TURNS === "1";
   if (key || turns) {
     let response = 0;
-    let said = false;
     pi.on("after_provider_response", (event) => {
       response += 1;
       const headers = lowered(event?.headers);
@@ -169,10 +241,15 @@ export default function acrbus(pi) {
         const n = String(headers[name]).replace(/[^0-9]/g, "").slice(0, 12);
         console.error(`acrbus cache: response ${response}: ${n} prompt tokens read from the cache, by its ${name} header`);
       }
-      if (turns && !said) {
+      if (!turns) return;
+      responded = true;
+      lastCount = Object.keys(headers).length;
+      if (lastCount > 0) anyHeaders = true;
+      route = routeOf(headers);
+      if (!appliedSaid) {
         const what = applied(headers);
         if (what) {
-          said = true;
+          appliedSaid = true;
           console.error(`acrbus effort: the provider applied ${what}`);
         }
       }
@@ -183,6 +260,9 @@ export default function acrbus(pi) {
   // The latest model call's prompt tokens, from the same reading the turn
   // log gives: what a relay checks its size against.
   let lastPrompt = 0;
+  // The last turn had no response: said again at the call's end if no
+  // turn followed it.
+  let unanswered = false;
   if (turns || relays) {
     let turn = 0;
     pi.on("message_end", (event) => {
@@ -192,12 +272,40 @@ export default function acrbus(pi) {
       const f = figures(message.usage);
       lastPrompt = f.prompt;
       if (turns) {
-        console.error(
-          `acrbus cache: turn ${turn}: ${f.cached} of ${f.prompt} prompt tokens read from the cache (${f.fresh} fresh, ${f.written} written, ${f.out} out)`,
+        const how = [];
+        if (message.stopReason) how.push(`stop ${plain(message.stopReason) ?? "?"}`);
+        if (requestAt !== null) how.push(`${((Date.now() - requestAt) / 1000).toFixed(1)}s`);
+        if (message.errorMessage) how.push(`error: ${oneLine(message.errorMessage)}`);
+        unanswered = f.prompt === 0 && f.out === 0;
+        if (unanswered) how.push("no response, retried");
+        how.push(
+          responded
+            ? `route: ${route ?? "the response named none"}`
+            : "route: no response headers",
         );
+        console.error(
+          `acrbus cache: turn ${turn}: ${f.cached} of ${f.prompt} prompt tokens read from the cache (${f.fresh} fresh, ${f.written} written, ${f.out} out); ${how.join(", ")}`,
+        );
+        if (!appliedSaid && !unsaidSaid) {
+          unsaidSaid = true;
+          console.error(
+            anyHeaders
+              ? `acrbus effort: the provider didn't say what effort it applied: no ${OPTIONS_HEADER} among its ${lastCount} response headers`
+              : "acrbus effort: no response's headers reached acrbus's extension, so the effort the provider applied is unknown",
+          );
+        }
+        requestAt = null;
       }
       return undefined;
     });
+    if (turns) {
+      pi.on("agent_end", () => {
+        if (unanswered) {
+          console.error("acrbus cache: the call ended on a turn with no response");
+        }
+        return undefined;
+      });
+    }
   }
   const effort = process.env.ACRBUS_EFFORT;
   if (effort) {
