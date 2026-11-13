@@ -33,6 +33,8 @@ output = "message.usage.output"
 cache_read = "message.usage.cacheRead"
 cache_write = "message.usage.cacheWrite"
 usd = "message.usage.cost.total"
+usd_input = "message.usage.cost.input"
+usd_cache_read = "message.usage.cost.cacheRead"
 model = "message.model"
 
 [usage.opened]

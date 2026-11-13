@@ -1606,6 +1606,79 @@ impl LiveTokens {
     pub fn fresh(&self) -> u64 {
         self.input + self.cache_write + self.output
     }
+
+    /// Adds one turn acrbus's pi extension logged on stderr as it ended:
+    /// `acrbus cache: turn N: C of P prompt tokens read from the cache (F
+    /// fresh, W written, O out); ...`. False if `line` isn't one.
+    fn add_logged_turn(&mut self, line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("acrbus cache: turn ") else {
+            return false;
+        };
+        let num = |s: &str| s.trim().parse::<u64>().ok();
+        let parsed = (|| {
+            let (turn, rest) = rest.split_once(": ")?;
+            let (cached, rest) = rest.split_once(" of ")?;
+            let (_, rest) = rest.split_once(" prompt tokens read from the cache (")?;
+            let (fresh, rest) = rest.split_once(" fresh, ")?;
+            let (written, rest) = rest.split_once(" written, ")?;
+            let (out, _) = rest.split_once(" out)")?;
+            Some((
+                num(turn)?,
+                num(cached)?,
+                num(fresh)?,
+                num(written)?,
+                num(out)?,
+            ))
+        })();
+        let Some((turn, cached, fresh, written, out)) = parsed else {
+            return false;
+        };
+        if self.turns == 0 {
+            self.first_turn = Some(crate::proto::TurnUsage {
+                input_tokens: fresh,
+                output_tokens: out,
+                cache_read_tokens: cached,
+                cache_write_tokens: written,
+            });
+        }
+        self.turns = self.turns.max(turn);
+        self.input += fresh;
+        self.cache_read += cached;
+        self.cache_write += written;
+        self.output += out;
+        true
+    }
+}
+
+/// How often a run's stderr is read for the turns its agent logs: soon
+/// enough that a fan-out's first call's first turn lets the rest go.
+const TURNS_EVERY: Duration = Duration::from_millis(500);
+/// The most of a run's stderr read at once for its turn lines.
+const TURNS_READ_MAX: u64 = 256 * 1024;
+
+/// The turns logged on stderr since `from`, added to `into`; returns how
+/// far it has read: up to the last whole line.
+fn read_logged_turns(path: &Path, from: u64, into: &mut LiveTokens) -> u64 {
+    let Ok(mut f) = fs::File::open(path) else {
+        return from;
+    };
+    if f.seek(std::io::SeekFrom::Start(from)).is_err() {
+        return from;
+    }
+    let mut buf = Vec::new();
+    if std::io::Read::take(&mut f, TURNS_READ_MAX)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return from;
+    }
+    let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
+        return from;
+    };
+    for line in String::from_utf8_lossy(&buf[..end]).lines() {
+        into.add_logged_turn(line);
+    }
+    from + end as u64 + 1
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3197,6 +3270,13 @@ impl Bridge {
         let mut shown = 0;
         let mut counted: Option<Instant> = None;
         let mut tokens_shown: Option<LiveTokens> = None;
+        // The turns its agent logs on stderr as each ends: seen at once,
+        // where its session's record is read only every TOKENS_EVERY, or not
+        // at all.
+        let logged_from = dirs.first().map(|d| d.join("stderr"));
+        let mut logged = LiveTokens::default();
+        let mut logged_at: u64 = 0;
+        let mut logged_checked: Option<Instant> = None;
         let cut_short = loop {
             if exited(pid) {
                 break None;
@@ -3225,6 +3305,24 @@ impl Bridge {
                 counted = Some(Instant::now());
                 let now = from.read(dir, before).map(|u| LiveTokens::of(&u));
                 if now.is_some() && now != tokens_shown {
+                    tokens_shown = now;
+                    self.report(|r| {
+                        if let Some(run) = r.running.get_mut(&msg.id) {
+                            run.tokens = now;
+                        }
+                    });
+                }
+            }
+            if let Some(path) = &logged_from
+                && logged_checked.is_none_or(|t| t.elapsed() >= TURNS_EVERY)
+            {
+                logged_checked = Some(Instant::now());
+                let before = logged.turns;
+                logged_at = read_logged_turns(path, logged_at, &mut logged);
+                // Its session's own record wins once it has as many turns.
+                let behind = tokens_shown.is_none_or(|t| t.turns < logged.turns);
+                if logged.turns > before && behind {
+                    let now = Some(logged);
                     tokens_shown = now;
                     self.report(|r| {
                         if let Some(run) = r.running.get_mut(&msg.id) {
@@ -4774,6 +4872,31 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_its_agent_logs_shows_in_status_before_any_session_is_read() {
+        let rig = Rig::new();
+        // pi's extension logs each turn to stderr as it ends; no session
+        // file is written for the bridge to read.
+        let script = r#"echo 'acrbus cache: turn 1: 0 of 39649 prompt tokens read from the cache (39649 fresh, 0 written, 120 out); stop toolUse, tools 2 (read 2), 48.1s, route: provider fireworks' >&2; sleep 3; echo done"#;
+        let bridge = rig.start(generous(&rig, script));
+        let id = rig.ask("work");
+        let started = std::time::Instant::now();
+        let live = until("its first turn in status.json", || {
+            let report: Report = read_json(&rig.state().join("status.json"))?;
+            report.running.get(&id)?.tokens.filter(|t| t.turns > 0)
+        });
+        // Well before the session reader's 10s, and before the call ends.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(live.turns, 1);
+        assert_eq!((live.input, live.cache_read, live.output), (39_649, 0, 120));
+        rig.reply_to(&id);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
     fn a_running_requests_tokens_so_far_are_in_its_status() {
         let rig = Rig::new();
         // Records one call's usage, then works on.
@@ -5914,7 +6037,9 @@ if (mode === "headers") {
     "X-Bifrost-Provider": "fireworks", "x-bifrost-resolved-model": "accounts/f/models/glm-5p3",
     "fireworks-prompt-tokens": "13644", "x-bifrost-routing-info-key": "the-routing-key",
     "fireworks-conversation-options": '{"reasoning_effort": "high", "thinking_mode": null}' } });
-  await end({ input: 13644, output: 200, cacheRead: 0, cacheWrite: 0 }, { stopReason: "toolUse" });
+  await end({ input: 13644, output: 200, cacheRead: 0, cacheWrite: 0 }, { stopReason: "toolUse",
+    content: [{ type: "text", text: "reading" }, { type: "toolCall", name: "read" },
+      { type: "toolCall", name: "bash" }, { type: "toolCall", name: "read" }] });
   // A request with no response: pi's 0/0 turn, then its retry.
   await req();
   await end({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -5983,6 +6108,11 @@ if (mode === "headers") {
             ),
             "{turn1}"
         );
+        // The turn's tool calls, counted and named: what shows batching.
+        assert!(
+            turn1.contains("stop toolUse, tools 3 (read 2, bash 1), "),
+            "{turn1}"
+        );
         assert!(
             turn1.ends_with(&format!(
                 "s, route: provider fireworks, model accounts/f/models/glm-5p3, provider prompt \
@@ -6012,7 +6142,7 @@ if (mode === "headers") {
             .lines()
             .find(|l| l.starts_with("acrbus cache: turn 3:"))
             .unwrap();
-        assert!(turn3.contains("stop stop, "), "{turn3}");
+        assert!(turn3.contains("stop stop, tools 0, "), "{turn3}");
         assert!(turn3.ends_with("route: the response named none"), "{turn3}");
         // The call didn't end on an unanswered turn.
         assert!(!said.contains("ended on a turn with no response"), "{said}");

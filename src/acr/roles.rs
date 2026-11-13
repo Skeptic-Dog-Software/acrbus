@@ -1110,13 +1110,25 @@ pub const FIX_SCOPE: &str = "Change code, tests and docs, not what's built from 
      it. Every file you change is listed after you're done, and a person is asked about each \
      binary, and each file the blockers don't point at.";
 
+/// What every fixer is told about running tests: the same for every fix, so
+/// it's part of the opening a group's session reads from the cache. A test
+/// run's output stays in the session and is re-read on every later turn, so
+/// a whole-suite run is costly to keep. Guidance, not a limit.
+pub const FIX_TESTS: &str = "To check a fix, run only the tests that cover what you changed: \
+     scoped to the packages and test names you touched, such as `go test -run <Name> ./pkg` or \
+     the equivalent for this repository's test command. The review runs the whole suite and \
+     its test gate itself after you're done, so don't run the whole suite, a race or mutation \
+     run, or the same tests again with nothing changed: every test run's output stays in your \
+     session and is read again on every turn after it. If a fix truly needs a wider run, \
+     nothing stops you: say why in your answer.";
+
 /// A fixer's brief: what every fix is told first, so that each group of a
 /// fix in groups shares it as a cached opening, and only its own blockers
 /// last.
 pub fn fix_prompt(blockers: &str) -> String {
     format!(
         "Fix these blockers in the working directory: the ones listed at the end of this brief. \
-         Change only what fixing them needs, and don't commit.\n\n{FIX_SCOPE}\n\n\
+         Change only what fixing them needs, and don't commit.\n\n{FIX_SCOPE}\n\n{FIX_TESTS}\n\n\
          Answer with only JSON: {{\"done\": \"<what you changed, in a line or two>\"}}.\n\n\
          # The blockers\n\n{blockers}"
     )
@@ -1231,6 +1243,28 @@ pub fn read_fixed(text: &str) -> Result<Fixed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fixer_is_told_to_run_only_the_tests_that_cover_its_change() {
+        let one = fix_prompt("- first blocker");
+        let two = fix_prompt("- second blocker");
+        let opening = one.find("# The blockers").unwrap();
+        // In the opening every fixer shares, so a group's session reads it
+        // from the cache.
+        assert_eq!(one[..opening], two[..opening]);
+        let guidance = &one[..opening];
+        assert!(
+            guidance.contains("run only the tests that cover what you changed"),
+            "{one}"
+        );
+        assert!(guidance.contains("go test -run"), "{one}");
+        assert!(guidance.contains("the whole suite"), "{one}");
+        // Guidance, not a limit: nothing is taken away.
+        assert!(guidance.contains("nothing stops you"), "{one}");
+        // A session that carries on is still under the same brief.
+        let carried = format!("{one}{}", fix_continuation(&["a".into()], "the rest", 2));
+        assert!(carried.contains("run only the tests that cover what you changed"));
+    }
 
     #[test]
     fn a_reviewer_is_told_to_read_in_fewer_turns_and_limited_in_nothing() {

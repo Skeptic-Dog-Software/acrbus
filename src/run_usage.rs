@@ -45,6 +45,12 @@ pub struct UsageFrom {
     pub reasoning: Option<String>,
     /// What the agent says the call cost, in US dollars.
     pub usd: Option<String>,
+    /// What it says the fresh input cost, and the input read from a cache,
+    /// for an agent that splits its cost.
+    #[serde(default)]
+    pub usd_input: Option<String>,
+    #[serde(default)]
+    pub usd_cache_read: Option<String>,
     pub model: Option<String>,
     /// Where a counted line names the files its call read.
     pub opened: Option<OpenedFrom>,
@@ -86,6 +92,8 @@ impl UsageFrom {
             &self.cache_write,
             &self.reasoning,
             &self.usd,
+            &self.usd_input,
+            &self.usd_cache_read,
             &self.model,
         ];
         let mut named: Vec<&String> = paths
@@ -144,6 +152,9 @@ impl UsageFrom {
             if f.seek(SeekFrom::Start(from)).is_err() {
                 continue;
             }
+            // The prompt the session's last turn sent: what its next turn
+            // should read back from the cache.
+            let mut last_prompt: Option<u64> = None;
             for line in BufReader::new(f).split(b'\n').map_while(Result::ok) {
                 let Ok(record) = serde_json::from_slice::<Value>(&line) else {
                     // Half a line from an agent that was stopped, or not JSON.
@@ -153,6 +164,18 @@ impl UsageFrom {
                     continue;
                 }
                 self.note_opened(&mut usage, &record);
+                // A turn streamed more than once is counted once, at the end;
+                // a session's turns, in order, say what each should have read
+                // back.
+                if self.dedupe.is_none() {
+                    let turn = self.turn(&record);
+                    if let Some(last) = last_prompt {
+                        usage.cache_shortfall_tokens += last
+                            .min(turn.prompt())
+                            .saturating_sub(turn.cache_read_tokens);
+                    }
+                    last_prompt = Some(turn.prompt());
+                }
                 let name = self
                     .dedupe
                     .as_deref()
@@ -230,6 +253,27 @@ impl UsageFrom {
         }
     }
 
+    /// How many tool calls a counted line made, whatever the tools: the
+    /// blocks `usage.opened` describes, by its `when`.
+    fn tool_calls_in(&self, record: &Value) -> u64 {
+        let Some(o) = &self.opened else {
+            return 0;
+        };
+        let Some(items) = at(record, &o.items).and_then(Value::as_array) else {
+            return 0;
+        };
+        items
+            .iter()
+            .filter(|item| {
+                o.when.iter().all(|(path, want)| {
+                    at(item, path)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v == want)
+                })
+            })
+            .count() as u64
+    }
+
     /// One call's tokens.
     fn turn(&self, record: &Value) -> TurnUsage {
         let tokens = |path: &Option<String>| -> u64 {
@@ -255,6 +299,19 @@ impl UsageFrom {
                 .map_or(0, |n| n.max(0.0).round() as u64)
         };
         usage.calls += 1;
+        usage.tool_calls += self.tool_calls_in(record);
+        let dollars = |path: &Option<String>| {
+            path.as_deref()
+                .and_then(|p| at(record, p))
+                .and_then(number)
+                .filter(|n| n.is_finite() && *n >= 0.0)
+        };
+        if let Some(d) = dollars(&self.usd_input) {
+            *usage.usd_input.get_or_insert(0.0) += d;
+        }
+        if let Some(d) = dollars(&self.usd_cache_read) {
+            *usage.usd_cache_read.get_or_insert(0.0) += d;
+        }
         usage.input_tokens += tokens(&self.input);
         usage.output_tokens += tokens(&self.output);
         usage.cache_read_tokens += tokens(&self.cache_read);
@@ -348,6 +405,53 @@ mod tests {
             "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn what_a_turn_billed_fresh_that_the_last_one_sent_is_its_cache_shortfall() {
+        let mut from = jsonl();
+        from.usd_input = Some("message.usage.cost.input".into());
+        from.usd_cache_read = Some("message.usage.cost.cacheRead".into());
+        from.opened = Some(OpenedFrom {
+            items: "message.content".into(),
+            when: [("type".to_string(), "toolCall".to_string())].into(),
+            name: "name".into(),
+            names: vec!["read".into()],
+            path: "arguments.path".into(),
+        });
+        let d = dir();
+        let turn = |input: u64, cached: u64, tools: usize| {
+            let blocks: Vec<String> = (0..tools)
+                .map(|i| {
+                    format!(r#"{{"type":"toolCall","name":"read","arguments":{{"path":"f{i}"}}}}"#)
+                })
+                .collect();
+            format!(
+                r#"{{"type":"message","message":{{"role":"assistant","model":"m","usage":{{"input":{input},"output":10,"cacheRead":{cached},"cacheWrite":0,"cost":{{"total":0.01,"input":{fi},"cacheRead":{fc}}}}},"content":[{blocks}]}}}}"#,
+                fi = input as f64 * 1e-6,
+                fc = cached as f64 * 1e-7,
+                blocks = blocks.join(",")
+            )
+        };
+        // Prompts 1000, 1500 (all of the last read back), 1800 (none of it:
+        // another server), 2000 (part of it).
+        let lines = [
+            turn(1000, 0, 2),
+            turn(500, 1000, 3),
+            turn(1800, 0, 0),
+            turn(1000, 1000, 1),
+        ];
+        fs::write(d.join("a.jsonl"), lines.join("\n") + "\n").unwrap();
+        let u = from.read(&d, &Before::new()).unwrap();
+        // 0, then 1500 - 0, then 1800 - 1000.
+        assert_eq!(u.cache_shortfall_tokens, 1500 + 800);
+        assert_eq!(u.tool_calls, 6);
+        assert!((u.usd_input.unwrap() - 4300.0 * 1e-6).abs() < 1e-12);
+        assert!((u.usd_cache_read.unwrap() - 2000.0 * 1e-7).abs() < 1e-12);
+        // A new file is a new session: its first turn has no last one.
+        fs::write(d.join("b.jsonl"), turn(3000, 0, 0) + "\n").unwrap();
+        let both = from.read(&d, &Before::new()).unwrap();
+        assert_eq!(both.cache_shortfall_tokens, 2300);
     }
 
     fn call(input: u64, output: u64, cached: u64, usd: f64) -> String {

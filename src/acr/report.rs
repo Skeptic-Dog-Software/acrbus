@@ -354,6 +354,12 @@ pub struct RoleUsage {
     pub first_cached: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rest_cached: Option<u64>,
+    /// Tokens billed fresh that the provider should have read from its
+    /// cache: see `adjusted`.
+    pub shortfall: u64,
+    /// What the calls would have cost had the provider cached them: derived,
+    /// not billed. None if a shortfall has no cached price to go by.
+    pub usd_adjusted: Option<f64>,
 }
 
 impl RoleUsage {
@@ -374,11 +380,104 @@ impl RoleUsage {
             (Some(f), Some(r)) => format!("; cached: first call {f}, the rest {r} each on average"),
             _ => String::new(),
         };
+        let adjusted = match (self.shortfall, self.usd_adjusted) {
+            (0, _) => String::new(),
+            (n, Some(d)) => format!(
+                "; cache-adjusted ${d:.3}, derived: {n} tokens billed fresh that the provider \
+                 should have read cached"
+            ),
+            (n, None) => format!(
+                "; {n} tokens billed fresh that the provider should have read cached (no cached \
+                 price to adjust by)"
+            ),
+        };
         format!(
-            "{round}, {}: {} call(s), {} fresh, {} cached, {} out, {usd}{secs}{first}",
+            "{round}, {}: {} call(s), {} fresh, {} cached, {} out, {usd}{secs}{first}{adjusted}",
             self.role, self.calls, self.fresh, self.cached, self.output
         )
     }
+}
+
+/// What a cache-adjusted figure is, said wherever one is shown.
+pub const ADJUSTED_IS: &str = "cache-adjusted is derived, not billed: the cost had the \
+    provider served from its cache what a turn had just sent, or, for a call after its \
+    fan-out's first, the opening that first call sent; the billed figure is what was charged";
+
+/// One call's cost had the provider cached what it should have: derived,
+/// beside the billed one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Adjusted {
+    /// Tokens billed fresh that it should have read from the cache: from
+    /// its second turn on, what its turn before had just sent; and on its
+    /// first turn, for a call after its fan-out's first, the opening that
+    /// first call sent.
+    pub shortfall: u64,
+    /// Its billed dollars with those tokens repriced at its cached rate.
+    /// None if it has no billed dollars, or a shortfall with no cached rate
+    /// to go by.
+    pub usd: Option<f64>,
+}
+
+/// Each call's `Adjusted`, in order. Rates come from the config's price,
+/// else from the call's agent's split of its cost, else from other calls
+/// of the same model.
+pub fn adjusted(usage: &[Usage]) -> Vec<Adjusted> {
+    let per_token = |dollars: Option<f64>, tokens: u64| {
+        dollars.filter(|_| tokens > 0).map(|d| d / tokens as f64)
+    };
+    let model_rate = |model: &Option<String>, cached: bool| -> Option<f64> {
+        let same: Vec<&Usage> = usage.iter().filter(|u| u.model == *model).collect();
+        let (dollars, tokens) = same.iter().fold((0.0, 0u64), |(d, t), u| {
+            let (ud, ut) = if cached {
+                (u.usd_cache_read, u.cache_read)
+            } else {
+                (u.usd_input, u.tokens_in)
+            };
+            match ud {
+                Some(x) if ut > 0 => (d + x, t + ut),
+                _ => (d, t),
+            }
+        });
+        (tokens > 0).then(|| dollars / tokens as f64)
+    };
+    usage
+        .iter()
+        .map(|u| {
+            // The opening its fan-out's first call sent, in the same round.
+            let opening = (!u.first)
+                .then_some(u.fan_out.as_ref())
+                .flatten()
+                .and_then(|fan| {
+                    usage
+                        .iter()
+                        .find(|w| w.first && w.round == u.round && w.fan_out.as_ref() == Some(fan))
+                })
+                .and_then(|w| w.first_turn)
+                .map(|t| t.prompt());
+            let first = match (opening, u.first_turn) {
+                (Some(o), Some(t)) => o.min(t.prompt()).saturating_sub(t.cache_read_tokens),
+                _ => 0,
+            };
+            let shortfall = u.cache_shortfall + first;
+            let usd = if u.subscription {
+                None
+            } else if shortfall == 0 {
+                u.usd
+            } else {
+                let rates = u.price_rates.map(|[f, c]| (f, c)).or_else(|| {
+                    let fresh = per_token(u.usd_input, u.tokens_in)
+                        .or_else(|| model_rate(&u.model, false))?;
+                    let cached = per_token(u.usd_cache_read, u.cache_read)
+                        .or_else(|| model_rate(&u.model, true))?;
+                    Some((fresh, cached))
+                });
+                u.usd.zip(rates).map(|(usd, (fresh, cached))| {
+                    usd - shortfall as f64 * (fresh - cached).max(0.0)
+                })
+            };
+            Adjusted { shortfall, usd }
+        })
+        .collect()
 }
 
 fn span(secs: u64) -> String {
@@ -414,7 +513,7 @@ const GROUPS: [&str; 7] = [
     "Configurer",
 ];
 
-fn summed(round: Option<u32>, role: &'static str, calls: &[&Usage]) -> RoleUsage {
+fn summed(round: Option<u32>, role: &'static str, calls: &[&Usage], adj: &[Adjusted]) -> RoleUsage {
     let owned: Vec<Usage> = calls.iter().map(|u| (*u).clone()).collect();
     let secs: Vec<u64> = calls.iter().filter_map(|u| u.secs).collect();
     // The first call of a fan-out, and the rest, within one round only.
@@ -443,6 +542,20 @@ fn summed(round: Option<u32>, role: &'static str, calls: &[&Usage]) -> RoleUsage
         secs_max: secs.iter().max().copied(),
         first_cached,
         rest_cached,
+        shortfall: adj.iter().map(|a| a.shortfall).sum(),
+        usd_adjusted: if adj.iter().all(|a| a.usd.is_some() || a.shortfall == 0)
+            && adj.iter().any(|a| a.usd.is_some())
+        {
+            Some(
+                calls
+                    .iter()
+                    .zip(adj)
+                    .map(|(u, a)| a.usd.or(u.usd).unwrap_or(0.0))
+                    .sum(),
+            )
+        } else {
+            None
+        },
     }
 }
 
@@ -512,26 +625,32 @@ pub const WRITES_UNREPORTED: &str = "(cache writes read 0 on every call: some pr
 /// The run's calls by round and role, then by role over every round if
 /// there was more than one.
 pub fn by_role(usage: &[Usage]) -> Vec<RoleUsage> {
+    let adj = adjusted(usage);
     let mut rounds: Vec<u32> = usage.iter().map(|u| u.round).collect();
     rounds.sort_unstable();
     rounds.dedup();
+    let pick = |keep: &dyn Fn(&Usage) -> bool| -> (Vec<&Usage>, Vec<Adjusted>) {
+        usage
+            .iter()
+            .zip(&adj)
+            .filter(|(u, _)| keep(u))
+            .map(|(u, a)| (u, *a))
+            .unzip()
+    };
     let mut out = Vec::new();
     for &round in &rounds {
         for role in GROUPS {
-            let calls: Vec<&Usage> = usage
-                .iter()
-                .filter(|u| u.round == round && group(u) == role)
-                .collect();
+            let (calls, a) = pick(&|u| u.round == round && group(u) == role);
             if !calls.is_empty() {
-                out.push(summed(Some(round), role, &calls));
+                out.push(summed(Some(round), role, &calls, &a));
             }
         }
     }
     if rounds.len() > 1 {
         for role in GROUPS {
-            let calls: Vec<&Usage> = usage.iter().filter(|u| group(u) == role).collect();
+            let (calls, a) = pick(&|u| group(u) == role);
             if !calls.is_empty() {
-                out.push(summed(None, role, &calls));
+                out.push(summed(None, role, &calls, &a));
             }
         }
     }
@@ -764,6 +883,69 @@ mod tests {
             "label": label, "fan_out": fan_out, "first": first,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn the_cost_had_the_provider_cached_what_it_should_is_beside_the_billed_one() {
+        let turn = |input, cached| crate::proto::TurnUsage {
+            input_tokens: input,
+            output_tokens: 10,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+        };
+        // The warm-up: its first turn sends the 40k opening fresh.
+        let mut warm = call("reviewer", 1, Some("r 1"), Some("reviewers"), true);
+        warm.first_turn = Some(turn(40_000, 0));
+        // A reviewer after it whose first turn found nothing cached, and
+        // whose later turns lost 10k more: 50k it should have read cached.
+        let mut cold = call("reviewer", 1, Some("r 2"), Some("reviewers"), false);
+        cold.first_turn = Some(turn(40_000, 0));
+        cold.cache_shortfall = 10_000;
+        cold.tokens_in = 60_000;
+        cold.cache_read = 100_000;
+        // $1 per million fresh, $0.10 per million cached, by its agent.
+        cold.usd_input = Some(0.06);
+        cold.usd_cache_read = Some(0.01);
+        cold.usd = Some(0.5);
+        // One whose first turn read the opening: nothing to adjust.
+        let mut hit = call("reviewer", 1, Some("r 3"), Some("reviewers"), false);
+        hit.first_turn = Some(turn(500, 40_000));
+        let all = [warm, cold, hit];
+        let adj = adjusted(&all);
+        assert_eq!(
+            adj[0],
+            Adjusted {
+                shortfall: 0,
+                usd: Some(0.5)
+            },
+            "the warm-up fills it"
+        );
+        assert_eq!(adj[1].shortfall, 50_000);
+        // 50k at $0.90 a million less: 0.5 - 0.045.
+        assert!((adj[1].usd.unwrap() - 0.455).abs() < 1e-9, "{:?}", adj[1]);
+        assert_eq!(
+            adj[2],
+            Adjusted {
+                shortfall: 0,
+                usd: Some(0.5)
+            }
+        );
+        let rows = by_role(&all);
+        assert_eq!(rows[0].shortfall, 50_000);
+        assert!((rows[0].usd_adjusted.unwrap() - 1.455).abs() < 1e-9);
+        let line = rows[0].line();
+        assert!(
+            line.contains(
+                "cache-adjusted $1.455, derived: 50000 tokens billed fresh that the \
+                           provider should have read cached"
+            ),
+            "{line}"
+        );
+        // No price for the cached tokens anywhere: no adjusted figure.
+        let mut unknown = all[1].clone();
+        unknown.usd_input = None;
+        unknown.usd_cache_read = None;
+        assert_eq!(adjusted(&[all[0].clone(), unknown])[1].usd, None);
     }
 
     #[test]
