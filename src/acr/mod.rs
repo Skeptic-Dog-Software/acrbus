@@ -330,8 +330,8 @@ pub enum AcrCmd {
         #[arg(long, value_name = "NUMBER")]
         post_pr: Option<u64>,
         /// Review a repository that isn't calibrated, or whose config has
-        /// changed since: its rulings haven't been checked against a full
-        /// review.
+        /// changed since: nobody has read and accepted the config the review
+        /// would use. Calibrated means accepted, not measured.
         #[arg(long)]
         uncalibrated: bool,
     },
@@ -671,9 +671,10 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
 
 /// A reviewer's or Judge's call, given the round's shared facts: the facts
 /// file, the cache's key for its bridge and model, and, when its roles'
-/// tools are matched, every tool their calls are given, holding it to its
-/// own.
-fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
+/// tools are matched and its bridge `holds` a call to its own, every tool
+/// their calls are given, holding it to its own. A bridge that can't hold
+/// one, any but pi's, would refuse the call, so it keeps its own tools.
+fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared, holds: bool) {
     let b = call.binding;
     // A fix's sessions, one per group, all open the same way: its cache's
     // key keeps them on the replica that holds that opening. Nothing else
@@ -687,7 +688,7 @@ fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
     }
     options.facts = Some(shared.facts.display().to_string());
     options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
-    if call.no_tools {
+    if call.no_tools || !holds {
         return;
     }
     let group = (b.agent.clone(), b.model.clone());
@@ -747,6 +748,8 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         allowed_tools: None,
         relay_tokens: None,
         relay_after_edit: None,
+        // The host's MCP servers it names, and none it doesn't.
+        mcp: b.mcp.clone(),
     }
 }
 
@@ -1782,7 +1785,8 @@ impl BridgeCaller {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            with_shared(&mut options, call, shared);
+            let holds = crate::bridge::holds_tools(&self.paths, bridge);
+            with_shared(&mut options, call, shared, holds);
         }
         // A restart after its model couldn't be reached: a new key, so it
         // may land on another replica than the one that didn't answer.
@@ -1931,10 +1935,29 @@ impl BridgeCaller {
                         b.agent
                     ));
                 }
+                let usage = result.and_then(|r| r.usage.clone());
+                // A tool its model reached for that its binding doesn't
+                // name: said, not refused here, since pi's bridge refuses it
+                // and others can't. It shows a gateway adding tools to its
+                // requests, or a model making one up.
+                if let Some(used) = &usage {
+                    let unnamed = flow::unnamed_tools(b, &used.tools);
+                    if !unnamed.is_empty() {
+                        let list: Vec<String> = unnamed
+                            .iter()
+                            .map(|(name, n)| format!("{name} ({n}×)"))
+                            .collect();
+                        self.progress.line(&format!(
+                            "{}: its model asked for tool(s) its binding doesn't name: {}",
+                            call.label,
+                            list.join(", ")
+                        ));
+                    }
+                }
                 Ok(Answer {
                     text,
                     run_id: sent.id,
-                    usage: result.and_then(|r| r.usage.clone()),
+                    usage,
                     secs: Some(asked.elapsed().as_secs()),
                 })
             }
@@ -2466,6 +2489,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
+    }
+    for u in &summary.unnamed_tools {
+        eprintln!("{APP_NAME}: {}", u.line());
     }
     for x in &summary.sessions {
         eprintln!("{APP_NAME}: {}", x.line());
@@ -3146,6 +3172,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
             let restarts = report::restarts(&run.usage);
+            let unnamed = report::unnamed_tools(&run.usage);
             let fixes = report::fix_routes(&run);
             let unreported = report::writes_unreported(&run.usage);
             let sessions = report::sessions(&run.usage);
@@ -3186,6 +3213,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
                     "restarts": restarts, "fix_routes": fixes,
+                    "unnamed_tools": unnamed,
                     "sessions": sessions, "session_calls": parts,
                     "calls": calls, "cost": billed, "cost_adjusted": cost_adjusted,
                     "cache_shortfall_tokens": shortfall,
@@ -3207,6 +3235,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for r in &restarts {
                     println!("{}", r.line());
+                }
+                for u in &unnamed {
+                    println!("{}", u.line());
                 }
                 for f in &fixes {
                     println!("{}", f.line());
@@ -6036,7 +6067,7 @@ mod tests {
         };
         let given = |c: &flow::Call| {
             let mut o = call_options(c, false, None);
-            with_shared(&mut o, c, &shared);
+            with_shared(&mut o, c, &shared, true);
             o
         };
         let r = given(&call(Role::Reviewer, &reviewer, false, false));
@@ -6084,6 +6115,17 @@ mod tests {
         );
         assert!(tools_note(&["read".into()]).contains("The tools you may use: read."));
         assert!(tools_note(&[]).contains("The tools you may use: none."));
+        // A bridge that can't hold a call to some of its tools, such as
+        // Claude Code's, would refuse one: it keeps its own, with the facts
+        // and the key all the same.
+        let c = call(Role::Reviewer, &reviewer, false, false);
+        let mut kept = call_options(&c, false, None);
+        with_shared(&mut kept, &c, &shared, false);
+        assert_eq!(
+            (kept.tools, kept.allowed_tools),
+            (reviewer.tools.clone(), None)
+        );
+        assert!(kept.facts.is_some() && kept.cache_key.is_some());
     }
 
     #[test]
@@ -6128,7 +6170,7 @@ mod tests {
                 label: label.to_string(),
             };
             let mut o = call_options(&c, false, None);
-            with_shared(&mut o, &c, &shared(round));
+            with_shared(&mut o, &c, &shared(round), true);
             (
                 o.model,
                 o.effort,

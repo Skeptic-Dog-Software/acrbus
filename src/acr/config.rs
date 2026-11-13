@@ -945,6 +945,11 @@ pub struct Binding {
     /// which lost the work done and cut off calls that were still working.
     #[serde(default, skip_serializing)]
     pub fallback: Option<String>,
+    /// The host's MCP servers its calls may use, by name, where its bridge
+    /// lets a request name them (pi's, given `options.mcp`). Left out, a
+    /// call gets none: a bridge whose agent can turn MCP off does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Vec<String>>,
 }
 
 /// A binding's `timeout` under this is said to be one, by `time_notes`.
@@ -954,6 +959,33 @@ const SHORT_CAP: u64 = 3600;
 const CHANGING_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
 
 impl Binding {
+    /// The tools a call on it may reach for: its own, and each MCP server's
+    /// it names, as `mcp__<server>__*`. None if it names no tools, when its
+    /// bridge's are all it has.
+    pub fn may_use(&self) -> Option<Vec<String>> {
+        let mut all = self.tools.clone()?;
+        for server in self.mcp.iter().flatten() {
+            all.push(format!("mcp__{server}__*"));
+        }
+        Some(all)
+    }
+
+    /// The tools a call used that it doesn't name: `used`'s names that
+    /// match none of `may_use`, a name ending in `*` covering every tool it
+    /// starts, in any case. Empty when it names no tools.
+    pub fn unnamed<'a>(&self, used: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+        let Some(may) = self.may_use() else {
+            return Vec::new();
+        };
+        let covered = |name: &str| {
+            may.iter().any(|t| match t.strip_suffix('*') {
+                Some(head) => name.to_lowercase().starts_with(&head.to_lowercase()),
+                None => t.eq_ignore_ascii_case(name),
+            })
+        };
+        used.into_iter().filter(|n| !covered(n)).cloned().collect()
+    }
+
     /// Whether it names a tool that can run or change files, in whatever
     /// case its agent spells it, `Bash` or `bash`. A reviewer that has one
     /// works in a copy of its own, to run and break things in, and never in
@@ -1942,6 +1974,27 @@ mod tests {
         assert_eq!(rate("small", small), Some(9.0), "by its name first");
         let medium = &cfg.allowed_bindings["medium"];
         assert_eq!(rate("medium", medium), Some(2.0));
+        // A binding's tools and its MCP servers' are what a call may use;
+        // anything else its model reached for is said, in any case.
+        let held = Binding {
+            tools: Some(vec!["read".into(), "bash".into()]),
+            mcp: Some(vec!["docs".into()]),
+            ..large.clone()
+        };
+        let used: Vec<String> = [
+            "read",
+            "Bash",
+            "mcp__docs__search",
+            "sk_context-slack_query",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(held.unnamed(&used), ["sk_context-slack_query"]);
+        let open = Binding {
+            tools: None,
+            ..large.clone()
+        };
+        assert!(open.unnamed(&used).is_empty(), "no list, nothing to say");
         let mine = Binding {
             input_per_mtok: Some(2.0),
             output_per_mtok: Some(3.0),

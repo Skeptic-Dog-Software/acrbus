@@ -61,6 +61,9 @@ pub struct Report<'a> {
     /// The calls broken into sessions, by role: relayed and scouted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<Sessions>,
+    /// Calls whose model asked for tools their binding doesn't name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unnamed_tools: Vec<UnnamedTools>,
     /// The blockers a person deferred to a ticket, each with a draft to
     /// file. Nothing is filed for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -467,6 +470,48 @@ impl Restarts {
                 .join("; ")
         )
     }
+}
+
+/// A call whose model asked for tools its binding doesn't name: one a
+/// gateway added to its requests, or one it made up. Seen, not a failure.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnnamedTools {
+    pub round: u32,
+    pub call: String,
+    pub binding: String,
+    /// Each tool, and how often it was asked for.
+    pub tools: BTreeMap<String, u64>,
+}
+
+impl UnnamedTools {
+    pub fn line(&self) -> String {
+        let tools: Vec<String> = self
+            .tools
+            .iter()
+            .map(|(name, n)| format!("{name} ({n}×)"))
+            .collect();
+        format!(
+            "round {}: {} (binding {}) asked for tool(s) its binding doesn't name: {}",
+            self.round,
+            self.call,
+            self.binding,
+            tools.join(", ")
+        )
+    }
+}
+
+/// Every call that asked for a tool its binding doesn't name.
+pub fn unnamed_tools(usage: &[Usage]) -> Vec<UnnamedTools> {
+    usage
+        .iter()
+        .filter(|u| !u.unnamed_tools.is_empty())
+        .map(|u| UnnamedTools {
+            round: u.round,
+            call: u.label.clone().unwrap_or_default(),
+            binding: u.binding.clone(),
+            tools: u.unnamed_tools.clone(),
+        })
+        .collect()
 }
 
 /// Each round's restarts, from the calls marked as a restart's.
@@ -889,6 +934,7 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         prefixes: &run.prefixes,
         repairs: repairs(&run.usage),
         sessions: sessions(&run.usage),
+        unnamed_tools: unnamed_tools(&run.usage),
         tickets: tickets(run),
         flags: &run.flags,
     }

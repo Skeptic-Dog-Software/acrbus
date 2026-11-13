@@ -250,6 +250,18 @@ pub struct Allowed {
     /// the one it named.
     #[serde(default)]
     pub effort_args: Vec<String>,
+    /// Added to the arguments of every request that names no MCP server, so
+    /// the host's servers reach no call that didn't ask for them, such as
+    /// pi's `--no-mcp`.
+    #[serde(default)]
+    pub no_mcp_args: Vec<String>,
+    /// The MCP servers a request may name, from the agent's own MCP config.
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    /// The tool pattern that keeps a named server's tools, added to a
+    /// call's tools for each, such as `mcp__{SERVER}__*` for pi. Left out,
+    /// a request can't name a server.
+    pub mcp_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -294,6 +306,8 @@ struct Plan {
     relay_tokens: Option<u64>,
     /// Its relay is a fixer's: by what it grew, after its first edit.
     relay_after_edit: bool,
+    /// The MCP servers it named, which its agent keeps on for it.
+    mcp: Vec<String>,
 }
 
 impl Plan {
@@ -610,7 +624,29 @@ impl Settings {
 }
 
 impl Allowed {
+    /// The tool patterns that keep `servers`' tools on.
+    fn mcp_tools(&self, servers: &[String]) -> Vec<String> {
+        match &self.mcp_tool {
+            Some(pattern) => servers
+                .iter()
+                .map(|s| pattern.replace("{SERVER}", s))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     fn check(&self, wants_model: bool, timeout_secs: u64) -> Result<()> {
+        if let Some(pattern) = &self.mcp_tool
+            && !pattern.contains("{SERVER}")
+        {
+            bail!("options.mcp_tool needs {{SERVER}}, for the server's name");
+        }
+        if !self.mcp.is_empty() && self.mcp_tool.is_none() {
+            bail!("options.mcp needs mcp_tool, or a server named would get every tool");
+        }
+        if let Some(bad) = self.mcp.iter().find(|s| !plain_tool(s)) {
+            bail!("{bad:?} can't be an MCP server's name in options.mcp");
+        }
         if !self.tools.is_empty() && self.tools_args.is_empty() && self.tools_env.is_none() {
             bail!("options.tools needs tools_args or tools_env, or nothing would enforce it");
         }
@@ -677,10 +713,22 @@ impl Settings {
             allowed_tools: None,
             relay_tokens: None,
             relay_after_edit: false,
+            mcp: Vec::new(),
         };
         let Some(options) = options else {
             return Ok(plan);
         };
+        if let Some(servers) = options.mcp.as_ref().filter(|s| !s.is_empty()) {
+            if self.options.mcp_tool.is_none() {
+                return Err("this agent's config doesn't let a request name MCP servers".into());
+            }
+            if let Some(bad) = servers.iter().find(|s| !self.options.mcp.contains(s)) {
+                return Err(format!(
+                    "MCP server {bad:?} isn't one this agent's config allows"
+                ));
+            }
+            plan.mcp = servers.clone();
+        }
         plan.review = options.review == Some(true);
         if !plan.review
             && (options.facts.is_some()
@@ -1861,6 +1909,13 @@ pub fn takes_facts(paths: &Paths, agent: &str, bytes: u64) -> bool {
         Some(_) => bytes <= FACTS_IN_ARG as u64,
         None => false,
     })
+}
+
+/// Whether bridge `agent` can hold a call to some of the tools it's given,
+/// as matched tools ask: only pi's extension can, and any other agent
+/// refuses such a call.
+pub fn holds_tools(paths: &Paths, agent: &str) -> bool {
+    load(paths, agent).is_ok_and(|s| s.agent_kind() == Some(Kind::Pi))
 }
 
 /// Whether a bridge has come up since `since`, in Unix milliseconds.
@@ -3111,7 +3166,15 @@ impl Bridge {
             format::tagged_as(item, inline),
         );
         let attachments_text = attachments.to_string_lossy();
-        let tools = plan.tools.as_ref().map(|t| t.join(","));
+        // A call's tools, with each MCP server it named kept on.
+        let named_mcp = self.cfg.options.mcp_tools(&plan.mcp);
+        let tools = plan.tools.as_ref().map(|t| {
+            let mut all = t.clone();
+            if !all.is_empty() {
+                all.extend(named_mcp.iter().cloned());
+            }
+            all.join(",")
+        });
         let vars = [
             ("AGENT", self.agent.as_str()),
             ("ID", msg.id.as_str()),
@@ -3152,6 +3215,15 @@ impl Bridge {
         if plan.effort.is_some() {
             for arg in &self.cfg.options.effort_args {
                 args.push(expand(arg, &vars)?);
+            }
+        }
+        // No MCP server of the host's reaches a call that named none.
+        if plan.mcp.is_empty() {
+            for arg in &self.cfg.options.no_mcp_args {
+                let arg = expand(arg, &vars)?;
+                if !args.contains(&arg) {
+                    args.push(arg);
+                }
             }
         }
         // Every role of a review gets ACR's system prompt, the way its agent
@@ -3210,7 +3282,16 @@ impl Bridge {
         if let Some(key) = plan.cache_key.as_ref().filter(|_| kind.is_some()) {
             command.env(CACHE_KEY_ENV, key);
         }
-        if let Some(allowed) = &plan.allowed_tools {
+        // A pi review call is held to its tools, whatever a request to its
+        // model offers it: its own of the bridge's, when every role is given
+        // the same, or else the ones it names, and its MCP servers'.
+        let held = plan.allowed_tools.clone().or_else(|| {
+            plan.tools
+                .clone()
+                .filter(|t| !t.is_empty() && kind == Some(Kind::Pi))
+        });
+        if let Some(mut allowed) = held {
+            allowed.extend(named_mcp.iter().cloned());
             command.env(ALLOWED_TOOLS_ENV, allowed.join(","));
         }
         if let Some(effort) = plan.effort.as_ref().filter(|_| kind == Some(Kind::Pi)) {
@@ -5573,6 +5654,85 @@ mod tests {
         "#;
 
     #[test]
+    fn a_pi_review_call_gets_no_mcp_server_unless_it_names_one_and_is_held_to_its_tools() {
+        let rig = Rig::new();
+        let script = r#"for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'allowed=%s\n' "$ACRBUS_ALLOWED_TOOLS""#;
+        let pi = format!(
+            "{PI_TOOLS}no_mcp_args = [\"--no-mcp\"]\nmcp_tool = \"mcp__{{SERVER}}__*\"\nmcp = [\"docs\"]\n"
+        );
+        let bridge = rig.start(rig.settings(script, &pi));
+        let review = |mcp: Option<Vec<String>>| {
+            with(RunOptions {
+                review: Some(true),
+                tools: Some(vec!["read".to_string()]),
+                mcp,
+                ..RunOptions::default()
+            })
+        };
+        // No server named: pi connects none, and the call is held to the
+        // tools it names, whatever a request to its model offers it.
+        let none = rig.reply_to(&rig.ask_with(review(None)));
+        // A server the bridge allows: it stays on, and only its tools join.
+        let docs = rig.reply_to(&rig.ask_with(review(Some(vec!["docs".into()]))));
+        // One it doesn't: refused.
+        let other = rig.ask_with(review(Some(vec!["slack".into()])));
+        let refused = rig.reply_to(&other);
+        // Not a review's call: still no MCP server, and nothing held.
+        let plain = rig.reply_to(&rig.ask_with(with(RunOptions::default())));
+        bridge.stop().unwrap();
+        assert!(none.contains("[--no-mcp]"), "{none}");
+        assert!(none.contains("[--tools]\n[read]"), "{none}");
+        assert!(none.trim_end().ends_with("allowed=read"), "{none}");
+        assert!(!docs.contains("[--no-mcp]"), "{docs}");
+        assert!(docs.contains("[--tools]\n[read,mcp__docs__*]"), "{docs}");
+        assert!(
+            docs.trim_end().ends_with("allowed=read,mcp__docs__*"),
+            "{docs}"
+        );
+        assert!(
+            refused.contains("MCP server \"slack\" isn't one this agent's config allows"),
+            "{refused}"
+        );
+        assert!(plain.contains("[--no-mcp]"), "{plain}");
+        assert!(plain.trim_end().ends_with("allowed="), "{plain}");
+        // A kind whose agent can't name servers refuses a request that does.
+        let table: toml::Value =
+            toml::from_str("kind = \"claude\"\nowner = \"o\"\ncommand = \"/bin/sh\"\nhome = \"/h\"\nworking_directory = \"/h\"\npath = \"/bin\"\n").unwrap();
+        let claude: Settings = with_defaults(table).unwrap().try_into().unwrap();
+        let asked = RunOptions {
+            mcp: Some(vec!["docs".into()]),
+            ..RunOptions::default()
+        };
+        assert!(
+            claude
+                .plan(Some(&asked))
+                .unwrap_err()
+                .contains("doesn't let a request name MCP servers")
+        );
+    }
+
+    #[test]
+    fn pi_and_omp_defaults_turn_off_what_a_review_call_didnt_ask_for() {
+        let pi: toml::Value = toml::from_str(Kind::Pi.defaults()).unwrap();
+        assert_eq!(pi["options"]["no_mcp_args"][0].as_str(), Some("--no-mcp"));
+        assert_eq!(pi["options"]["mcp_tool"].as_str(), Some("mcp__{SERVER}__*"));
+        let omp: toml::Value = toml::from_str(Kind::Omp.defaults()).unwrap();
+        assert_eq!(
+            omp["options"]["no_tools_args"][0].as_str(),
+            Some("--no-tools")
+        );
+        let claude: toml::Value = toml::from_str(Kind::Claude.defaults()).unwrap();
+        let args: Vec<&str> = claude["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(args.contains(&"--strict-mcp-config"));
+        assert!(!args.contains(&"--mcp-config"), "no server of the host's");
+    }
+
+    #[test]
     fn a_reviews_facts_cache_key_and_tool_limit_reach_pi_after_acrs_prompt() {
         let rig = Rig::new();
         // A facts file where the bus keeps its reviews: under its state
@@ -5754,7 +5914,10 @@ if (handlers.before_agent_start) {
 if (handlers.tool_call) {
   out.read = await handlers.tool_call({ toolName: "read" }) ?? null;
   out.bash = await handlers.tool_call({ toolName: "bash" }) ?? null;
+  out.hosts = await handlers.tool_call({ toolName: "sk_context-slack_query" }) ?? null;
+  out.served = await handlers.tool_call({ toolName: "mcp__docs__search" }) ?? null;
 }
+out.extra = headers["x-gateway-tools"] ?? null;
 console.log(JSON.stringify(out));
 "#,
         )
@@ -5764,6 +5927,7 @@ console.log(JSON.stringify(out));
             c.arg(dir.join("check.mjs"))
                 .env_remove("ACRBUS_CACHE_KEY")
                 .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_REQUEST_HEADERS")
                 .env_remove("ACRBUS_EFFORT")
                 .env_remove("ACRBUS_TURNS");
             for (k, v) in env {
@@ -5776,9 +5940,13 @@ console.log(JSON.stringify(out));
         };
         let (all, said) = run(&[
             ("ACRBUS_CACHE_KEY", "acr-r1-0a1b2c"),
-            ("ACRBUS_ALLOWED_TOOLS", "read,grep"),
+            ("ACRBUS_ALLOWED_TOOLS", "read,grep,mcp__docs__*"),
             ("ACRBUS_EFFORT", "medium"),
             ("ACRBUS_TURNS", "1"),
+            (
+                "ACRBUS_REQUEST_HEADERS",
+                "x-gateway-tools=none\nnot a header line",
+            ),
         ]);
         // The key, as the provider's header and as the one a gateway that
         // forwards only x-bf-eh- headers passes on.
@@ -5848,9 +6016,26 @@ console.log(JSON.stringify(out));
         assert_eq!(all["bash"]["block"], true);
         let why = all["bash"]["reason"].as_str().unwrap();
         assert!(
-            why.contains("may not use bash") && why.contains("read, grep"),
+            why.contains("Review calls can only use their binding's tools, and bash isn't one")
+                && why.contains("read, grep, mcp__docs__*"),
             "{why}"
         );
+        // A tool nobody named, such as one a gateway added to the request
+        // or one the model made up, is refused the same way, and said; a
+        // server the binding opted in to isn't.
+        assert_eq!(all["hosts"]["block"], true);
+        assert_eq!(all["served"], serde_json::Value::Null);
+        assert!(
+            said.contains(
+                "acrbus tools: refused sk_context-slack_query: not one of this call's tools"
+            ),
+            "{said}"
+        );
+        assert_eq!(said.matches("acrbus tools: refused").count(), 2, "{said}");
+        // The request headers it was given go on every request, and a line
+        // that isn't one is skipped, and said.
+        assert_eq!(all["extra"], "none");
+        assert!(said.contains("acrbus headers: skipped a line"), "{said}");
         // A level pi kept says nothing.
         let (_, kept) = run(&[("ACRBUS_EFFORT", "high")]);
         assert!(!kept.contains("acrbus effort"), "{kept}");
@@ -5883,7 +6068,8 @@ console.log(JSON.stringify(out));
         assert_eq!(
             none,
             serde_json::json!({"header": null, "gateway": null, "openai": null,
-                "anthropic": null, "theirs": null, "shaped": null, "shapedSystem": null})
+                "anthropic": null, "theirs": null, "shaped": null, "shapedSystem": null,
+                "extra": null})
         );
         assert!(quiet.is_empty(), "{quiet}");
         let _ = fs::remove_dir_all(&dir);
@@ -6564,6 +6750,31 @@ console.log(JSON.stringify({
             "SESSION_DIR",
         );
         assert!(toml::from_str::<Settings>("owner = 1").is_err());
+    }
+
+    #[test]
+    fn only_a_pi_bridge_holds_a_call_to_some_of_its_tools() {
+        let rig = Rig::new();
+        let paths = Paths {
+            state: rig.dir.clone(),
+            config: rig.dir.join("config.toml"),
+        };
+        let home = rig.dir.join("home");
+        let table: String = [("pi-r", "pi"), ("claude-r", "claude"), ("omp-r", "omp")]
+            .iter()
+            .map(|(name, kind)| {
+                format!(
+                    "[bridges.{name}]\nkind = \"{kind}\"\nmodel = \"m\"\nowner = \"o\"\ncommand = \"/bin/sh\"\n\
+                     home = \"{h}\"\nworking_directory = \"{h}\"\npath = \"/bin\"\n\n",
+                    h = home.display()
+                )
+            })
+            .collect();
+        fs::write(&paths.config, table).unwrap();
+        assert!(holds_tools(&paths, "pi-r"));
+        assert!(!holds_tools(&paths, "claude-r"));
+        assert!(!holds_tools(&paths, "omp-r"));
+        assert!(!holds_tools(&paths, "none"));
     }
 
     #[test]

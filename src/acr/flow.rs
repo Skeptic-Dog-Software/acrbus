@@ -486,6 +486,11 @@ pub struct Usage {
     /// binding, "hard" on the Orchestrator's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// The tools its model asked for that its binding doesn't name, and how
+    /// often, whether or not they ran: one a gateway added to the request,
+    /// or one the model made up. Said as it answers, and in the report.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unnamed_tools: BTreeMap<String, u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -574,6 +579,10 @@ pub struct Run {
     /// What each steelman between rounds did, in order.
     #[serde(default)]
     pub steelmans: Vec<Steelman>,
+    /// The briefs the session that fixed gave for the round after its fix,
+    /// outside a review to convergence, where a steelman's carry them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_briefs: Option<FixBriefs>,
     /// Defects a person reported the reviewers missed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<Reported>,
@@ -899,6 +908,14 @@ pub struct Steelman {
     pub declined: Vec<roles::Declined>,
 }
 
+/// A fixing session's briefs for the round after its fix, by lens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixBriefs {
+    /// The round they brief.
+    pub round: u32,
+    pub briefs: BTreeMap<String, String>,
+}
+
 /// What a steelman's fixes changed: the round whose blockers they fixed,
 /// and the files. The diff is kept beside the round's own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1052,8 +1069,22 @@ impl Answered {
             tool_calls: counted.tool_calls,
             restart: None,
             route: None,
+            unnamed_tools: BTreeMap::new(),
         }
     }
+}
+
+/// The tools in `used` that `binding` doesn't name, with how often each was
+/// asked for.
+pub fn unnamed_tools(binding: &Binding, used: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    binding
+        .unnamed(used.keys())
+        .into_iter()
+        .map(|name| {
+            let n = used.get(&name).copied().unwrap_or_default();
+            (name, n)
+        })
+        .collect()
 }
 
 fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usage {
@@ -1095,6 +1126,11 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         tool_calls: 0,
         restart: None,
         route: None,
+        unnamed_tools: answer
+            .usage
+            .as_ref()
+            .map(|u| unnamed_tools(call.binding, &u.tools))
+            .unwrap_or_default(),
     };
     match &answer.usage {
         Some(counted) => {
@@ -2291,6 +2327,7 @@ pub fn start(
         description: s.description.clone(),
         converge: s.converge,
         steelmans: Vec::new(),
+        fix_briefs: None,
         fix: None,
         sweep: false,
         reported: Vec::new(),
@@ -2536,6 +2573,12 @@ fn attack(
             .last()
             .filter(|m| m.round + 1 == run.round)
             .map(|m| m.briefs.clone())
+            .or_else(|| {
+                run.fix_briefs
+                    .as_ref()
+                    .filter(|b| b.round == run.round)
+                    .map(|b| b.briefs.clone())
+            })
             .unwrap_or_default()
     };
     let unbriefed: Vec<String> = open
@@ -5246,6 +5289,10 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     if let Some(round) = &gate_done {
         gate_text.push_str(&gate_report(round));
     }
+    // The gate runs before this round's facts exist, since they carry its
+    // results: its calls get none, rather than the last round's facts and
+    // cache key, which describe the change before its fix.
+    caller.share(None);
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
         gate_done.is_none()
             && cfg.stages.contains(&Kind::Gate)
@@ -6877,6 +6924,19 @@ pub fn fixed_by_session(
                 .unwrap_or_default()
         );
     }
+    // A session that says it fixed, with the working tree as it was when
+    // the fixes were asked for, did no work: refused, never taken for a fix.
+    if let Some(before) = run.fixing.as_ref().and_then(|f| f.from.as_deref())
+        && caller.snapshot(&run.repo).as_deref() == Some(before)
+    {
+        let line = "the session that ran the review: did no work: it said the fixes are in, but \
+                    the working tree is as it was when they were asked for";
+        caller.say(line);
+        bail!(
+            "{line}. Fold them into the working tree, then resume with --fixed again, or end \
+             the review with --stop"
+        );
+    }
     let folded = to_fix(run);
     let done = "fixed by the session that ran the review".to_string();
     for (id, _) in &folded {
@@ -6918,6 +6978,12 @@ pub fn fixed_by_session(
         if reported {
             reopen_all(run);
         }
+        // Its briefs go to the next round's reviewers, as a steelman's do
+        // in a review to convergence.
+        run.fix_briefs = (!briefs.is_empty()).then(|| FixBriefs {
+            round: run.round + 1,
+            briefs,
+        });
     }
     run.round += 1;
     blast_radius(run, s, caller);
@@ -13886,6 +13952,93 @@ lenses:
         fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
         assert!(run.partial_fix.is_none());
         assert_eq!(run.stage, Stage::Review);
+    }
+
+    #[test]
+    fn a_tool_a_calls_model_asked_for_that_its_binding_doesnt_name_is_recorded_and_reported() {
+        let cfg = plain("exception", 3, 1);
+        let reviewer = cfg.binding(Role::Reviewer, None).unwrap();
+        let own = reviewer.tools.clone().unwrap()[0].clone();
+        let mut fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
+        fake.usage = Some(RunUsage {
+            calls: 2,
+            input_tokens: 10,
+            output_tokens: 10,
+            tools: [(own, 3), ("sk_context-slack_query".to_string(), 1)].into(),
+            ..RunUsage::default()
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let reviewers: Vec<&Usage> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Reviewer)
+            .collect();
+        assert!(!reviewers.is_empty());
+        for u in &reviewers {
+            assert_eq!(
+                u.unnamed_tools,
+                [("sk_context-slack_query".to_string(), 1)].into(),
+                "{:?}",
+                u.label
+            );
+        }
+        let listed = super::super::report::unnamed_tools(&run.usage);
+        assert!(listed.len() >= reviewers.len());
+        assert!(
+            listed[0].line().contains(
+                "asked for tool(s) its binding doesn't name: sk_context-slack_query (1×)"
+            ),
+            "{}",
+            listed[0].line()
+        );
+    }
+
+    #[test]
+    fn a_fixing_sessions_brief_reaches_the_next_rounds_reviewers() {
+        let cfg = plain("exception", 3, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        let reload = |_| Ok(c.clone());
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        assert!(!run.converge);
+        let briefs = BTreeMap::from([(
+            "alpha".to_string(),
+            "Start at the new lock in a.src.".to_string(),
+        )]);
+        fixed_by_session(&mut run, &s, &fake, briefs).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(alpha.len() >= 2, "{}", alpha.len());
+        assert!(!alpha[0].contains("Start at the new lock"));
+        assert!(
+            alpha
+                .last()
+                .unwrap()
+                .contains("Start at the new lock in a.src."),
+            "round 2 gets the fixing session's brief"
+        );
+    }
+
+    #[test]
+    fn a_session_that_says_it_fixed_with_the_tree_unchanged_did_no_work() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.still = true;
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap_err();
+        assert!(format!("{e:#}").contains("did no work"), "{e:#}");
+        assert!(said(&fake).contains("did no work: it said the fixes are in"));
+        // Still waiting for the fixes, in the same round.
+        assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
     }
 
     /// What a fix changed: the file its blocker points at, a rebuilt

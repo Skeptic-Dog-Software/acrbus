@@ -20,6 +20,9 @@ use crate::proto::{RunUsage, TurnUsage};
 const MOST_FILES: usize = 1000;
 /// The most files a run says it read.
 const MOST_OPENED: usize = 500;
+/// The most tools a run's usage names, and the longest name it keeps.
+const MOST_TOOL_NAMES: usize = 200;
+const MOST_TOOL_NAME: usize = 120;
 
 /// `[bridges.<agent>.usage]`: which files under a run's session directory
 /// hold the agent's record, one JSON object a line, and where in each line
@@ -275,6 +278,28 @@ impl UsageFrom {
             .count() as u64
     }
 
+    /// The tools a counted line's tool calls name, each once per call.
+    fn tool_names_in(&self, record: &Value) -> Vec<String> {
+        let Some(o) = &self.opened else {
+            return Vec::new();
+        };
+        let Some(items) = at(record, &o.items).and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter(|item| {
+                o.when.iter().all(|(path, want)| {
+                    at(item, path)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v == want)
+                })
+            })
+            .filter_map(|item| at(item, &o.name).and_then(Value::as_str))
+            .map(|name| name.chars().take(MOST_TOOL_NAME).collect())
+            .collect()
+    }
+
     /// One call's tokens.
     fn turn(&self, record: &Value) -> TurnUsage {
         let tokens = |path: &Option<String>| -> u64 {
@@ -301,6 +326,11 @@ impl UsageFrom {
         };
         usage.calls += 1;
         usage.tool_calls += self.tool_calls_in(record);
+        for name in self.tool_names_in(record) {
+            if usage.tools.len() < MOST_TOOL_NAMES || usage.tools.contains_key(&name) {
+                *usage.tools.entry(name).or_default() += 1;
+            }
+        }
         let dollars = |path: &Option<String>| {
             path.as_deref()
                 .and_then(|p| at(record, p))
@@ -451,6 +481,8 @@ mod tests {
             u.counts_tools,
             "its tool calls are counted, so 0 would mean none"
         );
+        // And by name, each as often as it was asked for.
+        assert_eq!(u.tools, [("read".to_string(), 6)].into());
         assert!((u.usd_input.unwrap() - 4300.0 * 1e-6).abs() < 1e-12);
         assert!((u.usd_cache_read.unwrap() - 2000.0 * 1e-7).abs() < 1e-12);
         // A new file is a new session: its first turn has no last one.

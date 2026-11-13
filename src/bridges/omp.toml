@@ -14,6 +14,10 @@ max_concurrent = 3
 max_timeout_secs = 14400
 tools = ["read", "grep", "glob", "bash", "edit", "write"]
 tools_args = ["--tools", "{TOOLS}"]
+# For a call with no tools at all, such as the Sizer's first look. omp has
+# no flag that turns off MCP (as of omp 18.12), so its MCP servers are
+# whatever its config in the bridge's home names.
+no_tools_args = ["--no-tools"]
 efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 effort_args = ["--thinking", "{EFFORT}"]
 workdirs = []
