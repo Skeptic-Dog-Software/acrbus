@@ -27,6 +27,13 @@
 //   the harness, never a review's: one less block every turn sends again.
 //   Only that block goes, and only when it reads as pi wrote it; the tools,
 //   their rules and everything else stay.
+// - ACRBUS_RELAY_TOKENS: past this many prompt tokens in one turn that goes
+//   on to call tools, the call hands off. It's told to stop and answer with
+//   everything it would report so far, what it has checked and what's left;
+//   its tools are refused from then on; and its answer is marked, so acrbus
+//   starts a fresh session from the handoff instead of taking it for a
+//   finished review. A turn that calls no tools is the answer itself, and
+//   never hands off.
 
 // The headers the key goes in: the provider's own, and the same through a
 // gateway that forwards only what's prefixed for it.
@@ -90,6 +97,38 @@ function applied(headers) {
 // paths. Anything else in a <docs> block is left alone.
 const PI_DOCS = /\n*<docs>\nPi documentation \(read only when the user asks about the harness itself[\s\S]*?\n<\/docs>/;
 
+// What marks a handoff's answer, as its first line, for acrbus to read.
+const HANDOFF_MARK = "ACRBUS-HANDOFF";
+// What a call past its size is told.
+const HANDOFF =
+  "You've used most of the room one session has, so this session ends here, and a fresh one " +
+  "carries on from what you hand it. Stop investigating, and don't call any more tools. " +
+  "Answer now with only the JSON your instructions describe, holding everything your answer " +
+  "would hold so far, in full, exactly as you'd report it, and one more field: " +
+  '"handoff": {"checked": "<what you have checked, specifically: the files, functions, paths ' +
+  'and claims>", "left": "<what is left to check, and where you were going next>"}.';
+
+// One model call's figures, from pi's own usage: what the turn log says,
+// and the size a relay checks, read once.
+function figures(usage) {
+  const fresh = count(usage.input);
+  const cached = count(usage.cacheRead);
+  const written = count(usage.cacheWrite);
+  return { fresh, cached, written, out: count(usage.output), prompt: fresh + cached + written };
+}
+
+// An assistant message with the handoff mark ahead of its text.
+function marked(message) {
+  const content = Array.isArray(message.content) ? message.content : [];
+  const at = content.findIndex((b) => b && b.type === "text");
+  if (at >= 0 && String(content[at].text ?? "").startsWith(HANDOFF_MARK)) return message;
+  const next =
+    at >= 0
+      ? content.map((b, i) => (i === at ? { ...b, text: `${HANDOFF_MARK}\n${b.text ?? ""}` } : b))
+      : [...content, { type: "text", text: `${HANDOFF_MARK}\n` }];
+  return { ...message, content: next };
+}
+
 // An OpenAI chat completions request, which takes `user`: by the model's API
 // when pi says, otherwise by its shape, so no other API's request gets a
 // field it would refuse.
@@ -139,20 +178,24 @@ export default function acrbus(pi) {
       }
     });
   }
-  if (turns) {
+  const relayAt = Number.parseInt(process.env.ACRBUS_RELAY_TOKENS ?? "", 10);
+  const relays = Number.isFinite(relayAt) && relayAt > 0;
+  // The latest model call's prompt tokens, from the same reading the turn
+  // log gives: what a relay checks its size against.
+  let lastPrompt = 0;
+  if (turns || relays) {
     let turn = 0;
     pi.on("message_end", (event) => {
       const message = event?.message;
       if (!message || message.role !== "assistant" || !message.usage) return undefined;
       turn += 1;
-      const usage = message.usage;
-      const fresh = count(usage.input);
-      const cached = count(usage.cacheRead);
-      const written = count(usage.cacheWrite);
-      const out = count(usage.output);
-      console.error(
-        `acrbus cache: turn ${turn}: ${cached} of ${fresh + cached + written} prompt tokens read from the cache (${fresh} fresh, ${written} written, ${out} out)`,
-      );
+      const f = figures(message.usage);
+      lastPrompt = f.prompt;
+      if (turns) {
+        console.error(
+          `acrbus cache: turn ${turn}: ${f.cached} of ${f.prompt} prompt tokens read from the cache (${f.fresh} fresh, ${f.written} written, ${f.out} out)`,
+        );
+      }
       return undefined;
     });
   }
@@ -187,6 +230,39 @@ export default function acrbus(pi) {
         block: true,
         reason: `This role may not use ${event.toolName}. The tools it may use: ${may}.`,
       };
+    });
+  }
+  if (relays) {
+    let relaying = false;
+    pi.on("turn_end", (event) => {
+      if (relaying) return undefined;
+      // A turn that called no tools is the answer: nothing to hand off.
+      if (!Array.isArray(event?.toolResults) || event.toolResults.length === 0) return undefined;
+      // The turn's own model call, as the turn log read it.
+      const read = lastPrompt;
+      if (read < relayAt) return undefined;
+      relaying = true;
+      console.error(
+        `acrbus relay: turn ${event.turnIndex ?? "?"} read ${read} prompt tokens, past ${relayAt}: handing off`,
+      );
+      return {
+        entries: [
+          ...(Array.isArray(event.entries) ? event.entries : []),
+          { type: "custom_message", customType: "acrbus-relay", content: HANDOFF, display: false },
+        ],
+        continue: true,
+      };
+    });
+    pi.on("tool_call", async () => {
+      if (!relaying) return undefined;
+      return {
+        block: true,
+        reason: "This session is out of room: write your handoff now, as the last message asks.",
+      };
+    });
+    pi.on("message_end", (event) => {
+      if (!relaying || event?.message?.role !== "assistant") return undefined;
+      return { message: marked(event.message) };
     });
   }
 }

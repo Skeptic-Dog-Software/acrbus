@@ -190,6 +190,12 @@ pub enum AcrCmd {
         /// verdicts against the per-dimension ones and the key's.
         #[arg(long)]
         per_finding: bool,
+        /// Also try a first-pass Judge on this binding, as
+        /// `savings.first_pass_judge` would: its verdicts where it settles a
+        /// dimension, the Judge's where it sends it on, set against the key's.
+        /// Left out, the repository's `savings.first_pass_judge`, if any.
+        #[arg(long, value_name = "BINDING")]
+        first_pass: Option<String>,
     },
     /// Configure a repository's review from what's in it. The configurer, a
     /// strong model, reviews the whole repository, in a clone of its own, and
@@ -638,6 +644,9 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
         // its bridge allows, unless its binding caps it, and the bridge
         // ends one that stalls.
         timeout,
+        // A reviewer or Judge that hands off past a size: a fresh session
+        // carries on from its handoff.
+        relay_tokens: call.relay_tokens,
         ..options_for(call.binding)
     };
     // No tools at all: it answers from what it's given.
@@ -720,6 +729,7 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         facts: None,
         cache_key: None,
         allowed_tools: None,
+        relay_tokens: None,
     }
 }
 
@@ -1357,6 +1367,8 @@ struct BridgeCaller {
     /// has been answered: to tell when a fan-out's first has filled the
     /// prompt cache.
     sent: std::sync::Mutex<std::collections::HashMap<String, (String, String, bool)>>,
+    /// Agents asked to relay that can't be steered mid-call, said once each.
+    unrelayed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1393,6 +1405,7 @@ impl BridgeCaller {
             calls_file: std::sync::Mutex::new(None),
             shared: std::sync::Mutex::new(None),
             sent: Default::default(),
+            unrelayed: Default::default(),
         })
     }
 
@@ -1751,6 +1764,24 @@ impl BridgeCaller {
                 // The bridge made it for this reply alone.
                 if let Some(a) = whole {
                     self.noted(&a.sha256);
+                }
+                // Asked to relay, on an agent its bridge can't steer: the
+                // call ran whole, and a person following the review is told.
+                if call.relay_tokens.is_some()
+                    && result
+                        .and_then(|r| r.applied.as_ref())
+                        .is_some_and(|a| a.relay_tokens.is_none())
+                    && self
+                        .unrelayed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(b.agent.clone())
+                {
+                    self.progress.line(&format!(
+                        "{}: its agent can't be steered mid-call, so its calls don't relay and \
+                         run whole",
+                        b.agent
+                    ));
                 }
                 Ok(Answer {
                     text,
@@ -2235,6 +2266,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
+    }
+    for x in &summary.sessions {
+        eprintln!("{APP_NAME}: {}", x.line());
     }
     for p in &run.prefixes {
         eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
@@ -2898,11 +2932,16 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
             let unreported = report::writes_unreported(&run.usage);
+            let sessions = report::sessions(&run.usage);
             if json {
+                // Each session of a call broken up, as its own call.
+                let parts: Vec<&flow::Usage> =
+                    run.usage.iter().filter(|u| u.part.is_some()).collect();
                 let out = serde_json::json!({
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
+                    "sessions": sessions, "session_calls": parts,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -2920,6 +2959,12 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 if unreported {
                     println!("{}", report::WRITES_UNREPORTED);
+                }
+                for x in &sessions {
+                    println!("{}", x.line());
+                }
+                for line in report::session_lines(&run.usage) {
+                    println!("{line}");
                 }
                 if run.usage.iter().any(|u| u.label.is_none()) {
                     println!(
@@ -3201,9 +3246,10 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             keys,
             out,
             per_finding,
+            first_pass,
         } => {
             for key in keys {
-                let result = calibrate(paths, &key, per_finding)?;
+                let result = calibrate(paths, &key, per_finding, first_pass.as_deref())?;
                 println!(
                     "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
                     result["key"].as_str().unwrap_or_default(),
@@ -3224,6 +3270,22 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                         each["unrated"],
                         each["same_as_per_dimension"],
                         each["compared"],
+                    );
+                }
+                if let Some(each) = result.get("first_pass") {
+                    println!(
+                        "  with a first pass on {}: blockers agreed {}, missed {}, overrated {}; \
+                         non-blockers agreed {}; unrated {}; it settled {} of {} dimensions, \
+                         and sent {} on to the Judge",
+                        each["binding"].as_str().unwrap_or_default(),
+                        each["agreed_blockers"],
+                        each["missed_blockers"],
+                        each["overrated"],
+                        each["agreed_non_blockers"],
+                        each["unrated"],
+                        each["settled"],
+                        each["dimensions"],
+                        each["sent_on"],
                     );
                 }
                 if let Some(out) = &out {
@@ -3493,6 +3555,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: false,
             no_tools: false,
+            relay_tokens: None,
             repo: &tree,
             label: format!(
                 "the check: {name}{place}",
@@ -3568,6 +3631,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: true,
             no_tools: false,
+            relay_tokens: None,
             repo: &s.tree,
             label: "the check: the steelman".to_string(),
         });
@@ -3995,7 +4059,12 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     Ok(())
 }
 
-fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_json::Value> {
+fn calibrate(
+    paths: &Paths,
+    key_path: &Path,
+    per_finding: bool,
+    first_pass: Option<&str>,
+) -> Result<serde_json::Value> {
     use serde_json::json;
     let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
     if key.findings.is_empty() {
@@ -4047,6 +4116,21 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
     dimensions.sort();
     dimensions.dedup();
     let judge_name = cfg.binding_name(Role::Judge, None)?;
+    // The first pass to try, if any: named here, or the repository's.
+    let first_name = first_pass
+        .map(str::to_string)
+        .or_else(|| cfg.savings.first_pass_judge.clone());
+    let first = match &first_name {
+        Some(name) => Some((
+            name.as_str(),
+            cfg.allowed_bindings.get(name).with_context(|| {
+                format!("--first-pass: binding {name} isn't in your allowed_bindings")
+            })?,
+        )),
+        None => None,
+    };
+    let mut cascade: Vec<Option<(bool, String)>> = vec![None; key.findings.len()];
+    let (mut settled, mut sent_on, mut dimension_count) = (0usize, 0usize, 0usize);
     let keep_tags = "\n\nKeep each finding's title as it's given, with its [K..] tag, and judge \
                      each on its own: don't merge them.";
     let raw = |i: usize, f: &trial::KeyFinding| roles::Raw {
@@ -4128,10 +4212,51 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
             artifact: Some(&artifact),
             writes: false,
             no_tools: false,
+            relay_tokens: None,
             repo: &s.tree,
             label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
         rule(&lens, roles::read_ratings(&answer.text)?, None, &mut judged);
+        dimension_count += 1;
+        if let Some((name, binding)) = first {
+            // The first pass on the same prompt, with its note. Where it
+            // settles the dimension its verdicts stand; where it sends it on,
+            // the Judge's, from the call above, stand.
+            let first_prompt = format!("{prompt}{}", roles::FIRST_PASS_NOTE);
+            let ratings = caller
+                .call(&Call {
+                    role: Role::Judge,
+                    binding_name: name,
+                    binding,
+                    prompt: &first_prompt,
+                    artifact: Some(&artifact),
+                    writes: false,
+                    no_tools: false,
+                    relay_tokens: None,
+                    repo: &s.tree,
+                    label: format!("{}: the first-pass Judge, on the key's findings", lens.id),
+                })
+                .and_then(|a| roles::read_ratings(&a.text));
+            match ratings {
+                Ok(ratings)
+                    if !ratings
+                        .iter()
+                        .any(|r| flow::first_pass_escalates(&cfg, &lens, r, &lines)) =>
+                {
+                    settled += 1;
+                    rule(&lens, ratings, None, &mut cascade);
+                }
+                other => {
+                    if let Err(e) = other {
+                        eprintln!("{APP_NAME}: {}'s first pass: {e:#}", lens.id);
+                    }
+                    sent_on += 1;
+                    for (i, _) in &mine {
+                        cascade[*i] = judged[*i].clone();
+                    }
+                }
+            }
+        }
         if !per_finding {
             continue;
         }
@@ -4152,6 +4277,7 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
                             artifact: Some(artifact),
                             writes: false,
                             no_tools: false,
+                            relay_tokens: None,
                             repo: tree,
                             label: format!("{}: the Judge, on key finding {i}", lens.id),
                         });
@@ -4223,6 +4349,22 @@ fn calibrate(paths: &Paths, key_path: &Path, per_finding: bool) -> Result<serde_
                 .collect::<Vec<_>>()
         );
         result["per_finding"] = alone;
+    }
+    if let Some(name) = &first_name {
+        let mut with = tally(&cascade);
+        with["binding"] = json!(name);
+        with["dimensions"] = json!(dimension_count);
+        with["settled"] = json!(settled);
+        with["sent_on"] = json!(sent_on);
+        with["differ_from_judge"] = json!(
+            key.findings
+                .iter()
+                .zip(judged.iter().zip(&cascade))
+                .filter(|(_, (a, b))| matches!((a, b), (Some(a), Some(b)) if a.0 != b.0))
+                .map(|(f, _)| f.id.clone())
+                .collect::<Vec<_>>()
+        );
+        result["first_pass"] = with;
     }
     Ok(result)
 }
@@ -5271,6 +5413,7 @@ mod tests {
             artifact: None,
             writes: true,
             no_tools: false,
+            relay_tokens: None,
             repo: Path::new("."),
             label: "the Orchestrator, fixing".into(),
         };
@@ -5439,9 +5582,23 @@ mod tests {
             artifact: None,
             writes: false,
             no_tools,
+            relay_tokens: None,
             repo: &repo,
             label: "x".into(),
         };
+        // A call that relays asks its bridge to hand off past its size.
+        let relaying = flow::Call {
+            relay_tokens: Some(90_000),
+            ..call(Role::Reviewer, false)
+        };
+        assert_eq!(
+            call_options(&relaying, false, Some(60)).relay_tokens,
+            Some(90_000)
+        );
+        assert_eq!(
+            call_options(&call(Role::Reviewer, false), false, Some(60)).relay_tokens,
+            None
+        );
         for role in [Role::Judge, Role::Reviewer, Role::Orchestrator, Role::Sizer] {
             let options = call_options(&call(role, false), false, Some(60));
             assert_eq!(options.tools, binding.tools, "{role:?}");
@@ -5492,6 +5649,7 @@ mod tests {
             artifact: None,
             writes,
             no_tools,
+            relay_tokens: None,
             repo: &repo,
             label: "x".into(),
         };
@@ -5576,6 +5734,7 @@ mod tests {
                 artifact: *artifact,
                 writes: false,
                 no_tools: false,
+                relay_tokens: None,
                 repo: &repo,
                 label: label.to_string(),
             };

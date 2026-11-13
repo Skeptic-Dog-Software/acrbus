@@ -552,12 +552,194 @@ pub fn reformat_prompt(report: &str) -> String {
     )
 }
 
+/// What marks a handoff's answer: acrbus's pi extension puts it first, on a
+/// line of its own, once a session runs out of room.
+pub const HANDOFF_MARK: &str = "ACRBUS-HANDOFF";
+
+/// What a session that ran out of room says it has done and has left.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    #[serde(default)]
+    pub checked: String,
+    #[serde(default)]
+    pub left: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Handed {
+    handoff: Handoff,
+}
+
+/// A handoff, if the answer is one: marked as one, or carrying a `handoff`
+/// field. Its text without the mark, to read what it found. An answer
+/// marked as a handoff that can't be read is an error, never a finished
+/// review: a session that ran out of room and couldn't say what it had done
+/// left its lens unchecked.
+pub fn handoff_of(text: &str) -> Option<Result<(String, Handoff)>> {
+    let trimmed = text.trim_start();
+    let marked = trimmed.starts_with(HANDOFF_MARK);
+    let body = if marked {
+        trimmed[HANDOFF_MARK.len()..].trim_start()
+    } else {
+        text
+    };
+    match one_json_in::<Handed>(body) {
+        Ok(h) => Some(Ok((body.to_string(), h.handoff))),
+        Err(e) if marked => Some(Err(
+            e.context("the session ran out of room, and its handoff couldn't be read")
+        )),
+        Err(_) => None,
+    }
+}
+
+/// One thing an earlier session already has in its answer: what the next
+/// one is told, so it doesn't report it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Earlier {
+    pub title: String,
+    pub file: Option<String>,
+    pub line: Option<u64>,
+}
+
+/// What a handoff's answer already holds, read loosely from its findings:
+/// a reviewer's or a Judge's, whichever it is.
+pub fn earlier_of(text: &str) -> Vec<Earlier> {
+    #[derive(Deserialize)]
+    struct Item {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        file: Option<String>,
+        #[serde(default, deserialize_with = "lenient::line")]
+        line: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct Items {
+        #[serde(default)]
+        findings: Vec<Item>,
+        #[serde(default)]
+        suspects: Vec<Item>,
+    }
+    one_json_in::<Items>(text)
+        .map(|i| {
+            i.findings
+                .into_iter()
+                .chain(i.suspects)
+                .filter(|f| !f.title.trim().is_empty())
+                .map(|f| Earlier {
+                    title: f.title.trim().to_string(),
+                    file: f.file,
+                    line: f.line,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a fresh session is told, after the call's own brief, so that every
+/// session shares the brief's cached prefix: what the earlier ones checked,
+/// what's left, and what they already found, not to be reported again.
+pub fn continuation(checked: &[String], left: &str, earlier: &[Earlier], session: u32) -> String {
+    let checked: String = checked
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("- Session {}: {}\n", i + 1, c.trim()))
+        .collect();
+    let found: String = if earlier.is_empty() {
+        "- Nothing yet.\n".to_string()
+    } else {
+        earlier
+            .iter()
+            .map(|e| {
+                let at = match (&e.file, e.line) {
+                    (Some(f), Some(l)) => format!(" ({f}:{l})"),
+                    (Some(f), None) => format!(" ({f})"),
+                    _ => String::new(),
+                };
+                format!("- {}{at}\n", e.title)
+            })
+            .collect()
+    };
+    format!(
+        "\n\n# Carrying on from an earlier session\n\n\
+         This call's earlier session ran out of room and handed off to you: you are session \
+         {session}. What it has in its answer is kept, and reported with yours, so don't report \
+         it again: answer with only what you add from here, in the same JSON.\n\n\
+         What the earlier sessions checked:\n{checked}\n\
+         What's left to check, and where the last one was going next: {left}\n\n\
+         What they already have, not to repeat:\n{found}",
+        left = left.trim(),
+    )
+}
+
+/// A defect a scout suspects, to be confirmed or ruled out on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suspect {
+    pub title: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default, deserialize_with = "lenient::line")]
+    pub line: Option<u64>,
+    /// What's suspected.
+    #[serde(default)]
+    pub claim: String,
+    /// How to confirm or rule it out.
+    #[serde(default)]
+    pub check: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Scouted {
+    suspects: Vec<Suspect>,
+}
+
+pub fn read_suspects(text: &str) -> Result<Vec<Suspect>> {
+    Ok(one_json_in::<Scouted>(text)?.suspects)
+}
+
+/// A scout's session, after a reviewer's own brief, so it shares that
+/// brief's cached prefix: list what's suspect, verify nothing.
+pub fn scout_part() -> &'static str {
+    "\n\n# This session: scout\n\n\
+     This lens's review is in two steps, and this session is the first. Don't verify anything \
+     here. Explore the change for your lens, and list everything you suspect is wrong, each \
+     with how to confirm or rule it out. Each suspicion is then checked in a short session of \
+     its own. List what you suspect even when you're unsure: a suspicion that doesn't hold \
+     costs one short check, and one left out is a defect missed.\n\n\
+     Instead of the findings JSON above, answer with only JSON: {\"suspects\": [{\"title\": \
+     \"<one line>\", \"file\": \"<path>\", \"line\": <number>, \"claim\": \"<what you suspect \
+     is wrong>\", \"check\": \"<how to confirm or rule it out>\"}]}. If you suspect nothing, \
+     say so with an empty list."
+}
+
+/// One suspicion's session, after a reviewer's own brief: confirm it or
+/// rule it out, with evidence, and look at nothing else.
+pub fn verify_part(s: &Suspect) -> String {
+    let at = match (&s.file, s.line) {
+        (Some(f), Some(l)) => format!("{f}:{l}"),
+        (Some(f), None) => f.clone(),
+        _ => "not given".to_string(),
+    };
+    format!(
+        "\n\n# This session: verify one suspicion\n\n\
+         This lens's review is in two steps, and this session is the second, for one suspicion a \
+         scout raised. Confirm it or rule it out, with evidence: read and run what you need, but \
+         look for nothing else. What the scout says is a lead, not a finding.\n\n\
+         Title: {title}\nWhere: {at}\nWhat's suspected: {claim}\nHow to check: {check}\n\n\
+         If it holds, report it in the findings JSON above, with your evidence. If it doesn't, \
+         answer with an empty list.",
+        title = s.title.trim(),
+        claim = s.claim.trim(),
+        check = s.check.trim(),
+    )
+}
+
 pub fn read_findings(text: &str) -> Result<Vec<Raw>> {
     Ok(one_json_in::<Reviewed>(text)?.findings)
 }
 
 /// A judged finding, merged across a lens's reviewers.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rating {
     pub title: String,
     #[serde(default)]
@@ -630,6 +812,18 @@ pub struct Rating {
         deserialize_with = "lenient::flag"
     )]
     pub equivalent: bool,
+    /// The Judge can't rate it with confidence from what it can see. Only a
+    /// first-pass Judge is asked to say so: it sends the finding on to the
+    /// Judge's binding.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub unsure: bool,
+    /// Carried over from this round's ruling instead of judged again: see
+    /// `savings.reuse_rulings`. Never read from a Judge's answer.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<u32>,
+    /// The binding whose Judge ruled it. Never read from a Judge's answer.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub ruled_by: Option<String>,
 }
 
 fn yes() -> bool {
@@ -643,6 +837,15 @@ struct Judged {
 
 /// The hunks a Judge's findings point at, added to its brief to start from:
 /// fewer reads to find them, and nothing it can't still do.
+/// What a first-pass Judge adds to the Judge's own brief: to say which
+/// findings it can't rate with confidence, so they go on to the Judge's
+/// binding. It's asked of the first pass only, so the Judge's own brief, and
+/// the calibration made against it, stay as they are.
+pub const FIRST_PASS_NOTE: &str = "\n\nYou're the first pass: a fuller Judge rules after you on \
+     whatever you can't settle. For any finding you can't rate with confidence from what you can \
+     see, set \"unsure\": true on it, and rate it as best you can. Don't guess to avoid saying \
+     so.";
+
 pub fn judge_hunks(hunks: &str) -> String {
     format!(
         "\n# Where the findings point, to start from\n\nThe diff's hunks the findings above \
@@ -799,6 +1002,102 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
 
 pub fn read_ratings(text: &str) -> Result<Vec<Rating>> {
     Ok(one_json_in::<Judged>(text)?.findings)
+}
+
+/// The most of a fix's diff a focus note or the blast-radius check quotes:
+/// past it, the rest is said to be cut, and the whole change stays attached.
+pub const FIX_DIFF_MAX: usize = 24 * 1024;
+
+fn capped(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[... cut at {} KB; the rest of the fix is in the change itself]\n",
+        &text[..end],
+        max / 1024
+    )
+}
+
+/// Where to look first, after a fix: what it changed, and what could feel
+/// it. Said last in a reviewer's brief, after everything every reviewer
+/// shares, and as focus only: the whole change stays the reviewer's.
+pub fn focus_after_fix(round: u32, files: &[String], diff: &str, affects: &[String]) -> String {
+    let mut out = format!(
+        "\n\n## Since round {round}\n\nA fix changed {} since round {round}'s review. Look first \
+         at what it changed and at what it could affect, then review the whole change as \
+         usual: a fix for one defect can break something anywhere, and this note limits \
+         nothing you may read or check.\n\nFiles the fix changed: {}.\n",
+        if files.len() == 1 {
+            "1 file"
+        } else {
+            "these files"
+        },
+        files.join(", ")
+    );
+    if !affects.is_empty() {
+        out.push_str(&format!(
+            "\nWhat could feel it, from the change's map (references to what those files \
+             define, and the tests that name it): {}.\n",
+            affects.join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "\n```diff\n{}\n```\n",
+        capped(diff, FIX_DIFF_MAX).trim_end()
+    ));
+    out
+}
+
+/// One lens the blast-radius check is asked about.
+pub struct Candidate<'a> {
+    pub id: &'a str,
+    pub criteria: &'a str,
+}
+
+/// After a fix: for each lens that passed before it, could the fix affect
+/// what it reviews? Asked with no tools, and anything it can't tell is an
+/// attack.
+pub fn blast_radius_prompt(files: &[String], diff: &str, lenses: &[Candidate]) -> String {
+    let list: String = lenses
+        .iter()
+        .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
+        .collect();
+    format!(
+        "A review's lenses each attack a code change for one kind of defect. The lenses below \
+         all passed the change before a fix, and a fix has since changed it. For each lens, say \
+         whether the fix could affect what that lens looks for, so that it must attack the \
+         change again. Say false only when you can see that the fix can't touch that lens's \
+         concern, and give the reason in a sentence. If you can't tell, say true.\n\n\
+         Files the fix changed: {}.\n\n## Lenses\n\n{list}\n## The fix\n\n```diff\n{}\n```\n\n\
+         Answer with only JSON: {{\"lenses\": [{{\"lens\": \"<id>\", \"attack\": true, \
+         \"reason\": \"<why>\"}}]}}, one entry for each lens.",
+        files.join(", "),
+        capped(diff, FIX_DIFF_MAX).trim_end()
+    )
+}
+
+/// One lens's answer from the blast-radius check.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Blast {
+    pub lens: String,
+    #[serde(default = "yes", deserialize_with = "lenient::flag")]
+    pub attack: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlastAnswer {
+    lenses: Vec<Blast>,
+}
+
+pub fn read_blast(text: &str) -> Result<Vec<Blast>> {
+    Ok(json_in::<BlastAnswer>(text)?.lenses)
 }
 
 pub fn fix_prompt(blockers: &str) -> String {
@@ -1085,5 +1384,70 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         assert_eq!(read_ratings(ok).unwrap()[0].severity, Severity::High);
         let bad = r#"{"findings": [{"title": "t", "severity": "Spicy"}]}"#;
         assert!(read_ratings(bad).is_err());
+    }
+
+    #[test]
+    fn a_handoff_is_read_from_its_mark_or_its_field_and_a_bad_one_is_an_error() {
+        let body = r#"{"findings": [{"title": "half", "file": "a.go", "line": "3"}], "handoff": {"checked": "the parser", "left": "the writer"}}"#;
+        let (text, h) = handoff_of(&format!("{HANDOFF_MARK}\n{body}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, body);
+        assert_eq!(h.checked, "the parser");
+        assert_eq!(h.left, "the writer");
+        assert_eq!(
+            earlier_of(&text),
+            vec![Earlier {
+                title: "half".into(),
+                file: Some("a.go".into()),
+                line: Some(3)
+            }]
+        );
+        // Unmarked but with the field: a handoff all the same.
+        assert!(handoff_of(body).unwrap().is_ok());
+        // An answer: no handoff.
+        assert!(handoff_of(r#"{"findings": []}"#).is_none());
+        assert!(handoff_of("It all looks fine.").is_none());
+        // Marked, but unreadable: an error, never an answer.
+        let bad = handoff_of(&format!("{HANDOFF_MARK}\nI ran out of room.")).unwrap();
+        assert!(format!("{:#}", bad.unwrap_err()).contains("handoff couldn't be read"));
+        // A scout's suspects count as what it has, too.
+        let scout = r#"{"suspects": [{"title": "S", "file": "b.go"}], "handoff": {"checked": "c", "left": "l"}}"#;
+        assert_eq!(earlier_of(scout).len(), 1);
+    }
+
+    #[test]
+    fn a_fresh_session_is_told_what_was_checked_left_and_found_after_its_brief() {
+        let text = continuation(
+            &["the parser".into(), "the writer".into()],
+            "the flush, next its error path",
+            &[Earlier {
+                title: "lost write".into(),
+                file: Some("a.go".into()),
+                line: Some(9),
+            }],
+            3,
+        );
+        assert!(text.starts_with("\n\n# Carrying on from an earlier session"));
+        assert!(text.contains("you are session 3"));
+        assert!(text.contains("- Session 1: the parser\n- Session 2: the writer\n"));
+        assert!(text.contains("the flush, next its error path"));
+        assert!(text.contains("- lost write (a.go:9)"));
+        assert!(continuation(&[], "x", &[], 2).contains("- Nothing yet."));
+    }
+
+    #[test]
+    fn a_scout_lists_suspects_and_each_is_verified_from_its_own_brief() {
+        let found = read_suspects(
+            r#"{"suspects": [{"title": "S1", "file": "a.go", "line": 2, "claim": "c", "check": "k"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(found[0].title, "S1");
+        assert_eq!(found[0].line, Some(2));
+        assert!(read_suspects(r#"{"findings": []}"#).is_err());
+        assert!(scout_part().contains("\"suspects\""));
+        let v = verify_part(&found[0]);
+        assert!(v.contains("Title: S1\nWhere: a.go:2\nWhat's suspected: c\nHow to check: k"));
+        assert!(v.contains("findings JSON above"));
     }
 }

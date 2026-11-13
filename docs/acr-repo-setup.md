@@ -346,26 +346,151 @@ since by then it holds the change's context.
 - **Fewer turns.** A reviewer's cost is mostly what each turn reads again:
   everything before it. So the map carries what reviewers would otherwise
   spend turns to open. Each reviewer call's bridge says which files its
-  agent read; the review counts them per lens in a record kept for the
-  repository (`acr-learned/<name>.json` in the state folder), and each
-  round's facts carry the files this repository's reviewers keep opening,
-  whole, after the change's own files, most opened first, up to
-  `learned_bytes`, each one opened by at least two reviewer calls. Every
-  reviewer and Judge reads them again each turn, so a file pays only when
-  reviewers would open it early anyway: keep the budget small, and watch
-  turns and cache reads per reviewer when you change it. A file given once stays where it was for the rest of the
-  review, so the facts only grow at their end, and the next review of the
-  repository starts with what this one learned. Nothing is taken away: a
-  reviewer still opens what it likes, and its prompt asks it to read from
-  the facts first and to ask for several files in one turn. Trials don't
-  learn or use the record, so their arms stay blind. `learned: false` turns
-  it off. A pi bridge also leaves pi's pointer to its own documentation out
-  of a review's prompt, since pi says it's for questions about pi itself:
-  its kind sets `ACRBUS_DROP_PI_DOCS = "1"` in its `env`, and `"0"` keeps it.
+  agent read; the review counts them per lens, once per reviewer call
+  whichever of its sessions read them (a relay's legs, a scout and its
+  verifiers), in a record kept for the repository (`acr-learned/<name>.json`
+  in the state folder), and each round's facts carry the files this
+  repository's reviewers keep opening, whole, after the change's own files,
+  most opened first, up to `learned_bytes`, each one opened by at least two
+  reviewer calls. Every reviewer and Judge reads them again each turn, so a
+  file pays only when reviewers would open it early anyway: keep the budget
+  small, and watch turns and cache reads per reviewer when you change it. A
+  file given once stays where it was for the rest of the review, so the
+  facts only grow at their end, and the next review of the repository starts
+  with what this one learned. Nothing is taken away: a reviewer still opens
+  what it likes, and its prompt asks it to read from the facts first and to
+  ask for several files in one turn. Trials don't learn or use the record,
+  so their arms stay blind. `learned: false` turns it off. A pi bridge also
+  leaves pi's pointer to its own documentation out of a review's prompt,
+  since pi says it's for questions about pi itself: its kind sets
+  `ACRBUS_DROP_PI_DOCS = "1"` in its `env`, and `"0"` keeps it.
 - **Plan's estimate.** `acrbus acr plan` counts only the text the review
   sends and reads back. `costs.per_call` adds a measured average for each
   role, such as `reviewer: {input_tokens: 40000, output_tokens: 4000}`, to
   bring the estimate nearer the real use.
+
+## 5c. Savings: Judges and later rounds
+
+`savings` cuts what a review spends on its Judges and its later rounds.
+None of it takes anything from a reviewer or a Judge: every role keeps its
+tools and what it may read, and whatever a saving can't settle goes the way
+it would have gone without it.
+
+```yaml
+savings:
+  reuse_rulings: true        # the default
+  first_pass_judge: small    # off unless set; check it first, below
+  focus_after_fix: true      # off by default
+  blast_radius: true         # off by default
+```
+
+- **`reuse_rulings`** (default on). A Judge's ruling that didn't block (a
+  finding logged, or rejected) is kept. In a later round, a finding takes
+  it, with no Judge call, only when all of these hold: the same lens; the
+  same claim, by its title's words, as the Judge's or a reviewer's at that
+  place; within 3 lines of the same place; a file whose content no fix has
+  changed since; nothing else the ruling rested on changed (the lens's
+  text, the decided non-issues, the Judge's bindings, the rules); and the
+  rules as they stand still don't make it block. Anything short of that
+  goes to a Judge. A blocker's ruling is never kept: what a fix was meant
+  to settle is always judged again. The report marks each carried-over
+  ruling with the round it came from, and progress says so.
+- **`first_pass_judge`**: a binding, such as a cheaper model, that rules
+  first, with a note asking it to mark anything it isn't sure of. What it
+  would have block, rates Medium or above, calls a split or a values call,
+  states a fact the rules raise (a weak pin, a misleading claim, a blocker
+  by the lens's definition, a claimed fix, made worse), or marks unsure
+  goes on to the Judge's binding. The Judge rules fresh, from the very
+  prompt it would have had, never seeing the first pass's ruling. In
+  `per-lens` mode a lens goes on whole when any of its findings does; in
+  `per-finding` mode, each finding goes on alone. The report says which
+  binding ruled each finding.
+- **`focus_after_fix`**: after a fix, each lens's reviewers are told, last
+  in their brief, what the fix changed (its files and diff, cut at 24 KB)
+  and what could feel it (references to what those files define, and the
+  tests that name it, from the round's change map), as where to look
+  first. Their brief and the whole change are otherwise as before.
+- **`blast_radius`**: after a fix, one small call on the Sizer's binding,
+  with no tools, is asked whether each lens that passed before the fix
+  must attack again. A lens it says the fix can't touch, with a reason,
+  skips that round; one with blockers of its own, one that failed, and any
+  answer it can't give attack as before. A skipped lens is reported as
+  skipped, with the round and reason, never as passing the version it
+  skipped, and gets no lens label. In a review to convergence, the final
+  sweep still attacks it on the last version, so a skip saves the rounds
+  in between.
+
+**Check a first pass before you turn it on.** `acrbus acr judge-check
+<key>... --first-pass <binding>` rates each key's findings with the Judge
+alone and with the first pass in front of it, and prints both against the
+key: blockers agreed, missed and overrated, how many dimensions the first
+pass settled, and which findings it rated differently from the Judge. Turn
+it on only if it misses no blocker the Judge alone catches.
+
+## 5d. Long calls in shorter sessions
+
+A reviewer works in turns, and every turn rereads everything the session has
+read so far, most of it from the prompt cache. So a long session's cost grows
+faster than its turns. One measured reviewer averaged about 71k cached tokens
+a turn over 47 turns, against a 37k shared opening: about half of what it
+read was its own growing history. Two settings break long calls into shorter
+sessions, each of which starts from the shared opening the cache holds. Both
+are off unless set, and neither takes a tool or a lens away.
+
+```yaml
+sessions:
+  relay_tokens: {reviewer: 120000, judge: 120000}
+  scout: [correctness]
+```
+
+**`relay_tokens`, by role: hand off past a size.** When one turn of a
+reviewer's or Judge's call reads more prompt tokens than this, and the call is
+still calling tools, it's told to stop and answer with everything it would
+report so far, in full, plus what it has checked and what's left. A fresh
+session on the same binding then gets the call's own brief, so it shares the
+cached prefix, followed by what the earlier sessions checked, what's left, and
+what they already found, not to be reported again. It may hand off in turn.
+The call's answer is every session's findings, each once.
+
+- Only an agent acrbus can steer mid-call relays: pi, through acrbus's
+  extension. A call on any other agent runs whole, and progress says so once
+  for that agent.
+- A handoff that can't be read is never taken for a finished call, and
+  neither is a run of handoffs that find nothing new with the same left to
+  check. Either fails the call, which escalates as any failed reviewer or
+  Judge does.
+- The least it can be set to is 32000 tokens: a session needs room to work
+  past the shared opening.
+
+**`scout`, by lens: list first, then check each.** A scouted lens's reviewer
+first runs a scout session, which explores the change and lists everything it
+suspects, with how to confirm or rule each out, and verifies nothing. Each
+suspicion then gets a session of its own: the reviewer's brief and that
+suspicion alone, confirmed with evidence or dropped. Every suspicion is
+checked, however many there are, as many at once as the bridge runs. A
+suspicion that can't be checked fails the reviewer: the lens isn't clean.
+Scouting suits a lens whose reviewers read widely and long, where most of a
+long session is rereading; a lens whose reviews are short gains little.
+
+**What it shows.** Progress says when a session hands off and how many
+suspicions a scout listed. Each session is a call of its own in `acrbus acr
+usage <run id>`, marked as `leg N`, `scout` or `verify N`, and the run's
+report and `acr usage` sum them by role in a `sessions` line.
+
+**Measure it before you rely on it.** A handoff is a summary, so check that
+nothing found is lost at one. On a change whose defects you already know (a
+key, as §8 describes), run the trial twice, with `sessions` unset and then
+set in the repository's config, everything else the same:
+
+1. `acrbus acr check <key>`, then `acrbus acr trial <key> --arm separated`,
+   with `sessions` unset.
+2. Set `sessions`, accept the config, and run the same two again.
+3. Compare the two runs' scores, what each caught and missed, with `acrbus
+   acr rescore`, and their cost with `acrbus acr usage <run id>`. Relays
+   that lose findings show as misses the first run caught.
+
+On a live review the comparison is the same: the same change reviewed with
+and without, by round, in `acr usage`.
 
 ## 6. Check it
 

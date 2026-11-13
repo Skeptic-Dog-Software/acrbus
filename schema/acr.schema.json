@@ -196,6 +196,34 @@
         "learned": {"type": "boolean", "description": "Learn which files this repository's reviewers open, from their tool calls, and give the files they keep opening, whole, in later rounds' facts and the next review's, after the change's own, so a reviewer reads them from the prompt cache instead of spending turns to open them. Nothing a reviewer may open is taken away. Default true."},
         "learned_bytes": {"type": "integer", "minimum": 0, "description": "The most bytes of such often-read files a round's facts carry. Every reviewer and Judge reads them again each turn, so they pay only when reviewers would open them early anyway: a file must have been opened by at least two reviewer calls, and one that doesn't fit is left out, which progress says. Default 24576."}
       }
+    },
+    "savings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a review saves on its Judges and later rounds, without taking anything a reviewer or Judge may read or use. Each field left out takes the default.",
+      "properties": {
+        "reuse_rulings": {"type": "boolean", "description": "Carry a Judge's ruling over to a later round's finding that makes the same claim, in the same lens, at the same place in a file no fix has changed since, when that ruling didn't block. Anything else goes to a Judge. Default true."},
+        "first_pass_judge": {"type": "string", "description": "A binding that rules on findings first, such as a cheaper model. What it would have block, rates Medium or above, calls a split or a values call, or marks unsure goes to the Judge's binding, which rules on it fresh, without the first pass's ruling. Left out, none. Check it with acr judge-check --first-pass before turning it on."},
+        "focus_after_fix": {"type": "boolean", "description": "After a fix, tell each lens's reviewers what it changed and what it could affect (its references and tests) as where to look first. The whole change stays theirs. Default false."},
+        "blast_radius": {"type": "boolean", "description": "After a fix, ask one small call on the Sizer's binding whether each lens that passed before the fix needs to attack again. A lens it skips is reported as skipped, with the reason, never as passing the new version. A lens with blockers of its own always attacks again. Default false."}
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How long calls are broken into shorter sessions, each starting from the shared opening the prompt cache holds, instead of one session that rereads everything it has read on every turn. Off unless set.",
+      "properties": {
+        "relay_tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "By role: the prompt tokens of one turn past which a call hands off. It writes its findings so far, what it has checked and what's left, and a fresh session on the same binding carries on from there. Only agents acrbus can steer mid-call (pi, through acrbus's extension) relay; others run whole.",
+          "properties": {
+            "reviewer": {"type": "integer", "minimum": 32000},
+            "judge": {"type": "integer", "minimum": 32000}
+          }
+        },
+        "scout": {"$ref": "#/$defs/strings", "description": "Lenses whose reviewers scout first: one session lists what it suspects, without verifying, then each suspicion is confirmed or dropped in a short session of its own, from the shared opening and that suspicion alone."}
+      }
     }
   },
   "$defs": {

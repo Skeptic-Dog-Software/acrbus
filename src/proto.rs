@@ -103,6 +103,12 @@ pub struct RunOptions {
     /// they're called. Only an agent that can hold a call to them takes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Part of a review: the prompt tokens of one turn past which the call
+    /// hands off, writing what it has found, checked and left, so a fresh
+    /// session can carry on. Only an agent its bridge can steer mid-call
+    /// takes it; the reply's `applied` says whether it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_tokens: Option<u64>,
 }
 
 /// A file held by its hash on each bus it reaches.
@@ -231,6 +237,10 @@ pub struct Applied {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Set when the call will hand off past this many prompt tokens a turn:
+    /// its agent can be steered mid-call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_tokens: Option<u64>,
 }
 
 /// A `/pipe` message: a task handed to a worker, the worker's clarifying
