@@ -142,6 +142,18 @@ pub trait Caller: Sync {
     fn delta(&self, _repo: &Path, _from: &str, _to: &str) -> Option<(Vec<String>, String)> {
         None
     }
+
+    /// Each file that changed between two snapshots, binaries marked. None
+    /// if this caller can't say, and nothing a fix changed is flagged.
+    fn changed(&self, _repo: &Path, _from: &str, _to: &str) -> Option<Vec<super::change::Changed>> {
+        None
+    }
+
+    /// Puts `path` back as it was in snapshot `from`, or removes it if it
+    /// wasn't there: only ever as a person chose.
+    fn revert(&self, _repo: &Path, _from: &str, _path: &str, _existed: bool) -> Result<()> {
+        bail!("this review can't revert a file itself")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +575,57 @@ pub struct Run {
     /// tried again carries on from the first it didn't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_fix: Option<PartialFix>,
+    /// Files fixes changed that a person is asked about: binaries, and
+    /// files no blocker the fix was given points at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<Flag>,
+}
+
+/// A file a fix changed that a person keeps or reverts: a binary, or one
+/// no blocker the fix was given points at. It's flagged and asked about,
+/// and nothing reverts it but their choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flag {
+    /// The round whose fix changed it.
+    pub round: u32,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+    /// No blocker the fix was given points at it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
+    /// The checkout before the fix, as a git tree, to revert it from.
+    pub from: String,
+    /// It was there before the fix: reverting it restores it, rather than
+    /// removing it.
+    pub existed: bool,
+    /// What reverts it, for a person to run.
+    pub command: String,
+    #[serde(default)]
+    pub state: FlagState,
+}
+
+impl Flag {
+    /// Why it's flagged, in a few words.
+    pub fn why(&self) -> &'static str {
+        match (self.binary, self.outside) {
+            (true, true) => "a binary, and no blocker points at it",
+            (true, false) => "a binary",
+            _ => "no blocker points at it",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FlagState {
+    /// Not asked about yet, or a revert that failed.
+    #[default]
+    Open,
+    Kept,
+    /// A person chose to revert it, and the review's next step does.
+    Reverting,
+    Reverted,
 }
 
 /// A fix in groups that stopped at a group: the round's, with the checkout
@@ -1507,6 +1570,7 @@ pub fn start(
         pr: s.pr,
         rulings: Vec::new(),
         partial_fix: None,
+        flags: Vec::new(),
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -4369,19 +4433,17 @@ fn fix(
         super::change::copy_of(&run.repo, &copy).ok().map(|_| copy)
     });
     // The checkout before the fixes, to see what they changed: for the next
-    // round's focus and the blast-radius check, when they're on. A fix in
-    // groups tried again keeps the one from before its first group.
+    // round's focus and the blast-radius check, when they're on, and the
+    // files to flag. A fix in groups tried again keeps the one from before
+    // its first group.
     let saving = s.cfg.savings.focus_after_fix || s.cfg.savings.blast_radius;
     let carried = run
         .partial_fix
         .as_ref()
         .filter(|p| p.round == run.round)
         .and_then(|p| p.from.clone());
-    let before_fix = carried.or_else(|| {
-        (run.converge || saving)
-            .then(|| caller.snapshot(&run.repo))
-            .flatten()
-    });
+    // Always, to list what the fix changed and flag what a person should see.
+    let before_fix = carried.or_else(|| caller.snapshot(&run.repo));
     let fixed = if run.converge {
         let earlier: String = run
             .steelmans
@@ -4400,6 +4462,9 @@ fn fix(
     } else {
         fix_in_groups(run, s, caller, &folded, &reported, before_fix.as_deref())
     };
+    // What the fix changed so far, a failed one too, with the files a person
+    // should see flagged.
+    flag_fix(run, caller, before_fix.as_deref(), &folded, &reported);
     match fixed {
         Ok(fixed) => {
             // A fix in groups told each group's lenses what it did.
@@ -4689,6 +4754,122 @@ fn fix_call(
         run.usage.push(u);
     }
     fixed_of(&legs)
+}
+
+/// After a fix, every file it changed, said, and the ones a person should
+/// see flagged, to keep or revert at the next gate: each binary, as git
+/// tells, and each file no blocker the fix was given points at, by its file
+/// or by naming it. Nothing is blocked or reverted for it. A file already
+/// flagged for this round's fix keeps its flag and its answer.
+fn flag_fix(
+    run: &mut Run,
+    caller: &dyn Caller,
+    from: Option<&str>,
+    folded: &[(String, Finding)],
+    reported: &[Reported],
+) {
+    let Some(from) = from else {
+        return;
+    };
+    let Some(changed) = caller
+        .snapshot(&run.repo)
+        .and_then(|to| caller.changed(&run.repo, from, &to))
+    else {
+        return;
+    };
+    let round = run.round;
+    if changed.is_empty() {
+        caller.say(&format!("round {round}'s fix changed no file"));
+        return;
+    }
+    let norm = |p: &str| p.trim().trim_start_matches("./").to_string();
+    let files: Vec<String> = folded
+        .iter()
+        .filter_map(|(_, f)| f.file.as_deref())
+        .map(norm)
+        .collect();
+    let texts: Vec<&str> = folded
+        .iter()
+        .flat_map(|(_, f)| [f.title.as_str(), f.detail.as_str(), f.note.as_str()])
+        .chain(reported.iter().map(|r| r.text.as_str()))
+        .collect();
+    let named =
+        |path: &str| files.iter().any(|f| f == path) || texts.iter().any(|t| t.contains(path));
+    let mut flagged = Vec::new();
+    for c in &changed {
+        let outside = !named(&c.path);
+        if !(c.binary || outside) {
+            continue;
+        }
+        if !run
+            .flags
+            .iter()
+            .any(|f| f.round == round && f.path == c.path)
+        {
+            run.flags.push(Flag {
+                round,
+                path: c.path.clone(),
+                binary: c.binary,
+                outside,
+                from: from.to_string(),
+                existed: c.existed,
+                command: super::change::revert_command(&run.repo, from, &c.path, c.existed),
+                state: FlagState::Open,
+            });
+        }
+        let flag = run
+            .flags
+            .iter()
+            .find(|f| f.round == round && f.path == c.path)
+            .expect("just pushed");
+        flagged.push(format!("{} ({})", c.path, flag.why()));
+    }
+    let all: Vec<&str> = changed.iter().map(|c| c.path.as_str()).collect();
+    caller.say(&format!(
+        "round {round}'s fix changed {} file(s): {}{}",
+        all.len(),
+        all.join(", "),
+        if flagged.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; flagged for you to keep or revert at the next gate, and the report: {}",
+                flagged.join(", ")
+            )
+        }
+    ));
+}
+
+/// Reverts each flagged file a person chose to, as its command says. One
+/// that can't be is flagged again, and escalated with its command.
+fn revert_flagged(run: &mut Run, caller: &dyn Caller) {
+    let repo = run.repo.clone();
+    let mut failed = Vec::new();
+    for f in run
+        .flags
+        .iter_mut()
+        .filter(|f| f.state == FlagState::Reverting)
+    {
+        match caller.revert(&repo, &f.from, &f.path, f.existed) {
+            Ok(()) => {
+                f.state = FlagState::Reverted;
+                caller.say(&format!(
+                    "reverted {}, as you chose: it's as it was before round {}'s fix",
+                    f.path, f.round
+                ));
+            }
+            Err(e) => {
+                f.state = FlagState::Open;
+                failed.push(format!(
+                    "{} couldn't be reverted ({e:#}): run `{}` yourself, or keep it",
+                    f.path, f.command
+                ));
+            }
+        }
+    }
+    for reason in failed {
+        escalate(run, reason);
+    }
 }
 
 /// What's to be fixed, as the fixer reads it: each finding with what a
@@ -5004,7 +5185,8 @@ pub fn fixed_by_session(
             lens.done.push(done.clone());
         }
     }
-    let reported = run.reported.iter().any(|r| !r.fixed);
+    let unfixed: Vec<Reported> = run.reported.iter().filter(|r| !r.fixed).cloned().collect();
+    let reported = !unfixed.is_empty();
     for r in run.reported.iter_mut() {
         r.fixed = true;
     }
@@ -5016,6 +5198,7 @@ pub fn fixed_by_session(
         .and_then(|p| p.from);
     let from = carried.or_else(|| run.fixing.take().and_then(|f| f.from));
     run.fixing = None;
+    flag_fix(run, caller, from.as_deref(), &folded, &unfixed);
     if run.converge {
         run.steelmans.push(Steelman {
             round: run.round,
@@ -5104,6 +5287,8 @@ fn step(
     caller: &dyn Caller,
     reload: &dyn Fn(bool) -> Result<Change>,
 ) -> Result<bool> {
+    // What a person chose to revert, before anything reads the checkout.
+    revert_flagged(run, caller);
     if unseen(run) {
         pause(run, Gate::Escalation);
         return Ok(false);
@@ -5446,6 +5631,12 @@ lenses:
         bare: Mutex<Vec<Role>>,
         /// Each call's role and where it was asked to hand off.
         relays: Mutex<Vec<(Role, Option<u64>)>>,
+        /// What a fix changed, file by file, as the checkout would say.
+        changed: Option<Vec<super::super::change::Changed>>,
+        /// Each file reverted, from where, and whether it was there.
+        reverted: Mutex<Vec<(String, String, bool)>>,
+        /// Reverting fails.
+        stuck: bool,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -5467,6 +5658,9 @@ lenses:
                 told: Mutex::new(Vec::new()),
                 bare: Mutex::new(Vec::new()),
                 relays: Mutex::new(Vec::new()),
+                changed: None,
+                reverted: Mutex::new(Vec::new()),
+                stuck: false,
             }
         }
 
@@ -5543,7 +5737,27 @@ lenses:
         }
 
         fn snapshot(&self, _repo: &Path) -> Option<String> {
-            self.fixes.as_ref().map(|_| new_id())
+            (self.fixes.is_some() || self.changed.is_some()).then(new_id)
+        }
+
+        fn changed(
+            &self,
+            _repo: &Path,
+            _from: &str,
+            _to: &str,
+        ) -> Option<Vec<super::super::change::Changed>> {
+            self.changed.clone()
+        }
+
+        fn revert(&self, _repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+            if self.stuck {
+                bail!("the file is locked");
+            }
+            self.reverted
+                .lock()
+                .unwrap()
+                .push((path.to_string(), from.to_string(), existed));
+            Ok(())
         }
 
         fn delta(&self, _repo: &Path, _from: &str, _to: &str) -> Option<(Vec<String>, String)> {
@@ -10631,5 +10845,167 @@ lenses:
         fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
         assert!(run.partial_fix.is_none());
         assert_eq!(run.stage, Stage::Review);
+    }
+
+    /// What a fix changed: the file its blocker points at, a rebuilt
+    /// binary, and a doc nothing named.
+    fn rebuilt() -> Option<Vec<super::super::change::Changed>> {
+        let c = |path: &str, binary: bool, existed: bool| super::super::change::Changed {
+            path: path.into(),
+            binary,
+            existed,
+        };
+        Some(vec![
+            c("a.src", false, true),
+            c("build/tool.bin", true, true),
+            c("notes.md", false, false),
+        ])
+    }
+
+    #[test]
+    fn a_fix_that_changes_a_binary_or_a_file_no_blocker_names_is_flagged_and_asked_at_the_next_gate()
+     {
+        let cfg = plain("ends", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.changed = rebuilt();
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let reload = |_| Ok(c.clone());
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // The fix ran, and the next gate is the result's.
+        assert_eq!(run.waiting, Some(Gate::Final));
+        let told = fake.told.lock().unwrap().join("\n");
+        assert!(
+            told.contains(
+                "say: round 1's fix changed 3 file(s): a.src, build/tool.bin, notes.md; flagged \
+                 for you to keep or revert at the next gate, and the report: build/tool.bin (a \
+                 binary, and no blocker points at it), notes.md (no blocker points at it)"
+            ),
+            "{told}"
+        );
+        let flagged: Vec<(&str, bool, bool, FlagState)> = run
+            .flags
+            .iter()
+            .map(|f| (f.path.as_str(), f.binary, f.outside, f.state))
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                ("build/tool.bin", true, true, FlagState::Open),
+                ("notes.md", false, true, FlagState::Open),
+            ]
+        );
+        assert_eq!(headers(&run, &cfg), ["Flagged", "Result", "Missed"]);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        let q = &ask.carousels[0].questions[0];
+        assert!(q.multi_select);
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["build/tool.bin", "notes.md", "Keep them"]);
+        // Each with the exact command that reverts it.
+        assert!(q.options[0].description.contains(&run.flags[0].command));
+        assert!(q.options[1].description.contains(&run.flags[1].command));
+        assert!(run.flags[1].command.starts_with("rm -f -- "));
+        // In the report too.
+        assert_eq!(report::report(&run, &cfg).flags.len(), 2);
+        // Nothing is reverted until a person says.
+        assert!(fake.reverted.lock().unwrap().is_empty());
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Flagged", serde_json::json!(["build/tool.bin"])),
+                ("Result", "Approve".into()),
+                ("Missed", "Not now".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+        let reverted = fake.reverted.lock().unwrap();
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].0, "build/tool.bin");
+        assert_eq!(reverted[0].1, run.flags[0].from);
+        assert!(reverted[0].2);
+        assert_eq!(
+            run.flags.iter().map(|f| f.state).collect::<Vec<_>>(),
+            [FlagState::Reverted, FlagState::Kept]
+        );
+        assert!(
+            report::flag_line(&run.flags[1])
+                .contains("round 1's fix changed notes.md (no blocker points at it): kept")
+        );
+    }
+
+    #[test]
+    fn a_file_the_blockers_name_is_not_flagged_and_a_revert_that_fails_asks_again() {
+        let cfg = plain("ends", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.changed = rebuilt();
+        fake.stuck = true;
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let reload = |_| Ok(c.clone());
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert!(!run.flags.iter().any(|f| f.path == "a.src"));
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Flagged", serde_json::json!(["notes.md", "build/tool.bin"])),
+                ("Result", "Approve".into()),
+                ("Missed", "Not now".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        let reasons: Vec<&str> = run.escalations.iter().map(|e| e.reason.as_str()).collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("notes.md couldn't be reverted")
+                    && r.contains(&run.flags[1].command)),
+            "{reasons:?}"
+        );
+        // Asked again, with the escalation.
+        assert_eq!(headers(&run, &cfg), ["Escalated", "Escalated", "Flagged"]);
+    }
+
+    #[test]
+    fn a_fix_by_the_session_that_ran_the_review_is_flagged_too() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.changed = rebuilt();
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        assert_eq!(run.flags.len(), 2);
+        assert!(run.flags.iter().all(|f| f.round == 1));
     }
 }

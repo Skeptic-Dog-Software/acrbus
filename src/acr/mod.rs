@@ -1597,6 +1597,14 @@ impl Caller for BridgeCaller {
         change::tree_diff(repo, from, to).ok()
     }
 
+    fn changed(&self, repo: &Path, from: &str, to: &str) -> Option<Vec<change::Changed>> {
+        change::tree_changes(repo, from, to).ok()
+    }
+
+    fn revert(&self, repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+        change::revert(repo, from, path, existed)
+    }
+
     fn note(&self, what: &str) {
         self.progress.note(what);
     }
@@ -2284,6 +2292,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for p in &run.prefixes {
         eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
+    }
+    for f in &run.flags {
+        eprintln!("{APP_NAME}: {}", report::flag_line(f));
     }
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if let Some(pr) = pr {

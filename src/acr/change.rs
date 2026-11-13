@@ -289,6 +289,76 @@ pub fn tree_diff(repo: &Path, from: &str, to: &str) -> Result<(Vec<String>, Stri
     Ok((files.lines().map(str::to_string).collect(), diff))
 }
 
+/// A file a fix changed: whether git takes it for binary, and whether it
+/// was there before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub path: String,
+    pub binary: bool,
+    pub existed: bool,
+}
+
+/// Each file that differs between two trees, by path, with git's own say
+/// on which are binary.
+pub fn tree_changes(repo: &Path, from: &str, to: &str) -> Result<Vec<Changed>> {
+    let status = git(
+        repo,
+        &["diff", "--no-renames", "--name-status", "-z", from, to],
+    )?;
+    let numstat = git(repo, &["diff", "--no-renames", "--numstat", "-z", from, to])?;
+    // A binary file counts no lines: "-\t-\t<path>".
+    let binary: Vec<&str> = numstat
+        .split('\0')
+        .filter_map(|e| e.strip_prefix("-\t-\t"))
+        .collect();
+    let mut parts = status.split('\0').filter(|p| !p.is_empty());
+    let mut out = Vec::new();
+    while let (Some(kind), Some(path)) = (parts.next(), parts.next()) {
+        out.push(Changed {
+            path: path.to_string(),
+            binary: binary.contains(&path),
+            existed: !kind.starts_with('A'),
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `text` quoted for a POSIX shell.
+fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The command that puts `path` back as it was in the tree `from`, or
+/// removes it if it wasn't there: what [`revert`] does, for a person to run.
+pub fn revert_command(repo: &Path, from: &str, path: &str, existed: bool) -> String {
+    let repo = repo.display().to_string();
+    if existed {
+        format!(
+            "git -C {} restore --source={from} -- {}",
+            quoted(&repo),
+            quoted(path)
+        )
+    } else {
+        format!("rm -f -- {}", quoted(&format!("{repo}/{path}")))
+    }
+}
+
+/// Puts `path` back as it was in the tree `from`, in the working tree only,
+/// or removes it if it wasn't there.
+pub fn revert(repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+    if existed {
+        git(repo, &["restore", &format!("--source={from}"), "--", path])?;
+        return Ok(());
+    }
+    match fs::remove_file(repo.join(path)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {path}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The commit a review is of must be the one checked out, with nothing
 /// changed on top, wherever the checkout is read or written: by a review's
 /// fixes, which go into the checkout, and by a review saved before reviews
@@ -816,6 +886,65 @@ diff --git a/docs/b.md b/docs/b.md\n--- a/docs/b.md\n+++ b/docs/b.md\n\
         fs::remove_file(repo.join("c.txt")).unwrap();
         fs::write(repo.join("a.txt"), "two\n").unwrap();
         assert_eq!(fingerprint(&repo).unwrap(), before);
+    }
+
+    #[test]
+    fn what_a_fix_changed_says_which_files_are_binary_and_each_reverts_as_its_command_says() {
+        let repo = repo_with(&[("a.txt", "one\n"), ("gone.txt", "old\n")]);
+        fs::write(repo.join("tool.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
+        commit(&repo, &[], "a binary");
+        let from = worktree_tree(&repo).unwrap();
+        fs::write(repo.join("a.txt"), "two\n").unwrap();
+        fs::write(repo.join("tool.bin"), [0u8, 1, 2, 3, 0, 4]).unwrap();
+        fs::remove_file(repo.join("gone.txt")).unwrap();
+        fs::create_dir_all(repo.join("dir")).unwrap();
+        fs::write(repo.join("dir/new file.txt"), "new\n").unwrap();
+        let to = worktree_tree(&repo).unwrap();
+        let changed = tree_changes(&repo, &from, &to).unwrap();
+        let seen: Vec<(&str, bool, bool)> = changed
+            .iter()
+            .map(|c| (c.path.as_str(), c.binary, c.existed))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.txt", false, true),
+                ("dir/new file.txt", false, false),
+                ("gone.txt", false, true),
+                ("tool.bin", true, true),
+            ]
+        );
+        for c in &changed {
+            let command = revert_command(&repo, &from, &c.path, c.existed);
+            if c.existed {
+                assert!(
+                    command.contains(&format!("restore --source={from} -- ")),
+                    "{command}"
+                );
+            } else {
+                assert!(command.starts_with("rm -f -- "), "{command}");
+            }
+            revert(&repo, &from, &c.path, c.existed).unwrap();
+        }
+        // Each as it was before the fix.
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(fs::read_to_string(repo.join("gone.txt")).unwrap(), "old\n");
+        assert_eq!(
+            fs::read(repo.join("tool.bin")).unwrap(),
+            [0u8, 159, 146, 150, 0, 1]
+        );
+        assert!(!repo.join("dir/new file.txt").exists());
+        assert_eq!(worktree_tree(&repo).unwrap(), from);
+        // The command as shown does the same, quoting and all.
+        fs::write(repo.join("dir/new file.txt"), "again\n").unwrap();
+        fs::write(repo.join("a.txt"), "three\n").unwrap();
+        for (path, existed) in [("dir/new file.txt", false), ("a.txt", true)] {
+            let command = revert_command(&repo, &from, path, existed);
+            let ran = Command::new("sh").arg("-c").arg(&command).output().unwrap();
+            assert!(ran.status.success(), "{command}: {ran:?}");
+        }
+        assert_eq!(worktree_tree(&repo).unwrap(), from);
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
