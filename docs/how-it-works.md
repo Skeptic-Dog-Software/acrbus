@@ -106,9 +106,13 @@ between calls.
 
 That order is what makes it cheap. The provider's prompt cache serves the
 shared part to every call after the first, and each round after the first
-shares the previous round's map up to the first file a fix touched. A
-role's first call warms the cache before the rest start, and a keep-alive
-refreshes a prefix still in use before it could be evicted.
+keeps the previous round's file sections where they were, with what a fix
+changed after them, so it shares the previous round's map through every
+file. A role's first call warms the cache before the rest start, and a
+keep-alive refreshes a prefix still in use before it could be evicted, never
+sending another while the last is still going. A fix goes in groups, each a
+fresh session from the same opening with only its own blockers, rather than
+one session that grows with every blocker.
 
 The report gives each role's calls, fresh and cached tokens, dollars and
 times, and how many bytes each set of parallel calls shared.
@@ -147,14 +151,17 @@ if that doesn't work, it's ended and tried again in a fresh session.
 Nothing cuts off a call that's working.
 
 A review says what each call is doing at least once a minute, with the
-tokens it has used so far and the run's total against its plan. Stopping a
+tokens it has used so far and the run's total against its plan, and warns of
+a call that has logged no new turn in a while. Stopping a
 review stops its calls. A failed reviewer or Judge is never taken for a
 clean pass, and a lens with nothing for its Judge says so.
 
 ## Reviewers stay in their lane
 
 Reviewers read the code under review, not your other files, and nothing
-they do is written back to the repository.
+they do is written back to the repository. A fix keeps to the source, and
+every file it changes is listed: a binary, or a file none of its blockers
+points at, is put to you, to keep or revert.
 
 ## It's measurable
 

@@ -272,6 +272,20 @@ session, or you at the terminal, fixes with the change's context, as the
 builder does in an in-session review. The Orchestrator fixes only if its
 binding may write: `writes: true` in `acr.yaml`, with Write or Edit in its
 tools. The binding `setup acr` writes can't, so a review defaults to you.
+The Orchestrator fixes in groups, a fresh session for each file's blockers
+([`group_fixes`](acr-repo-setup.md#5c-savings-judges-and-later-rounds)),
+and is told to keep the fix to the source: no rebuilt binaries or
+artifacts, and no command that rewrites tracked files beyond the fix.
+
+**What a fix changed.** After every fix, whoever made it, progress lists
+the files it changed, and flags each binary and each file no blocker it was
+given points at. The next gate asks about the flagged ones, a few to a
+question: choose any to revert to how it was before the fix, and the rest
+stay. Each choice shows the exact command that reverts it, for you to run
+yourself if you'd rather. Nothing is reverted without you, and a review
+never stops for it. The report's `flags` lists them all with what you
+chose, and a review that ends with one unanswered says so, with its
+command.
 
 **Findings.** Each finding has a severity, an action and a state:
 - **Severity:** Critical, High, Medium, Low, or Rejected by the Judge.

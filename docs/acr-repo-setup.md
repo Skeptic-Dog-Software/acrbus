@@ -284,10 +284,13 @@ since by then it holds the change's context.
   comments, which can grow, after the round's number. Every reviewer and
   Judge gets the map in its system prompt, after ACR's own and before its
   own text, so the provider's prompt cache serves it to all of a role's
-  calls but the first. Files a fix left alone come first, as they were,
-  and those it changed after them, so a round shares the last one's cached
-  prefix up to the first file a fix touched; the round's number, the
-  review comments and the gate's results come last. The map is kept in the review's folder, as
+  calls but the first. A later round keeps every earlier round's file
+  sections where they were, in the same order, so it shares the last
+  round's cached prefix through all of them, whatever a fix touched. A
+  file a fix changed comes again after them, as it is now, and that later
+  section is the one that holds; a file the change no longer touches says
+  so there, and a new one comes there too. The round's number, the review
+  comments and the gate's results come last. The map is kept in the review's folder, as
   `round-<n>.facts.md`. It goes to no call unless every agent the
   reviewers and the Judge are bound to can take it: pi reads it from a
   file; Claude Code and omp take it in the same argument as ACR's prompt,
@@ -325,22 +328,38 @@ since by then it holds the change's context.
 
   Every role's pi call loads that extension, and its stderr (`acrbus bridge
   log <agent> <id> --stderr`) says, for each turn, what the cache served,
-  from pi's own usage, which a provider reports in the response body:
-  `acrbus cache: turn 2: 12288 of 13644 prompt tokens read from the cache
-  (1356 fresh, 0 written, 150 out)`. Hits come in whole blocks. A provider
-  that also counts them in a response header gets a `response` line as
-  well. Each call's first turn goes into its usage, so progress and `acrbus
-  acr usage` show whether it read the warmed prefix. A cache-write count of
-  0 on every call says nothing: some providers, Fireworks among them, don't
-  report writes.
+  from pi's own usage, which a provider reports in the response body, how
+  the turn ended, how long it took and where it went:
+
+  ```text
+  acrbus cache: turn 2: 12288 of 13644 prompt tokens read from the cache (1356 fresh, 0 written, 150 out); stop toolUse, 8.4s, route: provider fireworks, model accounts/fireworks/models/glm-5p3, provider prompt 13644, key #3f9a1c0b
+  ```
+
+  A turn that failed adds `error:` and what pi said, with anything that
+  looks like a token cut; one with no response at all says `no response,
+  retried` (pi tries it again), and a call that ended on one says so. The
+  route is from the response's headers: `x-bifrost-provider`,
+  `x-bifrost-resolved-model` and `fireworks-prompt-tokens` as they are, and
+  `x-bifrost-routing-info-key` only as the first 8 hex digits of its
+  SHA-256, never the value. No other header is logged, so nothing that
+  could carry a credential is. A response that names none of them says so,
+  and so does a turn whose response's headers never reached the extension. Hits come in
+  whole blocks. A provider that also counts them in a response header gets
+  a `response` line as well. Each call's first turn goes into its usage, so
+  progress and `acrbus acr usage` show whether it read the warmed prefix. A
+  cache-write count of 0 on every call says nothing: some providers,
+  Fireworks among them, don't report writes.
 
   pi rounds a thinking level its model doesn't have to one it does, and
   says so there as `acrbus effort:`: GLM 5.3 on Fireworks has `low`, `high`
   and `max`, so `medium` runs as `high`. Where the provider echoes what it
-  applied, as Fireworks does in `fireworks-conversation-options`, a second
-  `acrbus effort:` line says so, once a call, such as `the provider applied
-  reasoning_effort high`. On GLM 5.3 Flash, `--thinking off` still reports
-  `reasoning_effort low`: off isn't off there. `acrbus acr judge-check
+  applied, as Fireworks does in `fireworks-conversation-options`, another
+  `acrbus effort:` line says so, once a call, whether the binding set an
+  effort or not, such as `the provider applied reasoning_effort high`. A
+  call whose responses never say says that instead, once, at its first
+  turn's end, with how many response headers it saw, or that no response's
+  headers reached the extension at all. On GLM 5.3 Flash, `--thinking off`
+  still reports `reasoning_effort low`: off isn't off there. `acrbus acr judge-check
   --per-finding` sets per-finding verdicts against per-lens ones on a key,
   before you switch.
 - **Fewer turns.** A reviewer's cost is mostly what each turn reads again:
@@ -379,6 +398,7 @@ it would have gone without it.
 ```yaml
 savings:
   reuse_rulings: true        # the default
+  group_fixes: true          # the default
   first_pass_judge: small    # off unless set; check it first, below
   focus_after_fix: true      # off by default
   blast_radius: true         # off by default
@@ -395,6 +415,22 @@ savings:
   goes to a Judge. A blocker's ruling is never kept: what a fix was meant
   to settle is always judged again. The report marks each carried-over
   ruling with the round it came from, and progress says so.
+- **`group_fixes`** (default on). The Orchestrator fixes a round's
+  blockers in groups: blockers that point at the same file together, so
+  one session fixing them can't collide with itself, and every other one
+  alone; a defect several lenses found goes with the one it repeats, and a
+  defect you reported goes alone. Each group is a fresh session on the
+  Orchestrator's binding, with the same opening as every other group and
+  only its own blockers after it, so a later group reads the opening from
+  the cache rather than a growing session. The groups run one after
+  another in the checkout, each seeing what the ones before it changed.
+  Progress names each group, each group's usage is a part of its own
+  (`group N`, and `group N, leg M` when it relays), and each lens is told
+  what its own group did. A group that fails escalates, naming it, with
+  the ones before it done: trying again carries on from it, and a session
+  that takes over is briefed on only what's left. A review to convergence
+  still folds a round in with one steelman, which synthesizes the whole.
+  `false` fixes in one session, as before.
 - **`first_pass_judge`**: a binding, such as a cheaper model, that rules
   first, with a note asking it to mark anything it isn't sure of. What it
   would have block, rates Medium or above, calls a split or a values call,
@@ -439,8 +475,9 @@ are off unless set, and neither takes a tool or a lens away.
 
 ```yaml
 sessions:
-  relay_tokens: {reviewer: 120000, judge: 120000}
+  relay_tokens: {reviewer: 120000, judge: 120000, orchestrator: 120000}
   scout: [correctness]
+  stall_warn_secs: 180   # the default; 0: off
 ```
 
 **`relay_tokens`, by role: hand off past a size.** When one turn of a
@@ -452,13 +489,19 @@ cached prefix, followed by what the earlier sessions checked, what's left, and
 what they already found, not to be reported again. It may hand off in turn.
 The call's answer is every session's findings, each once.
 
+The Orchestrator's fix relays the same way, each group of a fix in groups
+on its own: the fixer stops and says what it changed so far and what's left,
+and a fresh session gets the fix's own brief, then what the earlier sessions
+changed, which is in the checkout already, and what's left to fix. The fix's
+answer is every session's, in order. A steelman relays too.
+
 - Only an agent acrbus can steer mid-call relays: pi, through acrbus's
   extension. A call on any other agent runs whole, and progress says so once
   for that agent.
 - A handoff that can't be read is never taken for a finished call, and
-  neither is a run of handoffs that find nothing new with the same left to
-  check. Either fails the call, which escalates as any failed reviewer or
-  Judge does.
+  neither is a run of handoffs that find nothing new, or a fixer's that do
+  nothing more, with the same left to check. Either fails the call, which
+  escalates as any failed reviewer, Judge or fix does.
 - The least it can be set to is 32000 tokens: a session needs room to work
   past the shared opening.
 
@@ -471,6 +514,13 @@ checked, however many there are, as many at once as the bridge runs. A
 suspicion that can't be checked fails the reviewer: the lens isn't clean.
 Scouting suits a lens whose reviewers read widely and long, where most of a
 long session is rereading; a lens whose reviews are short gains little.
+
+**`stall_warn_secs`: a call with no new turn.** A pi call logs each turn
+as it ends, and progress warns once when a call has logged no new turn for
+this long, with how many it has: its provider may be slow, or a request
+lost. It warns again if the call moves on and then stops again. Nothing cuts
+a call off for it: that's still the bridge's watch for a run that uses no
+CPU and writes no file (`idle_secs`), which this is apart from.
 
 **What it shows.** Progress says when a session hands off and how many
 suspicions a scout listed. Each session is a call of its own in `acrbus acr

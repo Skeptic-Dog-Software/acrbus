@@ -49,7 +49,10 @@ minute:
   a warning once a call passes its share of the most the plan allows, or
   the run passes that most;
 - each round's setup, what each lens's Judge has to rate, and a lens that
-  has none, such as one whose reviewers found nothing.
+  has none, such as one whose reviewers found nothing;
+- a call whose agent has logged no new turn for `sessions.stall_warn_secs`
+  (3 minutes by default), once, apart from the bridge's own idle watch;
+- after a fix, the files it changed, and those flagged for you.
 
 Where each lens of the round stands is kept in `lenses.json` in the
 review's folder as it moves, and `acr ask` shows it while the review
