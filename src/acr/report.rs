@@ -8,8 +8,8 @@ use serde::Serialize;
 use super::config::{CommentFormat, Config, Role, Severity};
 use super::facts::Prefix;
 use super::flow::{
-    Disagreement, Escalation, FactsRound, Finding, FindingState, Flag, FlagState, Gate, LensResult,
-    Outcome, Run, Status, Usage,
+    Disagreement, Escalation, FactsRound, Finding, FindingState, FixNote, Flag, FlagState, Gate,
+    Guarded, LensResult, Locked, Outcome, Run, Status, Usage,
 };
 
 #[derive(Debug, Serialize)]
@@ -81,6 +81,51 @@ pub struct Report<'a> {
     /// they chose.
     #[serde(skip_serializing_if = "<[Flag]>::is_empty")]
     pub flags: &'a [Flag],
+    /// Each fix session's scope: the files it could change, and each file
+    /// it changed outside them, put back at once, with what it cost.
+    #[serde(skip_serializing_if = "<[Guarded]>::is_empty")]
+    pub guarded: &'a [Guarded],
+    /// Files no fix could change again, after being put back.
+    #[serde(skip_serializing_if = "<[Locked]>::is_empty")]
+    pub locked: &'a [Locked],
+    /// What fixes noted outside their files, and what a person chose.
+    #[serde(skip_serializing_if = "<[FixNote]>::is_empty")]
+    pub fix_notes: &'a [FixNote],
+}
+
+/// A fix session's scope, as said at a review's end, when it put anything
+/// back.
+pub fn guarded_line(g: &Guarded) -> Option<String> {
+    if g.reverted.is_empty() {
+        return None;
+    }
+    let cost = g
+        .usd
+        .map(|d| format!(", in a session that cost ${d:.3}"))
+        .unwrap_or_default();
+    Some(format!(
+        "round {}'s {}: put back {} file(s) changed outside its files ({}){cost}: {}",
+        g.round,
+        g.fix,
+        g.reverted.len(),
+        g.paths.join(", "),
+        g.reverted
+            .iter()
+            .map(|(p, why)| format!("{p} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// A fix's note, as said at a review's end.
+pub fn note_line(n: &FixNote) -> String {
+    let state = match n.state {
+        super::flow::NoteState::Open => "not answered yet",
+        super::flow::NoteState::FixNow => "fixed by a follow-up, as you chose",
+        super::flow::NoteState::Ticket => "a ticket",
+        super::flow::NoteState::Left => "left, as you chose",
+    };
+    format!("round {}'s fix noted: {}: {state}", n.round, n.line())
 }
 
 /// A flagged file, as said at a review's end.
@@ -228,6 +273,30 @@ pub fn tickets(run: &Run) -> Vec<Ticket> {
                 out.push(ticket(run, &lens.id, round.round, f));
             }
         }
+    }
+    // What fixes noted for a person and left for a ticket: a change one
+    // needed outside its files, or a doc it left stale.
+    for (i, n) in run.fix_notes.iter().enumerate() {
+        if n.state != super::flow::NoteState::Ticket {
+            continue;
+        }
+        out.push(Ticket {
+            finding: format!("note-{}", i + 1),
+            lens: String::new(),
+            round: n.round,
+            title: if n.kind == "stale" {
+                format!("Stale doc: {}", n.path)
+            } else {
+                format!("Needed outside a fix's files: {}", n.path)
+            },
+            body: format!(
+                "Noted by round {}'s fix in review {}, which couldn't make the change itself, \
+                 since none of its blockers points at the file:\n\n{}\n",
+                n.round,
+                run.id,
+                n.line()
+            ),
+        });
     }
     out.sort_by(|a, b| (a.round, &a.finding).cmp(&(b.round, &b.finding)));
     out
@@ -968,6 +1037,9 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         answered_by: &run.answered_by,
         tickets: tickets(run),
         flags: &run.flags,
+        guarded: &run.guarded,
+        locked: &run.locked,
+        fix_notes: &run.fix_notes,
     }
 }
 

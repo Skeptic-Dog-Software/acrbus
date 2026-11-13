@@ -79,6 +79,15 @@ ACRBUS_REQUEST_HEADERS = "x-gateway-tools=none"
 Any tool a call's model asks for that its binding doesn't name, refused or
 not, is said in progress, and listed by `acr usage` and the report.
 
+A fix is held to its files the same way. Each fix call carries its scope,
+`allowed_paths` (the files its blockers point at, test directories beside
+them, files locked after an earlier fix), and a pi fixer is refused a write
+or edit to any other file (`ACRBUS_ALLOWED_PATHS`), told to note the change
+it needs instead. Claude Code and omp aren't held in the session, and a
+shell can write anywhere on any kind, so the review itself puts back what a
+fix session changed outside its scope, after each session, before anything
+reads it.
+
 ## What's kept
 
 Nothing a run or a review leaves is deleted as it finishes, so you can see

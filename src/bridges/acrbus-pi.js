@@ -43,6 +43,13 @@
 //   one a gateway added to the request or one the model made up included,
 //   and stderr says so, a line each. It fails closed: a list it can't read
 //   refuses every tool.
+// - ACRBUS_ALLOWED_PATHS: a fix's scope, as JSON: {"paths": [...],
+//   "test_dirs": [...], "locked": [...], "open": false}. A write or edit to a
+//   file it doesn't allow is refused, telling the fixer to note the change
+//   it needs instead, and stderr says so, a line each. It fails closed: a
+//   scope it can't read refuses every write. A shell can still write
+//   anywhere, so the review also puts back, after each session, whatever
+//   the call changed outside its scope.
 // - ACRBUS_REQUEST_HEADERS: headers for every model request the call makes,
 //   one `name=value` a line, such as a gateway's own switch for not adding
 //   its tools to requests. A line it can't read is skipped, and said.
@@ -398,6 +405,62 @@ function guard(pi, turnNow) {
   globalThis.fetch = wrapped;
 }
 
+// A tool's path, relative to the working directory, which is the
+// repository: "./a.go", "/repo/a.go" and "a.go" are one.
+function repoPath(raw) {
+  let p = String(raw ?? "").trim();
+  const cwd = process.cwd();
+  if (p.startsWith(cwd + "/")) p = p.slice(cwd.length + 1);
+  return p.replace(/^\.\//, "");
+}
+
+// A test file, as acrbus tells one (stages.rs is_test_path): in a tests
+// folder, or named as one.
+function isTestPath(p) {
+  const parts = p.split("/");
+  const name = parts.pop() ?? "";
+  const inTests = parts.some((d) => {
+    d = d.toLowerCase();
+    return (
+      ["test", "tests", "spec", "specs", "__tests__", "testdata", "test_data", "testing"].includes(d) ||
+      d.startsWith("test_") ||
+      d.endsWith("_test") ||
+      d.endsWith("_tests")
+    );
+  });
+  const stem = name.split(".")[0] ?? name;
+  const lower = stem.toLowerCase();
+  const dotted = name.toLowerCase();
+  const named =
+    ["test", "tests", "spec", "conftest"].includes(lower) ||
+    lower.startsWith("test_") ||
+    lower.endsWith("_test") ||
+    lower.endsWith("_tests") ||
+    lower.endsWith("_spec") ||
+    stem.endsWith("Test") ||
+    stem.endsWith("Tests") ||
+    stem.endsWith("Spec") ||
+    dotted.includes(".test.") ||
+    dotted.includes(".spec.");
+  return inTests || named;
+}
+
+// A doc, as acrbus tells one (stages.rs is_doc).
+function isDoc(p) {
+  const f = p.toLowerCase();
+  return [".md", ".txt", ".rst", ".adoc"].some((x) => f.endsWith(x));
+}
+
+// Whether a fix's scope allows a file, as flow.rs FixScope::allows does.
+function scopeAllows(p, paths, testDirs, locked, open) {
+  if (paths.includes(p)) return true;
+  if (locked.includes(p)) return false;
+  const i = p.lastIndexOf("/");
+  const dir = i < 0 ? "" : p.slice(0, i);
+  if (isTestPath(p) && testDirs.includes(dir)) return true;
+  return open && !isDoc(p);
+}
+
 export default function acrbus(pi) {
   const key = process.env.ACRBUS_CACHE_KEY;
   const turns = process.env.ACRBUS_TURNS === "1";
@@ -563,6 +626,38 @@ export default function acrbus(pi) {
       return {
         block: true,
         reason: `Review calls can only use their binding's tools, and ${name} isn't one. The tools this call may use: ${may}.`,
+      };
+    });
+  }
+  const scoped = process.env.ACRBUS_ALLOWED_PATHS;
+  if (scoped !== undefined) {
+    let scope = null;
+    try {
+      const v = JSON.parse(scoped);
+      if (v && typeof v === "object" && !Array.isArray(v)) scope = v;
+    } catch {
+      scope = null;
+    }
+    const list = (k) => (Array.isArray(scope?.[k]) ? scope[k].filter((x) => typeof x === "string") : []);
+    const paths = list("paths");
+    const testDirs = list("test_dirs");
+    const locked = list("locked");
+    const open = scope?.open === true;
+    pi.on("tool_call", async (event) => {
+      const name = String(event?.toolName ?? "");
+      if (name !== "write" && name !== "edit") return undefined;
+      const input = event?.input ?? {};
+      const p = repoPath(input.path ?? input.file_path ?? input.filePath);
+      if (scope !== null && p && scopeAllows(p, paths, testDirs, locked, open)) return undefined;
+      console.error(`acrbus scope: refused ${name} ${oneLine(p) || "?"}: not one of this fix's files`);
+      const own = paths.length > 0 ? paths.join(", ") : "the code its blockers need, but no doc";
+      return {
+        block: true,
+        reason:
+          `This fix may change only its own files: ${own}, and test files beside them. ` +
+          `${p || "That path"} isn't one. Don't change it another way: what you change outside ` +
+          `this fix's files is put back when your session ends. If the fix truly needs it, list ` +
+          `it in your answer's "needs" with why; if it's a doc your fix left wrong, in "stale".`,
       };
     });
   }

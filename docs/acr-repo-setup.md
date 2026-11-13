@@ -294,6 +294,14 @@ spend_cap: {usd: 20}   # or {tokens: 30000000}, or both
 - **The gate without coverage.** With no `tests.coverage`, the gate still
   runs its mutants and its other-way runs; only the uncovered lines are
   missing.
+- **What a fix may change.** A fix group may change the files its
+  blockers point at or name, test files beside them (by the repository's
+  test-file patterns), and files a person allowed. Anything else it
+  changes, a doc or a rebuilt binary included, is put back at once, and
+  locked for the run. A doc is in scope only when a blocker points at it:
+  when a fix leaves one wrong, the fixer notes it as stale, for a person to
+  fix now, ticket or leave. So the config needn't tell the fixer to keep
+  away from docs, binaries or generated files.
 - **Decided non-issues.** Accepting a proposal puts its non-findings in
   `<name>.not-findings.md`, beside the config, and points `not_findings` at
   it. A proposal needn't name the file.

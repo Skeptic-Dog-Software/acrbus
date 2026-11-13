@@ -367,7 +367,7 @@ fn stem(path: &str) -> &str {
 /// languages' ways: a folder such as `tests/` or `__tests__/`, or a name
 /// such as `test_x.py`, `x_test.go`, `x.test.ts`, `x.spec.js` or
 /// `XTest.java`. Not any path with "test" in it: `latest.rs` isn't one.
-fn is_test_path(path: &str) -> bool {
+pub(super) fn is_test_path(path: &str) -> bool {
     let mut parts: Vec<&str> = path.split('/').collect();
     let name = parts.pop().unwrap_or_default();
     let in_tests = parts.iter().any(|d| {
@@ -720,7 +720,7 @@ pub fn claims(change: &Change, description: Option<&str>) -> Vec<Claim> {
     found
 }
 
-fn is_doc(file: &str) -> bool {
+pub(super) fn is_doc(file: &str) -> bool {
     let f = file.to_ascii_lowercase();
     [".md", ".txt", ".rst", ".adoc"]
         .iter()

@@ -51,6 +51,9 @@ const NO_CAP: &str = "Go on without a cap";
 const EVERY_LENS: &str = "Every lens";
 const ORCHESTRATOR: &str = "The Orchestrator";
 const KEEP_THEM: &str = "Keep them";
+const FIX_NOW: &str = "Fix it now";
+const TICKET: &str = "A ticket";
+const LEAVE: &str = "Leave it";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Question {
@@ -86,6 +89,9 @@ enum Topic {
     /// Files a fix changed that are flagged, by their place in the run's
     /// list: each kept or reverted.
     Flags(Vec<usize>),
+    /// What a fix noted for a person, by its place in the run's list: a
+    /// change it needed outside its files, or a doc it left stale.
+    Note(usize),
     Missed,
     Final,
 }
@@ -323,6 +329,7 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
         });
     }
     out.extend(flagged(run));
+    out.extend(noted(run));
     match run.stage {
         Stage::Scope => {
             out.push(Asked {
@@ -451,6 +458,53 @@ fn flagged(run: &Run) -> Vec<Asked> {
         first = last + 1;
     }
     out
+}
+
+/// What fixes noted for a person and nobody has answered: each a change a
+/// fix needed outside its files, or a doc it left stale, to fix now, ticket
+/// or leave, before the next round's reviewers read the change.
+fn noted(run: &Run) -> Vec<Asked> {
+    run.fix_notes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.state == super::flow::NoteState::Open)
+        .enumerate()
+        .map(|(k, (i, n))| {
+            let fix_now = if n.kind == "stale" {
+                format!(
+                    "A follow-up fix may change {} to say what's true, before the next round's \
+                     reviewers",
+                    n.path
+                )
+            } else {
+                format!(
+                    "A follow-up fix may change {}, before the next round's reviewers",
+                    n.path
+                )
+            };
+            Asked {
+                topic: Topic::Note(i),
+                question: question(
+                    &format!("Noted {}", k + 1),
+                    cut(
+                        &format!(
+                            "Round {}'s fix couldn't change this, which its blockers don't point \
+                             at, and noted it instead: {}. What now?",
+                            n.round,
+                            n.line()
+                        ),
+                        DETAIL,
+                    ),
+                    vec![
+                        choice(FIX_NOW, fix_now),
+                        choice(TICKET, "Left for later, as a ticket in the report"),
+                        choice(LEAVE, "Left as it is"),
+                    ],
+                    false,
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Answers are keyed by a question's text, so no two may share it: a later
@@ -1253,6 +1307,32 @@ pub fn apply(
                     };
                 }
             }
+            Topic::Note(i) => {
+                let i = *i;
+                if i < run.fix_notes.len() {
+                    let state = if chose(pick, FIX_NOW) {
+                        super::flow::NoteState::FixNow
+                    } else if chose(pick, LEAVE) {
+                        super::flow::NoteState::Left
+                    } else {
+                        super::flow::NoteState::Ticket
+                    };
+                    run.fix_notes[i].state = state;
+                    if state == super::flow::NoteState::FixNow {
+                        let note = run.fix_notes[i].clone();
+                        run.locked.retain(|l| l.path != note.path);
+                        let id = format!("follow-up-{}", run.reported.len() + 1);
+                        run.reported.push(Reported {
+                            id,
+                            round: note.round,
+                            text: note.line(),
+                            fixed: false,
+                            path: Some(note.path),
+                            follow_up: true,
+                        });
+                    }
+                }
+            }
             Topic::Missed => {
                 if let Some(Picked::Other(text)) = pick
                     && !text.trim().is_empty()
@@ -1263,6 +1343,8 @@ pub fn apply(
                         round: run.round,
                         text: text.trim().to_string(),
                         fixed: false,
+                        path: None,
+                        follow_up: false,
                     });
                     applied.feedback.push(Feedback {
                         at,

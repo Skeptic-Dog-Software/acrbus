@@ -823,6 +823,7 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         facts: None,
         cache_key: None,
         allowed_tools: None,
+        allowed_paths: None,
         relay_tokens: None,
         relay_after_edit: None,
         // The host's MCP servers it names, and none it doesn't.
@@ -1471,6 +1472,8 @@ struct BridgeCaller {
     /// Calls, by label, restarted after their model couldn't be reached:
     /// they go with a new cache key.
     rekeyed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The running fix's scope, as JSON, for the calls that write.
+    fix_scope: std::sync::Mutex<Option<String>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1509,6 +1512,7 @@ impl BridgeCaller {
             sent: Default::default(),
             unrelayed: Default::default(),
             rekeyed: Default::default(),
+            fix_scope: Default::default(),
             cap: Default::default(),
         })
     }
@@ -1788,6 +1792,11 @@ impl Caller for BridgeCaller {
             .insert(label.to_string());
     }
 
+    fn fix_scope(&self, scope: Option<&flow::FixScope>) {
+        *self.fix_scope.lock().unwrap_or_else(|e| e.into_inner()) =
+            scope.and_then(|s| serde_json::to_string(s).ok());
+    }
+
     fn over_cap(&self) -> Option<String> {
         let cap = (*self.cap.lock().unwrap_or_else(|e| e.into_inner()))?;
         let spent = self.progress.spent();
@@ -1877,6 +1886,14 @@ impl BridgeCaller {
         {
             let holds = crate::bridge::holds_tools(&self.paths, bridge);
             with_shared(&mut options, call, shared, holds);
+        }
+        // A fix: what it may change, for an agent its bridge can hold to it.
+        if call.writes {
+            options.allowed_paths = self
+                .fix_scope
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
         }
         // A restart after its model couldn't be reached: a new key, so it
         // may land on another replica than the one that didn't answer.
@@ -2607,6 +2624,14 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for f in &run.flags {
         eprintln!("{APP_NAME}: {}", report::flag_line(f));
+    }
+    for g in &run.guarded {
+        if let Some(line) = report::guarded_line(g) {
+            eprintln!("{APP_NAME}: {line}");
+        }
+    }
+    for n in &run.fix_notes {
+        eprintln!("{APP_NAME}: {}", report::note_line(n));
     }
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if let Some(pr) = pr {
