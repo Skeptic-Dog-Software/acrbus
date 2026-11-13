@@ -198,6 +198,9 @@ pub struct Plan {
     /// Which lenses attack again after a fix, if the config or a flag says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reattack: Option<Reattack>,
+    /// The review's spend cap, if one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<super::config::SpendCap>,
     /// The expected cost with every lens attacking after each fix, as long
     /// as the longest lens took before: what `reattack: all` would cost
     /// here. None with no finished reviews to go by.
@@ -577,6 +580,7 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         fix,
         fixer: cfg.savings.fixer.clone(),
         reattack: cfg.reattack,
+        spend_cap: cfg.spend_cap,
         expected_all,
         least,
         expected,

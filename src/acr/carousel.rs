@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -46,6 +46,8 @@ const NOT_NOW: &str = "Not now";
 const NONE: &str = "None of them";
 const SESSION: &str = "This session";
 const ONLY_BLOCKED: &str = "Only lenses with blockers";
+const RAISE_CAP: &str = "Raise the cap";
+const NO_CAP: &str = "Go on without a cap";
 const EVERY_LENS: &str = "Every lens";
 const ORCHESTRATOR: &str = "The Orchestrator";
 const KEEP_THEM: &str = "Keep them";
@@ -215,6 +217,34 @@ fn who(run: &Run) -> &'static str {
         Fixer::Session => "This session",
         Fixer::Orchestrator => "The Orchestrator",
     }
+}
+
+/// A spend cap a person typed: dollars, such as `$20`, or tokens, such as
+/// `3000000 tokens`.
+fn new_cap(text: &str) -> Result<super::config::SpendCap> {
+    let t = text.trim().to_lowercase();
+    let number: String = t
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let n: f64 = number
+        .parse()
+        .ok()
+        .filter(|n: &f64| n.is_finite() && *n > 0.0)
+        .with_context(|| {
+            format!("{text:?} isn't a spend cap: say one such as $20 or 3000000 tokens")
+        })?;
+    Ok(if t.contains("token") {
+        super::config::SpendCap {
+            usd: None,
+            tokens: Some(n as u64),
+        }
+    } else {
+        super::config::SpendCap {
+            usd: Some(n),
+            tokens: None,
+        }
+    })
 }
 
 /// Which lenses attack again after each fix: an intensity, asked when the
@@ -503,6 +533,19 @@ fn escalation(run: &Run, reason: &str, about: Option<&About>) -> Question {
                     "Fold in its blockers and attack the fix once more",
                 ),
                 choice(STOP, "End here, with the blockers open"),
+            ],
+            false,
+        ),
+        Some(About::SpendCap) => question(
+            "Spend cap",
+            format!("{reason}. No new call starts until you say."),
+            vec![
+                choice(
+                    RAISE_CAP,
+                    "Say the new cap in your own words instead, such as $20 or 3000000 tokens",
+                ),
+                choice(NO_CAP, "The review goes on with no cap"),
+                choice(STOP, "End the review here"),
             ],
             false,
         ),
@@ -1000,10 +1043,13 @@ pub fn apply(
         );
     }
     // Free text only means something where a question says what it does.
+    let says_what = |topic: &Topic| {
+        matches!(topic, Topic::Blocker { .. } | Topic::Missed)
+            || matches!(topic, Topic::Escalation(n)
+                if run.escalations.get(*n).and_then(|e| e.about.as_ref()) == Some(&About::SpendCap))
+    };
     for (topic, q, pick) in &picks {
-        if let (Some(Picked::Other(text)), false) =
-            (pick, matches!(topic, Topic::Blocker { .. } | Topic::Missed))
-        {
+        if let (Some(Picked::Other(text)), false) = (pick, says_what(topic)) {
             let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
             bail!(
                 "\"{text}\" doesn't answer [{}] {}: choose one of {}",
@@ -1074,6 +1120,16 @@ pub fn apply(
                         fold = true;
                         Stage::Fix
                     };
+                }
+                Some(About::SpendCap) if chose(pick, NO_CAP) => run.spend_cap = None,
+                Some(About::SpendCap) if !stop => {
+                    let Some(Picked::Other(text)) = pick else {
+                        bail!(
+                            "say the new spend cap in your own words, such as $20 or 3000000 \
+                             tokens, or go on without one"
+                        );
+                    };
+                    run.spend_cap = Some(new_cap(text)?);
                 }
                 Some(About::Unfixed) if chose(pick, AGAIN) => run.stage = Stage::Fix,
                 Some(About::Unfixed) if chose(pick, SESSION) => {

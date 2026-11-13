@@ -83,6 +83,10 @@ pub struct Target {
     /// or the review asks at its scope gate.
     #[arg(long, value_parser = parse_reattack)]
     reattack: Option<config::Reattack>,
+    /// A spend cap for this review, in dollars: past it, no new call
+    /// starts, and you're asked to raise it, go on without it, or stop.
+    #[arg(long, value_name = "USD")]
+    spend_cap_usd: Option<f64>,
     #[arg(long, value_parser = parse_scope)]
     review_scope: Option<ReviewScope>,
     /// Use a binding for a role, as `role=name`. Can be repeated.
@@ -556,6 +560,7 @@ fn flags(t: &Target) -> Flags {
         human_gate: t.human_gate,
         max_rounds: t.max_rounds,
         reattack: t.reattack,
+        spend_cap_usd: t.spend_cap_usd,
         review_scope: t.review_scope,
         bindings: t.bindings.iter().cloned().collect(),
     }
@@ -1431,6 +1436,8 @@ fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<C
 /// Reaches models through bridges, as `acrbus call` does. Each call is a
 /// fresh session, limited to its binding's tools.
 struct BridgeCaller {
+    /// The review's spend cap, set as it runs.
+    cap: std::sync::Mutex<Option<config::SpendCap>>,
     socket: PathBuf,
     agent: String,
     store: Attachments,
@@ -1502,6 +1509,7 @@ impl BridgeCaller {
             sent: Default::default(),
             unrelayed: Default::default(),
             rekeyed: Default::default(),
+            cap: Default::default(),
         })
     }
 
@@ -1778,6 +1786,16 @@ impl Caller for BridgeCaller {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(label.to_string());
+    }
+
+    fn over_cap(&self) -> Option<String> {
+        let cap = (*self.cap.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let spent = self.progress.spent();
+        cap.reached(spent.usd, spent.fresh + spent.cached)
+    }
+
+    fn set_cap(&self, cap: Option<config::SpendCap>) {
+        *self.cap.lock().unwrap_or_else(|e| e.into_inner()) = cap;
     }
 
     fn has_room(&self, binding: &config::Binding) -> bool {
@@ -3078,6 +3096,13 @@ fn describe_plan(plan: &plan::Plan) {
         }
     };
     println!("Re-attack: {reattack}.");
+    if let Some(cap) = &plan.spend_cap {
+        println!(
+            "Spend cap: {}. Past it, no new call starts; calls at work finish, and you're asked \
+             to raise it, go on without it, or stop.",
+            cap.line()
+        );
+    }
     if let (Some(e), Some(all)) = (&plan.expected, &plan.expected_all) {
         println!(
             "  Expected with every lens attacking after each fix: {}, against {} with only \
@@ -3282,6 +3307,13 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 ));
             }
             run.weakened = weakened;
+            if let Some(cap) = &run.spend_cap {
+                caller.note(&format!(
+                    "spend cap: {}; past it, no new call starts, and you're asked to raise it, \
+                     go on without it, or stop",
+                    cap.line()
+                ));
+            }
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
@@ -3665,6 +3697,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 human_gate: None,
                 max_rounds: None,
                 reattack: None,
+                spend_cap_usd: None,
                 review_scope: None,
                 bindings: Vec::new(),
                 description: None,
@@ -3944,6 +3977,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         human_gate: None,
         max_rounds: None,
         reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4247,6 +4281,7 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
         human_gate: None,
         max_rounds: None,
         reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4284,6 +4319,7 @@ fn pipeline_arm(
         human_gate: None,
         max_rounds: None,
         reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: if converge {
             vec![(Role::Orchestrator, STEELMAN_BINDING.to_string())]
@@ -4546,6 +4582,7 @@ fn calibrate(
         human_gate: None,
         max_rounds: None,
         reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -5712,6 +5749,7 @@ mod tests {
             human_gate: None,
             max_rounds: None,
             reattack: None,
+            spend_cap_usd: None,
             review_scope: None,
             bindings: Vec::new(),
             description: None,

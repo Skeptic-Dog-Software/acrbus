@@ -312,6 +312,10 @@ pub struct Policy {
     /// from a terminal or Grayboard, never `acr resume --answers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers: Option<Answers>,
+    /// A review's spend cap: past it, no new calls start, and a person is
+    /// asked to raise it, go on without it, or stop. Unset by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<SpendCap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_escalate: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -899,6 +903,7 @@ impl Policy {
         self.max_rounds = later.max_rounds.or(self.max_rounds);
         self.reattack = later.reattack.or(self.reattack);
         self.answers = later.answers.or(self.answers);
+        self.spend_cap = later.spend_cap.or(self.spend_cap);
         self.always_escalate = later.always_escalate.or(self.always_escalate);
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
@@ -1107,6 +1112,46 @@ pub fn weakened(config: &Config, run: &Config) -> Vec<String> {
     out
 }
 
+/// A review's spend cap, in dollars, in tokens (fresh and cached), or both:
+/// whichever its finished calls reach first. Past it, no new call starts,
+/// calls at work finish, and the review asks a person to raise it, go on
+/// without it, or stop. It never cuts off a call that's working.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpendCap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+impl SpendCap {
+    /// Why it's reached, by spend so far: None while it isn't.
+    pub fn reached(&self, usd: f64, tokens: u64) -> Option<String> {
+        if let Some(cap) = self.usd
+            && usd >= cap
+        {
+            return Some(format!("${usd:.2} spent, at its spend cap of ${cap:.2}"));
+        }
+        if let Some(cap) = self.tokens
+            && tokens >= cap
+        {
+            return Some(format!("{tokens} tokens used, at its spend cap of {cap}"));
+        }
+        None
+    }
+
+    /// What it is, for a person.
+    pub fn line(&self) -> String {
+        match (self.usd, self.tokens) {
+            (Some(usd), Some(t)) => format!("${usd:.2} or {t} tokens, whichever comes first"),
+            (Some(usd), None) => format!("${usd:.2}"),
+            (None, Some(t)) => format!("{t} tokens"),
+            (None, None) => "none".into(),
+        }
+    }
+}
+
 /// Who may answer a review's questions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1126,6 +1171,8 @@ pub struct Flags {
     pub human_gate: Option<HumanGate>,
     pub max_rounds: Option<u32>,
     pub reattack: Option<Reattack>,
+    /// `--spend-cap-usd`: a spend cap in dollars for this run.
+    pub spend_cap_usd: Option<f64>,
     pub review_scope: Option<ReviewScope>,
     pub bindings: BTreeMap<Role, String>,
 }
@@ -1144,6 +1191,9 @@ pub struct Config {
     /// Who may answer the review's questions.
     #[serde(default)]
     pub answers: Answers,
+    /// The review's spend cap, if one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<SpendCap>,
     pub always_escalate: Vec<String>,
     pub review_scope: ReviewScope,
     pub integrations: Integrations,
@@ -1273,6 +1323,10 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         human_gate: flags.human_gate,
         max_rounds: flags.max_rounds,
         reattack: flags.reattack,
+        spend_cap: flags.spend_cap_usd.map(|usd| SpendCap {
+            usd: Some(usd),
+            tokens: None,
+        }),
         review_scope: flags.review_scope,
         bindings: flags.bindings.clone(),
         ..Policy::default()
@@ -1295,6 +1349,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         max_rounds: merged.max_rounds.expect("set by the framework"),
         reattack: merged.reattack,
         answers: merged.answers.unwrap_or_default(),
+        spend_cap: merged.spend_cap,
         always_escalate: merged.always_escalate.unwrap_or_default(),
         review_scope: merged.review_scope.expect("set by the framework"),
         integrations: merged.integrations.unwrap_or_default(),
@@ -2435,6 +2490,7 @@ mod tests {
             max_rounds: Some(1),
             reattack: Some(Reattack::All),
             answers: Some(Answers::Person),
+            spend_cap: Some(SpendCap::default()),
             always_escalate: Some(Vec::new()),
             review_scope: Some(ReviewScope::WholePr),
             integrations: Some(Integrations::default()),

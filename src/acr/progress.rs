@@ -198,6 +198,12 @@ impl Progress {
         self.shared.say(&[what.to_string()]);
     }
 
+    /// What the review's finished calls have used so far, before this
+    /// process included.
+    pub fn spent(&self) -> Spent {
+        lock(&self.shared.state).spent
+    }
+
     /// The plan's estimate, and what the review used before this process,
     /// to say the run's total against it as it goes.
     pub fn budget(&self, budget: Budget, spent: Spent) {

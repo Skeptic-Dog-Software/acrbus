@@ -159,6 +159,15 @@ pub trait Caller: Sync {
     /// reached: it goes with a new cache key, so it may land on another
     /// replica than the one that didn't answer.
     fn rekey(&self, _label: &str) {}
+
+    /// Why no new call may start, if the review's spend cap is reached by
+    /// what its calls have spent so far.
+    fn over_cap(&self) -> Option<String> {
+        None
+    }
+
+    /// The review's spend cap, from now on: None for none.
+    fn set_cap(&self, _cap: Option<super::config::SpendCap>) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +373,9 @@ pub enum About {
     MaxRounds,
     /// The Orchestrator couldn't fix what was folded in.
     Unfixed,
+    /// The review reached its spend cap: raise it, go on without it, or
+    /// stop.
+    SpendCap,
 }
 
 /// A defect a person says the reviewers missed. It's folded in like a
@@ -583,6 +595,10 @@ pub struct Run {
     /// outside a review to convergence, where a steelman's carry them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_briefs: Option<FixBriefs>,
+    /// The review's spend cap, as its config or flag set it, or a person
+    /// raised or lifted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<super::config::SpendCap>,
     /// Which lenses attack again after a fix, as the config, a flag or a
     /// person at the scope gate chose. None: nobody chose, so `blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1405,6 +1421,9 @@ fn restartable(e: &anyhow::Error) -> Option<bool> {
     unusable.then_some(false)
 }
 
+/// What a pause for the spend cap says first, to tell it from an outage.
+pub const SPEND_CAP: &str = "the review's spend cap";
+
 /// The label of a unit's session restarted fresh.
 fn restarted_label(label: &str) -> String {
     format!("{label}, restarted")
@@ -1548,6 +1567,15 @@ impl OutageWatch {
         self.lock().declared.clone()
     }
 
+    /// Stops the round's new calls, for `why`, if nothing has yet.
+    fn declare(&self, why: String) {
+        let mut st = self.lock();
+        if st.declared.is_none() {
+            st.declared = Some(why);
+        }
+        self.changed.notify_all();
+    }
+
     fn started(&self) {
         let mut st = self.lock();
         st.in_flight += 1;
@@ -1615,6 +1643,11 @@ struct Watched<'a> {
 
 impl Caller for Watched<'_> {
     fn call(&self, call: &Call) -> Result<Answer> {
+        // Past the spend cap, no new call starts: the round pauses as for
+        // an outage, keeping what its calls finished.
+        if let Some(why) = self.inner.over_cap() {
+            self.watch.declare(format!("{SPEND_CAP}: {why}"));
+        }
         if let Some(why) = self.watch.declared() {
             return Err(anyhow::Error::new(Outage(why)));
         }
@@ -1658,6 +1691,12 @@ impl Caller for Watched<'_> {
     }
     fn rekey(&self, label: &str) {
         self.inner.rekey(label)
+    }
+    fn over_cap(&self) -> Option<String> {
+        self.inner.over_cap()
+    }
+    fn set_cap(&self, cap: Option<super::config::SpendCap>) {
+        self.inner.set_cap(cap)
     }
 }
 
@@ -2047,6 +2086,14 @@ fn watched<T>(
     label: &str,
     mut f: impl FnMut(&mut Run) -> Result<T>,
 ) -> Result<T> {
+    if let Some(why) = caller.over_cap() {
+        let why = format!("{SPEND_CAP}: {why}");
+        run.outage = Some(Paused {
+            round: run.round,
+            why: why.clone(),
+        });
+        return Err(anyhow::Error::new(Outage(why)));
+    }
     match f(run) {
         Err(e) if is_connection(&e) => {
             caller.say(&format!(
@@ -2482,6 +2529,7 @@ pub fn start(
         fix_briefs: None,
         reattack: s.cfg.reattack,
         builder_brief: s.builder_brief.clone(),
+        spend_cap: s.cfg.spend_cap,
         weakened: Vec::new(),
         answered_by: Vec::new(),
         fix: None,
@@ -7270,9 +7318,32 @@ pub fn drive(
 ) -> Result<()> {
     run.status = Status::Running;
     run.waiting = None;
+    caller.set_cap(run.spend_cap);
     loop {
         let known = failures(run).len();
-        let stepped = step(run, s, caller, reload)?;
+        let capped = |run: &Run| {
+            run.outage
+                .as_ref()
+                .is_some_and(|o| o.why.starts_with(SPEND_CAP))
+        };
+        let stepped = match step(run, s, caller, reload) {
+            // The spend cap, reached: its calls at work finished, and a
+            // person decides whether it goes on.
+            Err(e) if is_outage(&e) && capped(run) => {
+                let why = run
+                    .outage
+                    .as_ref()
+                    .map(|o| o.why.clone())
+                    .unwrap_or_default();
+                caller.say(&format!(
+                    "{why}: no new call starts; raise the cap, go on without it, or stop"
+                ));
+                escalate_about(run, why, Some(About::SpendCap));
+                pause(run, Gate::Escalation);
+                return Ok(());
+            }
+            stepped => stepped?,
+        };
         if s.stop_on_failure {
             let now = failures(run);
             if now.len() > known {
@@ -7674,6 +7745,9 @@ lenses:
         /// "edited": a fix's edits, left whatever its answer.
         edits_once: bool,
         edited: std::sync::atomic::AtomicBool,
+        /// Past this many calls, the spend cap is reached, while one is set.
+        capped_after: Option<usize>,
+        cap: Mutex<Option<super::super::config::SpendCap>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -7702,6 +7776,8 @@ lenses:
                 rekeyed: Mutex::new(Vec::new()),
                 edits_once: false,
                 edited: Default::default(),
+                capped_after: None,
+                cap: Mutex::new(None),
             }
         }
 
@@ -7782,6 +7858,16 @@ lenses:
 
         fn rekey(&self, label: &str) {
             self.rekeyed.lock().unwrap().push(label.to_string());
+        }
+
+        fn over_cap(&self) -> Option<String> {
+            let n = self.capped_after?;
+            self.cap.lock().unwrap().as_ref()?;
+            (self.calls.lock().unwrap().len() >= n).then(|| format!("{n} calls in"))
+        }
+
+        fn set_cap(&self, cap: Option<super::super::config::SpendCap>) {
+            *self.cap.lock().unwrap() = cap;
         }
 
         fn snapshot(&self, _repo: &Path) -> Option<String> {
@@ -14521,6 +14607,47 @@ lenses:
                 .iter()
                 .any(|e| e.reason.contains("unreachable"))
         );
+    }
+
+    #[test]
+    fn at_its_spend_cap_a_review_starts_no_new_call_and_asks_whether_to_go_on() {
+        let mut cfg = plain("exception", 3, 1);
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let mut fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached once the first call is in.
+        fake.capped_after = Some(1);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        assert_eq!(run.spend_cap, cfg.spend_cap);
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.about == Some(About::SpendCap) && e.reason.starts_with(SPEND_CAP)),
+            "{:?}",
+            run.escalations
+        );
+        let calls_then = fake.calls.lock().unwrap().len();
+        assert!(said(&fake).contains("no new call starts"));
+        // Raised, in a person's words, it goes on, keeping what finished.
+        let a = answered(&run, &cfg, &[("Spend cap", "$5".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert_eq!(run.spend_cap.and_then(|c| c.usd), Some(5.0));
+        // Lifted, it goes on to the end.
+        run.spend_cap = None;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert!(fake.calls.lock().unwrap().len() > calls_then);
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
     }
 
     #[test]
