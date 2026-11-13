@@ -7,7 +7,7 @@ fixes them in the structure of the review, not in a prompt.
 
 acrbus doesn't review anything itself. Every reviewer, Judge, Sizer and
 Orchestrator is a model running headless in a harness, such as Claude Code,
-pi or omp, or called through a model's API. A [binding](bindings.md) says
+pi or omp. A [binding](bindings.md) says
 which harness and model each role uses, and each role can use a different
 one. acrbus is what runs around them.
 
@@ -52,7 +52,8 @@ refuses a repository until you have.
 
 The proposal is a starting point, not a baseline. After each review you
 say how it did, finding by finding, and what it missed. Recalibrating folds
-that back into the config, so the next review gets it right. A repository
+that back into the config, aiming the next review at what this one got
+wrong. A repository
 with little history to go on gets a config from its code, and leans more on
 your feedback.
 
@@ -204,8 +205,9 @@ only what didn't.
 
 ## Reviewers stay in their lane
 
-Reviewers read the code under review, not your other files, and nothing
-they do is written back to the repository. A fix keeps to the source, and
+Reviewers are told to read the code under review, not your other files,
+and nothing they do is copied back to the repository. That's guidance and
+structure, not a sandbox: an agent with a shell runs as you. A fix keeps to the source, and
 every file it changes is listed: a binary, or a file none of its blockers
 points at, is put to you, to keep or revert.
 

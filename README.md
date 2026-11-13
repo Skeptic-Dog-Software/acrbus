@@ -46,9 +46,11 @@ acrbus, carries the same bus between machines over Tailscale.
    Code, in a terminal, or on your phone through Grayboard.
 8. **Fix, and attack again.** The blockers you choose are fixed, by the
    review's Orchestrator or by the session that started the review, and
-   fresh reviewers attack the new version. A fix for one lens can break
-   another, so every lens attacks again, and the review ends when they all
-   pass the same version.
+   fresh reviewers attack the new version: the lenses that had blockers,
+   any that didn't finish, and any the fix now brings in. A lens that
+   passed before isn't attacked again unless you ask for another round. A
+   review to convergence, which `acrbus acr trial` runs, attacks every lens
+   after each fix and ends only when they all pass the same version.
 9. **It learns.** You say how the review did, finding by finding, and what
    it missed. Recalibrating folds that into the repository's config.
 
