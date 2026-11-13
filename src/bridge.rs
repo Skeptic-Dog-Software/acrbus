@@ -128,6 +128,13 @@ pub struct Settings {
     /// table says only what's this machine's and what differs.
     #[serde(default)]
     pub kind: Option<Kind>,
+    /// What requests it runs: `any` (the default for a bridge you write),
+    /// or `review`, only an ACR review's calls, as `acrbus setup acr`
+    /// writes for its bridge. A request to run its agent outside a review
+    /// gets no ACR system prompt, and a bridge that may write would run it
+    /// with every tool, so one made for reviews takes nothing else.
+    #[serde(default)]
+    pub accepts: Accepts,
     /// The agent's program.
     pub command: PathBuf,
     /// Its arguments, with the placeholders `expand` fills in.
@@ -198,6 +205,15 @@ pub struct Settings {
     /// Where the agent records what its model calls used, for results that
     /// carry real usage.
     pub usage: Option<UsageFrom>,
+}
+
+/// What requests a bridge runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Accepts {
+    #[default]
+    Any,
+    Review,
 }
 
 /// How a run sees its message's attachments.
@@ -715,6 +731,14 @@ impl Settings {
             relay_after_edit: false,
             mcp: Vec::new(),
         };
+        let review = options.is_some_and(|o| o.review == Some(true));
+        if self.accepts == Accepts::Review && !review {
+            return Err(
+                "this bridge runs only ACR review calls (accepts = \"review\"): give \
+                        it accepts = \"any\" in its table to run others"
+                    .into(),
+            );
+        }
         let Some(options) = options else {
             return Ok(plan);
         };
@@ -5709,6 +5733,33 @@ mod tests {
                 .unwrap_err()
                 .contains("doesn't let a request name MCP servers")
         );
+    }
+
+    #[test]
+    fn a_bridge_made_for_reviews_runs_only_review_calls() {
+        let settings = |accepts: &str| -> Settings {
+            let table: toml::Value = toml::from_str(&format!(
+                "kind = \"claude\"\n{accepts}owner = \"o\"\ncommand = \"/bin/sh\"\n\
+                 home = \"/h\"\nworking_directory = \"/h\"\npath = \"/bin\"\n"
+            ))
+            .unwrap();
+            with_defaults(table).unwrap().try_into().unwrap()
+        };
+        let review = RunOptions {
+            review: Some(true),
+            ..RunOptions::default()
+        };
+        let other = RunOptions::default();
+        let only = settings("accepts = \"review\"\n");
+        assert!(only.plan(Some(&review)).is_ok());
+        for asked in [None, Some(&other)] {
+            let e = only.plan(asked).unwrap_err();
+            assert!(e.contains("runs only ACR review calls"), "{e}");
+        }
+        // Left out, as for a bridge you write, it runs any request.
+        let any = settings("");
+        assert_eq!(any.accepts, Accepts::Any);
+        assert!(any.plan(None).is_ok() && any.plan(Some(&other)).is_ok());
     }
 
     #[test]
