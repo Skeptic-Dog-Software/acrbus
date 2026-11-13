@@ -184,6 +184,13 @@ tried again. Stopping a review stops its calls, and its usage still counts
 every call that finished, in a round marked as unfinished. A failed reviewer or Judge is never taken for a
 clean pass, and a lens with nothing for its Judge says so.
 
+A reviewer that answers in prose instead of the form asked has its report
+put in form by a quick call, adding and dropping nothing. If even that
+can't be read, the reviewer gave no answer, so it's asked again once, in a
+fresh session; for a scouted lens, that's the one check that gave none. A
+second that's no better fails the lens, which is asked about at the gate.
+Whatever a failed session used is counted with its round.
+
 ## Reviewers stay in their lane
 
 Reviewers read the code under review, not your other files, and nothing
