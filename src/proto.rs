@@ -109,6 +109,11 @@ pub struct RunOptions {
     /// takes it; the reply's `applied` says whether it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_tokens: Option<u64>,
+    /// With `relay_tokens`: a call that changes the code, whose relay counts
+    /// what its prompt grew since its first turn, and hands off only once
+    /// it has made an edit, or has grown twice that size without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_after_edit: Option<bool>,
 }
 
 /// A file held by its hash on each bus it reaches.
@@ -219,6 +224,10 @@ pub struct RunUsage {
     /// turn asked for at once.
     #[serde(default)]
     pub tool_calls: u64,
+    /// Its bridge counts tool calls, so `tool_calls` of 0 means none were
+    /// made, not that none were counted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counts_tools: bool,
 }
 
 /// One model call's tokens, by the agent's own record.

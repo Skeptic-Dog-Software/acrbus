@@ -92,6 +92,8 @@ const TURNS_ENV: &str = "ACRBUS_TURNS";
 /// carry on from. The extension reads each turn's size from the same usage
 /// it logs for `ACRBUS_TURNS`.
 const RELAY_ENV: &str = "ACRBUS_RELAY_TOKENS";
+/// A fixer's relay: by what its prompt grew, once it has edited.
+const RELAY_GROWTH_ENV: &str = "ACRBUS_RELAY_GROWTH";
 /// acrbus's extension for pi, which sends the cache key where a gateway
 /// passes it on, says what the cache served, and holds a call to its tools.
 const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
@@ -290,6 +292,8 @@ struct Plan {
     allowed_tools: Option<Vec<String>>,
     /// Where the call hands off, when its agent can be steered mid-call.
     relay_tokens: Option<u64>,
+    /// Its relay is a fixer's: by what it grew, after its first edit.
+    relay_after_edit: bool,
 }
 
 impl Plan {
@@ -672,6 +676,7 @@ impl Settings {
             cache_key: None,
             allowed_tools: None,
             relay_tokens: None,
+            relay_after_edit: false,
         };
         let Some(options) = options else {
             return Ok(plan);
@@ -696,6 +701,7 @@ impl Settings {
             }
             if self.agent_kind() == Some(Kind::Pi) {
                 plan.relay_tokens = Some(tokens);
+                plan.relay_after_edit = options.relay_after_edit == Some(true);
             }
         }
         if let Some(facts) = &options.facts {
@@ -3214,6 +3220,9 @@ impl Bridge {
             command.env(TURNS_ENV, "1");
             if let Some(tokens) = plan.relay_tokens {
                 command.env(RELAY_ENV, tokens.to_string());
+                if plan.relay_after_edit {
+                    command.env(RELAY_GROWTH_ENV, "1");
+                }
             }
         }
         // Anthropic's longer-lived prompt cache, which Claude Code takes by
@@ -6792,6 +6801,142 @@ writeSync(1, "still running\n");
         // but nothing tells it to hand off.
         assert!(whole.trim_end().ends_with("relay="), "{whole}");
         assert!(whole.contains("[-e]\n["), "{whole}");
+    }
+
+    #[test]
+    fn a_fixers_relay_reaches_pi_as_growth_after_an_edit() {
+        let rig = Rig::new();
+        let script =
+            r#"printf 'relay=%s growth=%s\n' "$ACRBUS_RELAY_TOKENS" "$ACRBUS_RELAY_GROWTH""#;
+        let bridge = rig.start(rig.settings(script, PI_TOOLS));
+        let fixer = rig.reply_to(&rig.ask_with(with(RunOptions {
+            review: Some(true),
+            relay_tokens: Some(64_000),
+            relay_after_edit: Some(true),
+            ..RunOptions::default()
+        })));
+        let reviewer = rig.reply_to(&rig.ask_with(with(RunOptions {
+            review: Some(true),
+            relay_tokens: Some(64_000),
+            ..RunOptions::default()
+        })));
+        bridge.stop().unwrap();
+        assert!(fixer.contains("relay=64000 growth=1"), "{fixer}");
+        assert!(
+            reviewer.trim_end().ends_with("relay=64000 growth="),
+            "{reviewer}"
+        );
+    }
+
+    #[test]
+    fn the_pi_extension_relays_a_fixer_by_its_growth_and_only_after_its_first_edit() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-relay-growth-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const load = () => {
+  const handlers = {};
+  acrbus({ on: (name, f) => { (handlers[name] ??= []).push(f); } });
+  const fire = async (name, event) => {
+    let out;
+    for (const f of handlers[name] ?? []) out = (await f(event, {})) ?? out;
+    return out ?? null;
+  };
+  const turn = async (input, cacheRead, tools) => {
+    const message = { role: "assistant", usage: { input, cacheRead, cacheWrite: 0, output: 10 } };
+    await fire("message_end", { message });
+    return fire("turn_end", { turnIndex: 1, message, toolResults: tools ? [{}] : [], entries: [] });
+  };
+  return { fire, turn };
+};
+const out = {};
+// Run G's shape: a 13k opening, then reading, with no edit yet.
+{
+  const { fire, turn } = load();
+  out.g = [];
+  out.g.push(await turn(1000, 12000, true));
+  out.g.push(await turn(1000, 60000, true));
+  out.g.push(await turn(1000, 74000, true));
+  out.g.push(await turn(1000, 79000, true));
+  await fire("tool_call", { toolName: "read" });
+  out.g.push(await turn(1000, 85000, true));
+  await fire("tool_call", { toolName: "edit" });
+  out.edited = await turn(1000, 90000, true);
+}
+// Never an edit: at twice its size it hands off anyway, for acrbus to see.
+{
+  const { turn } = load();
+  out.never = [];
+  out.never.push(await turn(1000, 12000, true));
+  out.never.push(await turn(1000, 139000, true));
+  out.twice = await turn(1000, 141000, true);
+}
+// A first turn with no response read nothing: growth counts from the next.
+{
+  const { fire, turn } = load();
+  await turn(0, 0, true);
+  out.blank = await turn(1000, 79000, true);
+  await fire("tool_call", { toolName: "write" });
+  out.wrote = await turn(1000, 81000, true);
+}
+console.log(JSON.stringify(out));
+"#,
+        )
+        .unwrap();
+        let run = |growth: bool| -> (serde_json::Value, String) {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .env_remove("ACRBUS_CACHE_KEY")
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_EFFORT")
+                .env_remove("ACRBUS_TURNS")
+                .env_remove("ACRBUS_RELAY_GROWTH")
+                .env("ACRBUS_RELAY_TOKENS", "64000");
+            if growth {
+                c.env("ACRBUS_RELAY_GROWTH", "1");
+            }
+            let out = c.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            (serde_json::from_slice(&out.stdout).unwrap(), stderr)
+        };
+        let (on, said) = run(true);
+        for (i, t) in on["g"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(*t, serde_json::Value::Null, "turn {}: no edit yet", i + 1);
+        }
+        assert_eq!(on["edited"]["continue"], true, "{on}");
+        assert!(
+            said.contains(
+                "acrbus relay: turn 1 grew 78000 prompt tokens since its first turn's 13000, past 64000, after an edit: handing off"
+            ),
+            "{said}"
+        );
+        for t in on["never"].as_array().unwrap() {
+            assert_eq!(*t, serde_json::Value::Null);
+        }
+        assert_eq!(on["twice"]["continue"], true, "{on}");
+        assert!(
+            said.contains("grew 129000 prompt tokens since its first turn's 13000, past twice 64000, with no edit: handing off"),
+            "{said}"
+        );
+        // Counted from 0, it would have grown 82000 by its edit: from the
+        // first turn that read, 2000.
+        assert_eq!(on["blank"], serde_json::Value::Null, "{on}");
+        assert_eq!(on["wrote"], serde_json::Value::Null, "{on}");
+        assert!(!said.contains("first turn's 0,"), "{said}");
+        // As a reviewer's relay, by its size alone: G's third turn.
+        let (off, _) = run(false);
+        assert_eq!(off["g"][2]["continue"], true, "{off}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

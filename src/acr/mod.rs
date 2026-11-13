@@ -647,6 +647,9 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
         // A reviewer or Judge that hands off past a size: a fresh session
         // carries on from its handoff.
         relay_tokens: call.relay_tokens,
+        // A fixer's: counted from its session's first turn, and only once
+        // it has edited, since a handoff with nothing changed is no work.
+        relay_after_edit: (call.writes && call.relay_tokens.is_some()).then_some(true),
         ..options_for(call.binding)
     };
     // No tools at all: it answers from what it's given.
@@ -737,6 +740,7 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         cache_key: None,
         allowed_tools: None,
         relay_tokens: None,
+        relay_after_edit: None,
     }
 }
 
@@ -5809,6 +5813,24 @@ mod tests {
             call_options(&call(Role::Reviewer, false), false, Some(60)).relay_tokens,
             None
         );
+        // A fixer's relay counts its growth and waits for its first edit;
+        // a reader's is its size alone.
+        assert_eq!(call_options(&relaying, false, None).relay_after_edit, None);
+        let fixing = flow::Call {
+            role: Role::Orchestrator,
+            writes: true,
+            relay_tokens: Some(64_000),
+            ..call(Role::Orchestrator, false)
+        };
+        assert_eq!(
+            call_options(&fixing, false, None).relay_after_edit,
+            Some(true)
+        );
+        let whole = flow::Call {
+            relay_tokens: None,
+            ..fixing
+        };
+        assert_eq!(call_options(&whole, false, None).relay_after_edit, None);
         for role in [Role::Judge, Role::Reviewer, Role::Orchestrator, Role::Sizer] {
             let options = call_options(&call(role, false), false, Some(60));
             assert_eq!(options.tools, binding.tools, "{role:?}");

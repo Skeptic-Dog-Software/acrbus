@@ -206,6 +206,7 @@ impl UsageFrom {
         if usage.calls == 0 {
             return None;
         }
+        usage.counts_tools = self.opened.is_some();
         if !priced {
             usage.usd = None;
         }
@@ -446,6 +447,10 @@ mod tests {
         // 0, then 1500 - 0, then 1800 - 1000.
         assert_eq!(u.cache_shortfall_tokens, 1500 + 800);
         assert_eq!(u.tool_calls, 6);
+        assert!(
+            u.counts_tools,
+            "its tool calls are counted, so 0 would mean none"
+        );
         assert!((u.usd_input.unwrap() - 4300.0 * 1e-6).abs() < 1e-12);
         assert!((u.usd_cache_read.unwrap() - 2000.0 * 1e-7).abs() < 1e-12);
         // A new file is a new session: its first turn has no last one.

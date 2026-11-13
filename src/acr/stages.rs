@@ -847,26 +847,36 @@ pub fn carry_probes(copy: &Path, kept: &Path) -> (Option<String>, Carried) {
 }
 
 /// Keeps what a prober changed in its copy, the earlier probes it was given
-/// included, for the next round's prober in its slot. A note if it
-/// couldn't.
-pub fn keep_probes(copy: &Path, before: &str, kept: &Path) -> Option<String> {
+/// included, for the next round's prober in its slot. Whether its copy
+/// changed at all, when that could be read, and a note if they couldn't be
+/// kept.
+pub fn keep_probes(copy: &Path, before: &str, kept: &Path) -> (Option<bool>, Option<String>) {
     let _ = fs::remove_file(copy.join(EARLIER_PROBES));
     let diff = super::change::worktree_tree(copy)
         .and_then(|after| super::change::git(copy, &["diff", "--binary", before, &after]));
     match diff {
-        Err(e) => Some(format!("its probes weren't kept for the next round: {e:#}")),
+        Err(e) => (
+            None,
+            Some(format!("its probes weren't kept for the next round: {e:#}")),
+        ),
         Ok(diff) if diff.trim().is_empty() => {
             let _ = fs::remove_file(kept);
-            None
+            (Some(false), None)
         }
-        Ok(diff) if diff.len() > PROBES_KEPT_MAX => Some(format!(
-            "its probes weren't kept for the next round: {} KB of changes is more than the {} KB kept",
-            diff.len() / 1024,
-            PROBES_KEPT_MAX / 1024
-        )),
-        Ok(diff) => fs::write(kept, diff)
-            .err()
-            .map(|e| format!("its probes weren't kept for the next round: {e}")),
+        Ok(diff) if diff.len() > PROBES_KEPT_MAX => (
+            Some(true),
+            Some(format!(
+                "its probes weren't kept for the next round: {} KB of changes is more than the {} KB kept",
+                diff.len() / 1024,
+                PROBES_KEPT_MAX / 1024
+            )),
+        ),
+        Ok(diff) => (
+            Some(true),
+            fs::write(kept, diff)
+                .err()
+                .map(|e| format!("its probes weren't kept for the next round: {e}")),
+        ),
     }
 }
 
@@ -1071,9 +1081,14 @@ fn mutate(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<(usize, Raw)>, String)>
             }
         }
     }
-    let (ran, out) = run_tests(&base, r.command, &named, r.limit, &r.dir.join("base.log"))?;
+    let log = r.dir.join("base.log");
+    let (ran, out) = run_tests(&base, r.command, &named, r.limit, &log)?;
     match ran {
-        Ran::Passed => {}
+        Ran::Passed => ran_none(
+            &log,
+            "the run of the tests before any break, so no mutant can be judged, as it",
+            &command_line(r.command, &named),
+        )?,
         Ran::Failed => bail!(
             "the tests fail before any break, so no mutant can be judged ({}): {}",
             command_line(r.command, &named),
@@ -1216,6 +1231,62 @@ fn command_line(command: &str, tests: &[String]) -> String {
         .map(|t| format!("'{}'", t.replace('\'', "'\\''")))
         .collect();
     command.replace("{tests}", &quoted.join(" "))
+}
+
+/// Whether a run of the tests says it ran none at all: a line that says
+/// so, and none that says some ran. Output that says neither is never taken
+/// for none.
+pub fn ran_no_tests(out: &str) -> bool {
+    const NONE: [&str; 8] = [
+        "[no test files]",
+        "[no tests to run]",
+        "running 0 tests",
+        "no tests ran",
+        "collected 0 items",
+        "no tests found",
+        "no tests were found",
+        "0 passing",
+    ];
+    let out = out.to_lowercase();
+    NONE.iter().any(|m| out.contains(m)) && !out.lines().any(ran_some)
+}
+
+/// A line that says some tests ran: cargo's and libtest's "running 3
+/// tests", a count passed or passing above 0, or Go's "ok" for a package
+/// that had tests to run.
+fn ran_some(line: &str) -> bool {
+    let line = line.trim_start();
+    let counted = |word: &str| {
+        line.match_indices(word).any(|(at, _)| {
+            line[..at]
+                .split(|c: char| !c.is_ascii_digit())
+                .next_back()
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n > 0)
+        })
+    };
+    let go_ok = (line.starts_with("ok ") || line.starts_with("ok\t"))
+        && !line.contains("[no tests to run]")
+        && !line.contains("[no test files]");
+    let running = line
+        .strip_prefix("running ")
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some_and(|n| n > 0);
+    go_ok || running || line.starts_with("--- pass") || counted(" passed") || counted(" passing")
+}
+
+/// A run that passed, but whose log says it ran no tests: an error, since
+/// a step that runs the tests and ran none did no work.
+fn ran_none(log: &Path, what: &str, command: &str) -> Result<()> {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    if ran_no_tests(&text) {
+        bail!(
+            "did no work: {what} ran no tests (`{command}`): {}",
+            clip(text.trim(), 600)
+        );
+    }
+    Ok(())
 }
 
 /// Runs the tests in `dir`. Returns how they ended, and the end of what they
@@ -1488,6 +1559,13 @@ fn vary(g: &GateRuns) -> Result<(Vec<Raw>, String)> {
     for (i, (what, command)) in runs.iter().enumerate() {
         let log = r.dir.join(format!("check-{i}.log"));
         let (ran, out) = run_tests(&copy, command, &tests, r.limit, &log)?;
+        if ran == Ran::Passed {
+            ran_none(
+                &log,
+                &format!("the change's tests, run {what},"),
+                &command_line(command, &tests),
+            )?;
+        }
         if ran != Ran::Passed {
             let how = if ran == Ran::TimedOut {
                 format!("ran past {} s", r.limit.as_secs())
@@ -1647,13 +1725,15 @@ pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Gap>, String)> 
             .map_or_else(|| "repo".into(), |n| n.to_owned());
         let copy = r.dir.join("coverage").join(&name);
         copy_of(r.repo, &copy).context("copying the change to measure coverage")?;
-        let (ran, out) = run_tests(&copy, command, &[], r.limit, &r.dir.join("coverage.log"))?;
+        let log = r.dir.join("coverage.log");
+        let (ran, out) = run_tests(&copy, command, &[], r.limit, &log)?;
         if ran != Ran::Passed {
             bail!(
                 "the coverage run didn't pass as the change stands ({command}): {}",
                 clip(&out, 1500)
             );
         }
+        ran_none(&log, "the coverage run", command)?;
         let text = fs::read_to_string(copy.join(g.report))
             .with_context(|| format!("reading the coverage report {}", g.report))?;
         let gaps = uncovered(&text, &copy, g.diff);
@@ -1888,7 +1968,10 @@ mod tests {
             "test \"$(cat a.src)\" = 'let x = 1;'\n",
         )
         .unwrap();
-        assert_eq!(keep_probes(&one, &before.unwrap(), &kept), None);
+        assert_eq!(
+            keep_probes(&one, &before.unwrap(), &kept),
+            (Some(true), None)
+        );
         assert!(fs::read_to_string(&kept).unwrap().contains("probe_test.sh"));
         // Round 2: the probe is in the new copy before the prober starts.
         let two = copy(2);
@@ -1897,7 +1980,10 @@ mod tests {
         assert!(two.join("probe_test.sh").is_file());
         // What's kept now is the earlier probe and this round's too.
         fs::write(two.join("more_test.sh"), "true\n").unwrap();
-        assert_eq!(keep_probes(&two, &before.unwrap(), &kept), None);
+        assert_eq!(
+            keep_probes(&two, &before.unwrap(), &kept),
+            (Some(true), None)
+        );
         let diff = fs::read_to_string(&kept).unwrap();
         assert!(diff.contains("probe_test.sh") && diff.contains("more_test.sh"));
         // A fix that took the probe's path: it waits in the copy as a diff,
@@ -1907,7 +1993,11 @@ mod tests {
         let (before, carried) = carry_probes(&three, &kept);
         assert_eq!(carried, Carried::Unapplied);
         assert!(three.join(EARLIER_PROBES).is_file());
-        assert_eq!(keep_probes(&three, &before.unwrap(), &kept), None);
+        // It wrote nothing: said, for the review to take as no work.
+        assert_eq!(
+            keep_probes(&three, &before.unwrap(), &kept),
+            (Some(false), None)
+        );
         assert!(!three.join(EARLIER_PROBES).exists());
         assert!(
             !kept.exists(),
@@ -2220,6 +2310,58 @@ mod tests {
         assert!(
             summary.contains("run 4 other way(s): 1 failed"),
             "{summary}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_says_it_ran_no_tests_ran_none_and_one_that_ran_some_did() {
+        for none in [
+            "?   \texample.com/x\t[no test files]\n",
+            "ok  \texample.com/x\t0.01s [no tests to run]\n",
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored\n",
+            "============ no tests ran in 0.01s ============\n",
+            "collected 0 items\n\n=== no tests ran in 0.02s ===\n",
+            "No tests found, exiting with code 0\n",
+        ] {
+            assert!(ran_no_tests(none), "{none}");
+        }
+        for some in [
+            // Doc-tests that ran none, after the tests that ran.
+            "running 523 tests\ntest result: ok. 523 passed; 0 failed\n   Doc-tests acrbus\n\nrunning 0 tests\n\ntest result: ok. 0 passed;\n",
+            "ok  \texample.com/x\t0.21s\n?   \texample.com/y\t[no test files]\n",
+            "=== 12 passed in 0.31s ===\n",
+            "Tests:       4 passed, 4 total\n",
+            // Nothing it can read either way: never taken for none.
+            "all good\n",
+            "",
+        ] {
+            assert!(!ran_no_tests(some), "{some}");
+        }
+    }
+
+    #[test]
+    fn a_coverage_run_that_ran_no_tests_did_no_work() {
+        let repo = repo_with(&[("README", "x\n")]);
+        let dir = std::env::temp_dir().join(format!("tb-acr-none-{}", crate::util::new_id()));
+        let runs = GateRuns {
+            runner: Runner {
+                repo: &repo,
+                dir: &dir,
+                command: "true {tests}",
+                parallel: 1,
+                limit: Duration::from_secs(30),
+            },
+            coverage: Some("echo 'running 0 tests'; mkdir -p coverage; : > coverage/lcov.info"),
+            report: "coverage/lcov.info",
+            diff: "",
+            variants: &[],
+            repeat: 0,
+        };
+        let e = run_gate(&runs, &[]).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("did no work: the coverage run ran no tests"),
+            "{e:#}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
