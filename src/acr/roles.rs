@@ -397,6 +397,16 @@ pub struct ReviewerCall<'a> {
 /// for every reviewer, then the lens's, then this call's. One with
 /// `own_copy` works in a copy of the checkout that's its alone, and is told
 /// to settle doubts by running things there.
+/// How a reviewer reads, so it spends fewer turns: each turn sends again
+/// everything before it, so a turn saved is all of that not read again. It
+/// limits nothing a reviewer may open.
+pub const READING: &str = "How to read: every turn sends again all that came before it, so \
+     fewer turns cost less. Where the facts given ahead of this prompt already hold a file, or \
+     what you need from it, use them there rather than opening it again. When you need several \
+     files, ask for them together in one turn, one read each, where you can call tools in \
+     parallel, rather than one a turn. Read whatever else you need: nothing here limits what \
+     you may open.\n\n";
+
 pub fn reviewer_parts(lens: &Lens, call: &ReviewerCall) -> Vec<Part> {
     let attached = super::change::ATTACHED;
     let mut parts = vec![part(
@@ -472,6 +482,7 @@ pub fn reviewer_parts(lens: &Lens, call: &ReviewerCall) -> Vec<Part> {
                 .to_string()
         },
     ));
+    parts.push(part(Source::Fixed, READING.to_string()));
     if !call.gate.trim().is_empty() {
         parts.push(part(Source::Tool, call.gate.to_string()));
     }
@@ -1179,6 +1190,48 @@ pub fn read_fixed(text: &str) -> Result<Fixed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reviewer_is_told_to_read_in_fewer_turns_and_limited_in_nothing() {
+        let lens = Lens {
+            id: "correctness".into(),
+            criteria: "wrong results".into(),
+            attack: None,
+            blocker: None,
+            triggers: Default::default(),
+            binding: None,
+            severity: Default::default(),
+            include_generated: false,
+        };
+        for own_copy in [false, true] {
+            let prompt = reviewer_prompt(&lens, "the whole change", "", own_copy, "");
+            assert!(prompt.contains(READING), "{prompt}");
+            assert!(prompt.contains("ask for them together in one turn"));
+            assert!(prompt.contains("nothing here limits what you may open"));
+            // After the lens and the working directory, before what varies
+            // most: the brief and the decided non-issues.
+            let reading = prompt.find("How to read:").unwrap();
+            assert!(prompt.find("# Your lens").unwrap() < reading);
+            assert!(reading < prompt.rfind("Answer with only the JSON").unwrap());
+        }
+        // It's fixed text, the same for every reviewer, so it shares the cache.
+        let parts = reviewer_parts(
+            &lens,
+            &ReviewerCall {
+                scope: "s",
+                not_findings: "",
+                own_copy: false,
+                runbook: None,
+                brief: None,
+                gate: "",
+            },
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|p| p.text == READING && p.source == Source::Fixed)
+        );
+    }
 
     #[test]
     fn finds_json_among_other_words() {

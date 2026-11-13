@@ -22,6 +22,11 @@
 //   every role on the bridge is given the same tool definitions so their
 //   prompts share a cached prefix. A call to any other tool is refused, and
 //   says so. It fails closed: a list it can't read refuses every tool.
+// - ACRBUS_DROP_PI_DOCS=1: a review's system prompt leaves out pi's pointer
+//   to its own documentation, which says itself it's for questions about
+//   the harness, never a review's: one less block every turn sends again.
+//   Only that block goes, and only when it reads as pi wrote it; the tools,
+//   their rules and everything else stay.
 // - ACRBUS_RELAY_TOKENS: past this many prompt tokens in one turn that goes
 //   on to call tools, the call hands off. It's told to stop and answer with
 //   everything it would report so far, what it has checked and what's left;
@@ -87,6 +92,10 @@ function applied(headers) {
   if (budget) parts.push(`thinking_budget_tokens ${budget}`);
   return parts.join(", ");
 }
+
+// pi's <docs> section, as pi writes it: what it says it's for, then its
+// paths. Anything else in a <docs> block is left alone.
+const PI_DOCS = /\n*<docs>\nPi documentation \(read only when the user asks about the harness itself[\s\S]*?\n<\/docs>/;
 
 // What marks a handoff's answer, as its first line, for acrbus to read.
 const HANDOFF_MARK = "ACRBUS-HANDOFF";
@@ -200,6 +209,13 @@ export default function acrbus(pi) {
       const model = ctx?.model?.id ?? "this model";
       console.error(`acrbus effort: asked for thinking ${effort}, which ${model} doesn't have, so pi uses ${used}`);
       return undefined;
+    });
+  }
+  if (process.env.ACRBUS_DROP_PI_DOCS === "1") {
+    pi.on("before_agent_start", (event) => {
+      const prompt = event?.systemPrompt;
+      if (typeof prompt !== "string" || !PI_DOCS.test(prompt)) return undefined;
+      return { systemPrompt: prompt.replace(PI_DOCS, "") };
     });
   }
   const listed = process.env.ACRBUS_ALLOWED_TOOLS;

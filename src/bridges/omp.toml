@@ -28,3 +28,10 @@ cache_write = "message.usage.cacheWrite"
 reasoning = "message.usage.reasoningTokens"
 usd = "message.usage.cost.total"
 model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "toolCall" }
+name = "name"
+names = ["read"]
+path = "arguments.path"

@@ -194,6 +194,11 @@ pub struct RunUsage {
     pub usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// The files the call's agent read, as its tool calls named them, each
+    /// once, in the order first read: where a review learns what its
+    /// reviewers open, to give the next round's in the facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opened: Vec<String>,
     /// The first model call's own figures: what a run's first turn read
     /// from a prompt cache, which says whether a warm-up worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]

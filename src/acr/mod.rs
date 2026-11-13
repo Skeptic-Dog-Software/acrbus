@@ -13,6 +13,7 @@ mod flow;
 mod generated;
 pub mod grayboard;
 mod keep;
+mod learned;
 mod plan;
 pub mod progress;
 mod report;
@@ -2363,6 +2364,11 @@ fn next_steps(run: &Run, cfg: &Config) -> String {
     }
 }
 
+/// Where each repository's record of what its reviewers open is kept.
+fn learned_root(paths: &Paths) -> PathBuf {
+    paths.state.join("acr-learned")
+}
+
 /// Where reviewers that can change files get their copies of the checkout.
 fn copies_root(paths: &Paths) -> PathBuf {
     paths.state.join("acr-copies")
@@ -2580,6 +2586,7 @@ fn setting<'a>(
         copies: Some(copies_root(paths)),
         head_copy: None,
         pr: None,
+        learned: Some(learned_root(paths)),
         builder_brief: None,
     })
 }
@@ -3700,6 +3707,8 @@ fn pipeline_run(
     s.description = description;
     s.converge = converge;
     s.stop_on_failure = stop_on_failure;
+    // A trial's arms are measured blind: none reads what another learned.
+    s.learned = None;
     s.builder_brief = target
         .brief
         .as_deref()

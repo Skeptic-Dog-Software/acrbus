@@ -417,6 +417,18 @@ pub struct Usage {
     /// of an answer that couldn't be read as it came.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repaired: Option<Repaired>,
+    /// The lens, for a reviewer's call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens: Option<String>,
+    /// The files its agent read, as its tool calls named them, when its
+    /// bridge says: what the review learns its reviewers open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opened: Vec<String>,
+    /// For a reviewer's session, the reviewer call it belongs to, by that
+    /// call's first label: a relay's legs and a scout's verifying sessions
+    /// are one call, whose reading counts once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
     /// Its first model call alone, by the agent's count: what the call's
     /// first turn read from the cache, which shows a warm-up worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,6 +541,11 @@ pub struct Run {
     /// head of what they send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefixes: Vec<super::facts::Prefix>,
+    /// The rounds whose reviewers' reading is already in the repository's
+    /// record of what its reviewers open, so a resumed round isn't counted
+    /// twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned: Vec<u32>,
     /// A copy of the commit under review, which the review reads until its
     /// first fix, so the checkout can be on any branch meanwhile. None for a
     /// review of the working tree, and for one saved before reviews read a
@@ -780,6 +797,10 @@ pub struct Setting<'a> {
     pub head_copy: Option<PathBuf>,
     /// The change's pull request, for a new run: see `Run::pr`.
     pub pr: Option<u64>,
+    /// Where each repository's record of what its reviewers open is kept
+    /// (see `learned`). None for a trial, whose arms are measured blind, and
+    /// for tests.
+    pub learned: Option<PathBuf>,
     /// The building session's brief for round 1's reviewers, if it wrote
     /// one. Later rounds are briefed by the steelman, which holds the
     /// change's context by then.
@@ -821,6 +842,13 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         fan_out: None,
         first: false,
         repaired: None,
+        lens: None,
+        opened: answer
+            .usage
+            .as_ref()
+            .map(|u| u.opened.clone())
+            .unwrap_or_default(),
+        call: None,
         first_turn: None,
         part: None,
     };
@@ -1374,6 +1402,7 @@ pub fn start(
         reported: Vec::new(),
         facts: Vec::new(),
         prefixes: Vec::new(),
+        learned: Vec::new(),
         // An Orchestrator that can't write leaves it to whoever ran the
         // review, rather than to nobody.
         fixer: if s
@@ -2029,6 +2058,10 @@ fn attack(
             u.fan_out = Some("reviewers".into());
             // Its first session only, which goes alone to warm the cache.
             u.first = first && c.label == *label && c.prompt == prompt.as_str();
+            // Every session of the call is its lens's and its call's, so what
+            // all its sessions read counts once, for the call.
+            u.lens = Some(lens.id.clone());
+            u.call = Some(label.clone());
             u
         };
         if matches!(brief, Brief::Review { .. }) && cfg.sessions.scouts(&lens.id) {
@@ -2475,6 +2508,7 @@ fn attack(
     }
     // Once the round's calls are all in, so each repair is set against them.
     warn_repairs(run, caller);
+    learn_round(run, s);
     Ok((by_lens, judgments, notes))
 }
 
@@ -3475,6 +3509,104 @@ fn rate(
     findings
 }
 
+/// The repository's record of what its reviewers open, when the review
+/// keeps one and the config learns.
+fn learned_record(run: &Run, s: &Setting) -> Option<PathBuf> {
+    let dir = s.learned.as_deref().filter(|_| s.cfg.facts.learned)?;
+    let name = run.repo.file_name()?.to_string_lossy().into_owned();
+    Some(super::learned::Learned::path(dir, &name))
+}
+
+/// Adds to this round's facts the files the repository's reviewers keep
+/// opening, ranked by the record, within the config's budget, and says what
+/// it gave and left out.
+fn add_learned(
+    built: &mut super::facts::Facts,
+    run: &Run,
+    s: &Setting,
+    prior: Option<&super::facts::Facts>,
+    caller: &dyn Caller,
+) {
+    let Some(path) = learned_record(run, s) else {
+        return;
+    };
+    let record = super::learned::Learned::load(&path);
+    let changed: BTreeSet<String> = built.files.iter().map(|f| f.path.clone()).collect();
+    // Every reviewer and Judge reads a given file again each turn, so only
+    // a file more than one reviewer call opened is worth that.
+    let ranked: Vec<(String, u32)> = record
+        .ranked(&changed)
+        .into_iter()
+        .filter(|(_, n)| *n >= super::learned::MIN_OPENS)
+        .collect();
+    let budget = usize::try_from(s.cfg.facts.learned_bytes).unwrap_or(usize::MAX);
+    let added = built.add_learned(run.reading(), run.round, prior, &ranked, budget);
+    if added.files == 0 && added.left_out == 0 {
+        return;
+    }
+    let left = if added.left_out > 0 {
+        format!(
+            "; {} more the budget ({} bytes) left out",
+            added.left_out, s.cfg.facts.learned_bytes
+        )
+    } else {
+        String::new()
+    };
+    caller.say(&format!(
+        "round {}: the facts carry {} file(s) this repository's reviewers keep opening, {} new, \
+         {} bytes{left}",
+        run.round, added.files, added.new, added.bytes
+    ));
+}
+
+/// Adds what this round's reviewers read to the repository's record, once
+/// a round: each reviewer call counts each file it read once, whichever of
+/// its sessions read it, a relay's legs or a scout's and its verifiers'.
+fn learn_round(run: &mut Run, s: &Setting) {
+    let Some(path) = learned_record(run, s) else {
+        return;
+    };
+    if run.learned.contains(&run.round) {
+        return;
+    }
+    let repo = run.reading().to_path_buf();
+    let mut record = super::learned::Learned::load(&path);
+    // Each reviewer call's reading, every session's together.
+    let mut calls: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for u in run
+        .usage
+        .iter()
+        .filter(|u| u.round == run.round && u.role == Role::Reviewer)
+    {
+        let Some(lens) = &u.lens else {
+            continue;
+        };
+        let call = u
+            .call
+            .clone()
+            .or_else(|| u.label.clone())
+            .unwrap_or_default();
+        calls.entry((lens.clone(), call)).or_default().extend(
+            u.opened
+                .iter()
+                .filter_map(|o| super::learned::in_repo(&repo, o)),
+        );
+    }
+    let mut any = false;
+    for ((lens, _), files) in &calls {
+        if !files.is_empty() {
+            record.add(lens, files);
+            any = true;
+        }
+    }
+    run.learned.push(run.round);
+    if any {
+        // Only a hint for later rounds: a record that can't be written
+        // leaves the review as it was.
+        let _ = record.save(&path);
+    }
+}
+
 /// Keeps this round's rulings that didn't block, for a later round's same
 /// claim: each finding a Judge ruled on just now, at a place in a file, with
 /// its own title and those of the reviewers' findings at that place. A
@@ -3551,12 +3683,13 @@ fn share_facts(
     let prior = (run.round > 1)
         .then(|| facts::kept(&s.work_dir, run.round - 1))
         .flatten();
-    let built = facts::Facts::build(
+    let mut built = facts::Facts::build(
         run.reading(),
         change,
         run.round,
         prior.as_ref().map(|(f, _)| f),
     );
+    add_learned(&mut built, run, s, prior.as_ref().map(|(f, _)| f), caller);
     // The pull request's words, fetched again each round, since its
     // comments can grow. gh runs in the checkout, whose remote names the
     // repository.
@@ -5140,6 +5273,7 @@ lenses:
             copies: None,
             head_copy: None,
             pr: None,
+            learned: None,
             builder_brief: None,
         }
     }
@@ -8525,6 +8659,229 @@ lenses:
         fn warmed(&self, label: &str) -> Option<bool> {
             Some(self.answered.lock().unwrap().contains(label))
         }
+    }
+
+    /// A repository the learned-reading tests review: a checkout of plain
+    /// files, and a record folder of its own.
+    fn reading_repo() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("tb-reading-{}", new_id()));
+        let repo = root.join("project");
+        for (path, text) in [
+            ("a.src", "let x = 1;\n"),
+            ("src/helper.rs", "pub fn helper() {}\n"),
+            ("docs/notes.md", "how the parts fit\n"),
+        ] {
+            let full = repo.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, text).unwrap();
+        }
+        let out = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        (repo, root.join("learned"))
+    }
+
+    /// A one-round review of `repo`, with its record folder at `store`: the
+    /// run, and its round's facts as every reviewer got them.
+    fn reading_review(repo: &Path, store: Option<PathBuf>, top: &str) -> (Run, String) {
+        let cfg = config("exception", 1, 1, "", top);
+        let mut fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => r#"{"findings": []}"#.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        fake.usage = Some(RunUsage {
+            calls: 1,
+            input_tokens: 10,
+            opened: vec![
+                // In a copy of its own, wherever that was.
+                "/elsewhere/acr-copies/r1-x/project/docs/notes.md".into(),
+                "src/helper.rs".into(),
+                // Outside the repository, and not there: not learned.
+                "/etc/hosts".into(),
+                "src/gone.rs".into(),
+            ],
+            ..RunUsage::default()
+        });
+        let mut s = setting(&cfg);
+        s.learned = store;
+        fs::create_dir_all(&s.work_dir).unwrap();
+        let c = change(&["a.src"]);
+        let mut run = start("r", repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let facts = fs::read_to_string(s.work_dir.join("round-1.facts.md")).unwrap_or_default();
+        let _ = fs::remove_dir_all(&s.work_dir);
+        (run, facts)
+    }
+
+    #[test]
+    fn what_reviewers_read_is_learned_and_the_next_review_starts_with_it() {
+        let (repo, store) = reading_repo();
+        let record = super::super::learned::Learned::path(&store, "project");
+        // An earlier review's reviewers kept opening the helper.
+        let mut earlier = super::super::learned::Learned::default();
+        earlier.add("alpha", &["src/helper.rs".to_string()]);
+        earlier.add("beta", &["src/helper.rs".to_string()]);
+        // A file one call opened isn't worth every turn's reading.
+        earlier.add("alpha", &["a.src".to_string()]);
+        earlier.save(&record).unwrap();
+        let (run, facts) = reading_review(&repo, Some(store.clone()), "");
+        assert!(
+            facts.contains("## Often read: src/helper.rs") && facts.contains("pub fn helper()"),
+            "round 1's facts carry what reviewers kept opening: {facts}"
+        );
+        assert!(
+            !facts.contains("Often read: docs/notes.md"),
+            "not yet learned"
+        );
+        assert!(
+            !facts.contains("Often read: a.src"),
+            "opened by one call only"
+        );
+        // This review's reading is in the record, per lens, as paths in the
+        // repository, each reviewer call counting each file once.
+        let learned = super::super::learned::Learned::load(&record);
+        assert_eq!(learned.lenses["alpha"]["src/helper.rs"], 2);
+        assert_eq!(learned.lenses["beta"]["src/helper.rs"], 2);
+        assert_eq!(learned.lenses["alpha"]["docs/notes.md"], 1);
+        assert_eq!(learned.lenses["beta"]["docs/notes.md"], 1);
+        let all: Vec<&String> = learned.lenses.values().flat_map(|c| c.keys()).collect();
+        assert!(
+            all.iter()
+                .all(|p| !p.starts_with('/') && !p.contains("gone")),
+            "{all:?}"
+        );
+        assert_eq!(run.learned, vec![1], "the round is counted once");
+        // The reviewers' calls carry their lens and what they read.
+        let reviewer = run.usage.iter().find(|u| u.role == Role::Reviewer).unwrap();
+        assert!(reviewer.lens.is_some() && !reviewer.opened.is_empty());
+        // The next review of the repository starts with this one's reading.
+        let (_, next) = reading_review(&repo, Some(store.clone()), "");
+        assert!(next.contains("## Often read: docs/notes.md"), "{next}");
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn a_reviewer_calls_reading_counts_once_across_all_its_sessions() {
+        let (repo, store) = reading_repo();
+        let cfg = config("exception", 1, 1, "", "");
+        let mut s = setting(&cfg);
+        s.learned = Some(store.clone());
+        let fake = Fake::new(|_, _: &str| Ok(NOTHING.to_string()));
+        let mut run = start("r", &repo, "main", None, &s, &change(&["a.src"]), &fake).unwrap();
+        let session = |lens: &str, call: &str, label: &str, opened: &[&str]| -> Usage {
+            let mut u: Usage = serde_json::from_value(serde_json::json!({
+                "role": "reviewer", "binding": "b", "agent": "a@here", "model": "m",
+                "run_id": "x", "tokens_in": 1, "tokens_out": 1, "usd": null,
+                "round": 1, "label": label,
+            }))
+            .unwrap();
+            u.lens = Some(lens.into());
+            u.call = Some(call.into());
+            u.opened = opened.iter().map(|o| o.to_string()).collect();
+            u
+        };
+        run.round = 1;
+        run.usage.extend([
+            // One call of alpha's: two relay legs and a verifying session,
+            // reading the helper twice and the notes twice between them.
+            session(
+                "alpha",
+                "alpha: reviewer 1",
+                "alpha: reviewer 1",
+                &["src/helper.rs"],
+            ),
+            session(
+                "alpha",
+                "alpha: reviewer 1",
+                "alpha: reviewer 1 (session 2)",
+                &["src/helper.rs", "docs/notes.md"],
+            ),
+            session(
+                "alpha",
+                "alpha: reviewer 1",
+                "alpha: reviewer 1: verify 1",
+                &["docs/notes.md"],
+            ),
+            // Another of alpha's calls, and one of beta's.
+            session(
+                "alpha",
+                "alpha: reviewer 2",
+                "alpha: reviewer 2",
+                &["docs/notes.md"],
+            ),
+            session(
+                "beta",
+                "beta: reviewer 1",
+                "beta: reviewer 1",
+                &["docs/notes.md"],
+            ),
+        ]);
+        learn_round(&mut run, &s);
+        let record = super::super::learned::Learned::load(&super::super::learned::Learned::path(
+            &store, "project",
+        ));
+        assert_eq!(
+            record.lenses["alpha"]["src/helper.rs"], 1,
+            "one call, however many sessions"
+        );
+        assert_eq!(
+            record.lenses["alpha"]["docs/notes.md"], 2,
+            "two of alpha's calls"
+        );
+        assert_eq!(record.lenses["beta"]["docs/notes.md"], 1);
+        // Learned once a round, even if the round is resumed.
+        learn_round(&mut run, &s);
+        let again = super::super::learned::Learned::load(&super::super::learned::Learned::path(
+            &store, "project",
+        ));
+        assert_eq!(again, record);
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn learning_what_reviewers_read_can_be_turned_off_and_trials_never_learn() {
+        let (repo, store) = reading_repo();
+        let record = super::super::learned::Learned::path(&store, "project");
+        let mut earlier = super::super::learned::Learned::default();
+        earlier.add("alpha", &["src/helper.rs".to_string()]);
+        earlier.add("beta", &["src/helper.rs".to_string()]);
+        earlier.save(&record).unwrap();
+        let (_, off) = reading_review(&repo, Some(store.clone()), "facts: {learned: false}");
+        assert!(!off.contains("Often read"), "{off}");
+        assert_eq!(
+            super::super::learned::Learned::load(&record),
+            earlier,
+            "nothing learned"
+        );
+        // A review with no record folder, as a trial, neither reads nor writes one.
+        let (_, blind) = reading_review(&repo, None, "");
+        assert!(!blind.contains("Often read"));
+        assert_eq!(super::super::learned::Learned::load(&record), earlier);
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn often_read_files_keep_to_the_configured_budget() {
+        let (repo, store) = reading_repo();
+        let record = super::super::learned::Learned::path(&store, "project");
+        let mut earlier = super::super::learned::Learned::default();
+        for lens in ["alpha", "beta"] {
+            earlier.add(
+                lens,
+                &["src/helper.rs".to_string(), "docs/notes.md".to_string()],
+            );
+        }
+        earlier.save(&record).unwrap();
+        // Room for the notes (18 bytes), not the helper (19).
+        let (_, facts) = reading_review(&repo, Some(store), "facts: {learned_bytes: 18}");
+        assert!(facts.contains("## Often read: docs/notes.md"), "{facts}");
+        assert!(!facts.contains("Often read: src/helper.rs"));
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
     }
 
     fn cached_run(top: &str, fan_out: u32, caller: &Cached) -> (Run, PathBuf) {

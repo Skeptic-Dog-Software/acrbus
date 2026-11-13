@@ -18,6 +18,8 @@ use crate::proto::{RunUsage, TurnUsage};
 /// The most files a run's usage is read from, so a session full of files
 /// can't hold up its reply.
 const MOST_FILES: usize = 1000;
+/// The most files a run says it read.
+const MOST_OPENED: usize = 500;
 
 /// `[bridges.<agent>.usage]`: which files under a run's session directory
 /// hold the agent's record, one JSON object a line, and where in each line
@@ -44,6 +46,26 @@ pub struct UsageFrom {
     /// What the agent says the call cost, in US dollars.
     pub usd: Option<String>,
     pub model: Option<String>,
+    /// Where a counted line names the files its call read.
+    pub opened: Option<OpenedFrom>,
+}
+
+/// `[bridges.<agent>.usage.opened]`: the blocks of a counted line that are
+/// tool calls reading a file, and where in each the file is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedFrom {
+    /// A dotted path, in a counted line, to the array of its blocks.
+    pub items: String,
+    /// A block counts when each path here, within it, has its value.
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    /// The path, within a block, to its tool's name.
+    pub name: String,
+    /// The tools that read a file.
+    pub names: Vec<String>,
+    /// The path, within a block, to the file it read.
+    pub path: String,
 }
 
 /// How long each file was before a run, so that a session kept between
@@ -66,7 +88,18 @@ impl UsageFrom {
             &self.usd,
             &self.model,
         ];
-        let named = paths.into_iter().flatten().chain(self.when.keys());
+        let mut named: Vec<&String> = paths
+            .into_iter()
+            .flatten()
+            .chain(self.when.keys())
+            .collect();
+        if let Some(o) = &self.opened {
+            if o.names.is_empty() {
+                bail!("usage.opened needs at least one tool in names");
+            }
+            named.extend([&o.items, &o.name, &o.path]);
+            named.extend(o.when.keys());
+        }
         if let Some(bad) = named.into_iter().find(|p| p.split('.').any(str::is_empty)) {
             bail!("usage: {bad:?} isn't a dotted path");
         }
@@ -119,6 +152,7 @@ impl UsageFrom {
                 if !self.counts(&record) {
                     continue;
                 }
+                self.note_opened(&mut usage, &record);
                 let name = self
                     .dedupe
                     .as_deref()
@@ -163,6 +197,37 @@ impl UsageFrom {
                 other => serde_json::from_str::<Value>(want).is_ok_and(|w| w == *other),
             })
         })
+    }
+
+    /// The files a counted line's tool calls read, added to `usage`'s, each
+    /// once and in the order first read.
+    fn note_opened(&self, usage: &mut RunUsage, record: &Value) {
+        let Some(o) = &self.opened else {
+            return;
+        };
+        let Some(items) = at(record, &o.items).and_then(Value::as_array) else {
+            return;
+        };
+        for item in items {
+            let wanted = o.when.iter().all(|(path, want)| {
+                at(item, path)
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v == want)
+            });
+            let reads = at(item, &o.name)
+                .and_then(Value::as_str)
+                .is_some_and(|n| o.names.iter().any(|t| t == n));
+            let Some(file) = at(item, &o.path).and_then(Value::as_str) else {
+                continue;
+            };
+            let file = file.trim();
+            if !wanted || !reads || file.is_empty() || usage.opened.len() >= MOST_OPENED {
+                continue;
+            }
+            if !usage.opened.iter().any(|f| f == file) {
+                usage.opened.push(file.to_string());
+            }
+        }
     }
 
     /// One call's tokens.
@@ -330,6 +395,105 @@ mod tests {
         assert!((u.usd.unwrap() - 0.0006).abs() < 1e-12);
         assert_eq!(u.models, ["m/flash"]);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The kinds' own defaults, as each bridge kind ships them.
+    fn kind_usage(toml_text: &str) -> UsageFrom {
+        let v: toml::Value = toml::from_str(toml_text).unwrap();
+        let u: UsageFrom = v["usage"].clone().try_into().unwrap();
+        u.check().unwrap();
+        u
+    }
+
+    #[test]
+    fn the_files_a_pi_call_read_are_named_once_in_the_order_first_read() {
+        let d = dir();
+        let read = |path: &str| {
+            format!(
+                r#"{{"type":"toolCall","id":"c","name":"read","arguments":{{"path":"{path}"}}}}"#
+            )
+        };
+        let line = |blocks: &[String]| {
+            format!(
+                r#"{{"type":"message","message":{{"role":"assistant","model":"m","usage":{{"input":10,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{{"total":0.1}}}},"content":[{}]}}}}"#,
+                blocks.join(",")
+            )
+        };
+        append(
+            &d.join("s.jsonl"),
+            &[
+                line(&[
+                    r#"{"type":"text","text":"reading"}"#.to_string(),
+                    read("src/a.rs"),
+                    read("/copies/r1/repo/src/b.rs"),
+                    r#"{"type":"toolCall","id":"g","name":"grep","arguments":{"path":"src","pattern":"x"}}"#.to_string(),
+                ]),
+                line(&[read("src/a.rs"), read("docs/c.md")]),
+                // A tool result, not a call, names nothing read.
+                r#"{"type":"message","message":{"role":"toolResult","toolName":"read","content":[{"type":"toolCall","name":"read","arguments":{"path":"x"}}]}}"#.to_string(),
+            ],
+        );
+        for kind in [
+            include_str!("bridges/pi.toml"),
+            include_str!("bridges/omp.toml"),
+        ] {
+            let u = kind_usage(kind).read(&d, &Before::new()).unwrap();
+            assert_eq!(
+                u.opened,
+                ["src/a.rs", "/copies/r1/repo/src/b.rs", "docs/c.md"],
+                "reads only, each once, first read first"
+            );
+        }
+        // Without `opened`, nothing is named.
+        assert!(jsonl().read(&d, &Before::new()).unwrap().opened.is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_files_a_claude_code_call_read_are_named_from_its_transcript() {
+        let d = dir();
+        let line = |id: &str, file: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","model":"claude","usage":{{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"tool_use","id":"t","name":"Read","input":{{"file_path":"{file}"}}}},{{"type":"tool_use","id":"u","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+            )
+        };
+        append(
+            &d.join("t.jsonl"),
+            &[
+                line("m1", "/repo/src/lib.rs"),
+                // The same call written again as it streamed.
+                line("m1", "/repo/src/lib.rs"),
+                line("m2", "/repo/tests/t.rs"),
+            ],
+        );
+        let u = kind_usage(include_str!("bridges/claude.toml"))
+            .read(&d, &Before::new())
+            .unwrap();
+        assert_eq!(u.opened, ["/repo/src/lib.rs", "/repo/tests/t.rs"]);
+        assert_eq!(u.calls, 2, "the streamed call counts once");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_opened_setting_must_name_its_tools_and_paths() {
+        let bad: UsageFrom = toml::from_str(
+            r#"
+            files = "*.jsonl"
+            input = "u.in"
+            opened = { items = "content", name = "name", names = [], path = "arguments.path" }
+            "#,
+        )
+        .unwrap();
+        assert!(bad.check().unwrap_err().to_string().contains("names"));
+        let dotted: UsageFrom = toml::from_str(
+            r#"
+            files = "*.jsonl"
+            input = "u.in"
+            opened = { items = "content", name = "name", names = ["read"], path = "arguments..path" }
+            "#,
+        )
+        .unwrap();
+        assert!(dotted.check().is_err());
     }
 
     #[test]
