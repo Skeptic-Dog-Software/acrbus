@@ -4318,11 +4318,222 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     Ok(())
 }
 
+/// Where a finding points: its file and line, its file, or the change.
+pub(super) fn place(f: &Finding) -> String {
+    match (&f.file, f.line) {
+        (Some(file), Some(line)) => format!("{file}:{line}"),
+        (Some(file), None) => file.clone(),
+        _ => "the change".to_string(),
+    }
+}
+
+/// Words too common in code and in reviews to say two findings are about
+/// one thing, even in a code span: keywords, built-in types, and the
+/// everyday names of everyday things.
+const COMMON_NAMES: &[&str] = &[
+    "append",
+    "array",
+    "assert",
+    "async",
+    "await",
+    "bool",
+    "boolean",
+    "break",
+    "buffer",
+    "bytes",
+    "case",
+    "chan",
+    "channel",
+    "class",
+    "close",
+    "config",
+    "const",
+    "context",
+    "continue",
+    "data",
+    "default",
+    "defer",
+    "duration",
+    "else",
+    "enum",
+    "equals",
+    "error",
+    "errorf",
+    "errors",
+    "expect",
+    "false",
+    "file",
+    "files",
+    "float",
+    "func",
+    "function",
+    "goroutine",
+    "hashcode",
+    "impl",
+    "import",
+    "init",
+    "input",
+    "interface",
+    "item",
+    "items",
+    "json",
+    "length",
+    "line",
+    "lines",
+    "list",
+    "lock",
+    "loop",
+    "main",
+    "make",
+    "match",
+    "mutex",
+    "name",
+    "names",
+    "none",
+    "null",
+    "number",
+    "object",
+    "open",
+    "option",
+    "options",
+    "output",
+    "package",
+    "panic",
+    "path",
+    "print",
+    "printf",
+    "println",
+    "private",
+    "public",
+    "range",
+    "read",
+    "result",
+    "results",
+    "return",
+    "select",
+    "self",
+    "slice",
+    "sprintf",
+    "state",
+    "static",
+    "status",
+    "string",
+    "struct",
+    "switch",
+    "test",
+    "tests",
+    "this",
+    "time",
+    "tostring",
+    "true",
+    "type",
+    "types",
+    "uint",
+    "undefined",
+    "unlock",
+    "value",
+    "values",
+    "void",
+    "while",
+    "write",
+];
+
+/// The names in a finding's words that point at one thing in the code: a
+/// symbol, field, variable or function. A word counts when its shape only
+/// an identifier has, camelCase or snake_case, or when it's written in a
+/// code span (`like_this`); a dotted path counts by its parts. Plain
+/// words, common names (`COMMON_NAMES`) and names under four characters
+/// don't count. Deterministic: the same words give the same names.
+pub(super) fn identifiers(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (n, segment) in text.split('`').enumerate() {
+        let spanned = n % 2 == 1;
+        for token in segment.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+            for word in token.split('.') {
+                let word = word.trim_matches('_');
+                if word.chars().count() < 4
+                    || word.starts_with(|c: char| c.is_ascii_digit())
+                    || COMMON_NAMES.contains(&word.to_lowercase().as_str())
+                {
+                    continue;
+                }
+                let camel = word
+                    .chars()
+                    .zip(word.chars().skip(1))
+                    .any(|(a, b)| a.is_lowercase() && b.is_uppercase());
+                let snake = word.contains('_');
+                if camel || snake || spanned {
+                    out.insert(word.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A pair of findings, from different lenses at different places, that
+/// name the same thing in the code: it may be one defect showing at two
+/// places. Only proposed; the dedupe call decides.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Candidate {
+    pub a: String,
+    pub b: String,
+    /// The names both findings use.
+    pub shared: Vec<String>,
+}
+
+/// Findings that may be one defect at two places: from different lenses,
+/// at different places, in the same file or in files one finding names
+/// the other's, and naming the same identifier. Findings at the same
+/// place are left to the dedupe call as they always were.
+pub(super) fn candidates(found: &[(String, Finding)]) -> Vec<Candidate> {
+    let names: Vec<BTreeSet<String>> = found
+        .iter()
+        .map(|(_, f)| identifiers(&format!("{}\n{}", f.title, f.detail)))
+        .collect();
+    let base = |file: &str| file.rsplit('/').next().unwrap_or(file).to_string();
+    let mut out = Vec::new();
+    for i in 0..found.len() {
+        for j in i + 1..found.len() {
+            let ((la, a), (lb, b)) = (&found[i], &found[j]);
+            if la == lb || place(a) == place(b) {
+                continue;
+            }
+            let related = match (&a.file, &b.file) {
+                (Some(fa), Some(fb)) if fa == fb => true,
+                (Some(fa), Some(fb)) => {
+                    let (ta, tb) = (
+                        format!("{}\n{}", a.title, a.detail),
+                        format!("{}\n{}", b.title, b.detail),
+                    );
+                    ta.contains(&base(fb)) || tb.contains(&base(fa))
+                }
+                _ => false,
+            };
+            if !related {
+                continue;
+            }
+            let shared: Vec<String> = names[i].intersection(&names[j]).cloned().collect();
+            if !shared.is_empty() {
+                out.push(Candidate {
+                    a: a.id.clone(),
+                    b: b.id.clone(),
+                    shared,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Findings that different lenses made of one defect this round, grouped
 /// by one small call on the Sizer's binding, so that a person decides each
 /// defect once and whoever fixes reads it once. Each keeps its own ruling:
 /// the grouping only says which to decide together. A lens's own findings
 /// aren't grouped, and a call that fails groups nothing, and says so.
+/// Pairs at different places that name the same thing in the code are
+/// put to the call explicitly, since one cause can show at two places; the
+/// call still decides.
 fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
     let round = run.round;
     let found: Vec<(String, Finding)> = run
@@ -4353,17 +4564,32 @@ fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
     let listed: Vec<(String, String, String, String, String)> = found
         .iter()
         .map(|(lens, f)| {
-            let at = match (&f.file, f.line) {
-                (Some(file), Some(line)) => format!("{file}:{line}"),
-                (Some(file), None) => file.clone(),
-                _ => "the change".to_string(),
-            };
             (
                 lens.clone(),
                 f.id.clone(),
-                at,
+                place(f),
                 f.title.clone(),
                 f.detail.clone(),
+            )
+        })
+        .collect();
+    let proposed = candidates(&found);
+    let at = |id: &str| {
+        found
+            .iter()
+            .find(|(_, f)| f.id == id)
+            .map(|(_, f)| place(f))
+            .unwrap_or_default()
+    };
+    let pairs: Vec<(String, String, String, String, Vec<String>)> = proposed
+        .iter()
+        .map(|c| {
+            (
+                c.a.clone(),
+                at(&c.a),
+                c.b.clone(),
+                at(&c.b),
+                c.shared.clone(),
             )
         })
         .collect();
@@ -4374,10 +4600,31 @@ fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
         caller,
         Role::Sizer,
         what,
-        &roles::same_prompt(&listed),
+        &roles::same_prompt(&listed, &pairs),
         None,
     )
     .and_then(|text| roles::read_same(&text));
+    if !proposed.is_empty() {
+        let merged = match &groups {
+            Ok(groups) => proposed
+                .iter()
+                .filter(|c| groups.iter().any(|g| g.contains(&c.a) && g.contains(&c.b)))
+                .count(),
+            Err(_) => 0,
+        };
+        if let Some(r) = run.lenses.values_mut().find_map(|l| l.rounds.last_mut()) {
+            r.notes.push(format!(
+                "{} pair(s) of findings at different places name the same thing in the code, \
+                 and were put to the dedupe: {}. It ruled {merged} the same defect.",
+                proposed.len(),
+                proposed
+                    .iter()
+                    .map(|c| format!("{} and {} (`{}`)", c.a, c.b, c.shared.join("`, `")))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+    }
     let groups = match groups {
         Ok(groups) => groups,
         Err(e) => {
@@ -5006,18 +5253,45 @@ fn fix_list(findings: &[(String, Finding)], reported: &[Reported]) -> String {
         {
             continue;
         }
-        let at = f.file.as_deref().unwrap_or("somewhere in the change");
+        let at = if f.file.is_some() {
+            place(f)
+        } else {
+            "somewhere in the change".to_string()
+        };
         out.push_str(&format!("- {} ({at}): {}\n  {}\n", f.id, f.title, f.detail));
-        let also: Vec<&str> = findings
+        let same: Vec<&(String, Finding)> = findings
             .iter()
             .filter(|(l, g)| g.same_as.as_deref() == Some(&f.id) && l != lens)
-            .map(|(l, _)| l.as_str())
             .collect();
-        if !also.is_empty() {
+        if !same.is_empty() {
+            let also: Vec<String> = same
+                .iter()
+                .map(|(l, g)| {
+                    if place(g) == place(f) {
+                        l.clone()
+                    } else {
+                        format!("{l} (at {})", place(g))
+                    }
+                })
+                .collect();
             out.push_str(&format!(
                 "  The same defect was found by: {}\n",
                 also.join(", ")
             ));
+            // One defect at more than one place: fixed at every one.
+            let mut places = vec![place(f)];
+            for (_, g) in &same {
+                if !places.contains(&place(g)) {
+                    places.push(place(g));
+                }
+            }
+            if places.len() > 1 {
+                out.push_str(&format!(
+                    "  It shows at {} places; fix it at each: {}\n",
+                    places.len(),
+                    places.join(", ")
+                ));
+            }
         }
         if !f.note.is_empty() {
             out.push_str(&format!("  Your user says: {}\n", f.note));
@@ -8265,6 +8539,235 @@ lenses:
             "{brief}"
         );
         let _ = c;
+    }
+
+    fn named(id: &str, file: &str, line: u64, title: &str, detail: &str) -> Finding {
+        Finding {
+            id: id.into(),
+            title: title.into(),
+            detail: detail.into(),
+            file: Some(file.into()),
+            line: Some(line),
+            severity: Severity::High,
+            action: Action::Blocks,
+            reason: String::new(),
+            state: FindingState::Open,
+            note: String::new(),
+            same_as: None,
+            reused_from: None,
+            ruled_by: None,
+        }
+    }
+
+    #[test]
+    fn identifiers_are_distinctive_names_not_common_words() {
+        let ids = identifiers(
+            "Unbounded `pendingFireErrs` growth: each fire_err appends, the `error` and `ctx` \
+             stay, Registry.drainAll never runs, and the host doesn't drain",
+        );
+        for name in ["pendingFireErrs", "fire_err", "drainAll"] {
+            assert!(ids.contains(name), "{name} in {ids:?}");
+        }
+        for word in ["error", "ctx", "growth", "host", "Registry", "drain"] {
+            assert!(!ids.contains(word), "{word} in {ids:?}");
+        }
+    }
+
+    #[test]
+    fn one_defect_at_two_places_is_proposed_by_the_name_both_findings_use() {
+        let found = vec![
+            (
+                "alpha".to_string(),
+                named(
+                    "alpha-r1-1",
+                    "core/registry.go",
+                    806,
+                    "Unbounded pendingFireErrs growth",
+                    "Each fire appends to `pendingFireErrs`, and a host that doesn't drain keeps it all",
+                ),
+            ),
+            (
+                "beta".to_string(),
+                named(
+                    "beta-r1-2",
+                    "core/registry.go",
+                    158,
+                    "pendingFireErrs is never drained",
+                    "Hosts that don't drain let `pendingFireErrs` grow without bound",
+                ),
+            ),
+        ];
+        assert_eq!(
+            candidates(&found),
+            [Candidate {
+                a: "alpha-r1-1".into(),
+                b: "beta-r1-2".into(),
+                shared: vec!["pendingFireErrs".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_shared_common_word_or_different_names_make_no_candidate() {
+        let pair = |a: (&str, &str), b: (&str, &str)| {
+            vec![
+                (
+                    "alpha".to_string(),
+                    named("alpha-r1-1", "core/x.go", 10, a.0, a.1),
+                ),
+                (
+                    "beta".to_string(),
+                    named("beta-r1-1", "core/x.go", 90, b.0, b.1),
+                ),
+            ]
+        };
+        // Only a common word in common.
+        assert!(
+            candidates(&pair(
+                (
+                    "The error is returned unwrapped",
+                    "the `error` loses its context"
+                ),
+                (
+                    "The error path ignores the context",
+                    "an `error` here is dropped"
+                ),
+            ))
+            .is_empty()
+        );
+        // Different names in the same file.
+        assert!(
+            candidates(&pair(
+                (
+                    "pendingFireErrs grows",
+                    "`pendingFireErrs` is never drained"
+                ),
+                (
+                    "retryBudget is reset",
+                    "`retryBudget` goes to zero on reload"
+                ),
+            ))
+            .is_empty()
+        );
+        // Different files that don't name each other.
+        let apart = vec![
+            (
+                "alpha".to_string(),
+                named(
+                    "alpha-r1-1",
+                    "core/x.go",
+                    10,
+                    "pendingFireErrs grows",
+                    "unbounded",
+                ),
+            ),
+            (
+                "beta".to_string(),
+                named(
+                    "beta-r1-1",
+                    "other/y.go",
+                    10,
+                    "pendingFireErrs grows",
+                    "unbounded",
+                ),
+            ),
+        ];
+        assert!(candidates(&apart).is_empty());
+    }
+
+    /// Two lenses' findings of one defect at two places of a.src, both
+    /// naming `pendingFireErrs`; the dedupe groups them only when the pair
+    /// is put to it, and only if `merge` says so.
+    fn at_two_places(merge: bool) -> (Run, Config) {
+        let cfg = plain("per-round", 3, 1);
+        let fake = Fake::new(move |role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha criteria") => r#"{"findings": [{"title": "Unbounded pendingFireErrs growth", "detail": "Each fire appends to `pendingFireErrs` and nothing drains it", "file": "a.src", "line": 3}]}"#.to_string(),
+                Role::Reviewer => r#"{"findings": [{"title": "pendingFireErrs never drained", "detail": "Hosts that don't drain let `pendingFireErrs` grow", "file": "a.src", "line": 40}]}"#.to_string(),
+                // The Judge restates each finding as it rules it.
+                Role::Judge if prompt.contains("alpha criteria") => r#"{"findings": [{"title": "Unbounded pendingFireErrs growth", "detail": "Each fire appends to `pendingFireErrs` and nothing drains it", "file": "a.src", "line": 3, "severity": "High"}]}"#.to_string(),
+                Role::Judge => r#"{"findings": [{"title": "pendingFireErrs never drained", "detail": "Hosts that don't drain let `pendingFireErrs` grow", "file": "a.src", "line": 40, "severity": "High"}]}"#.to_string(),
+                Role::Sizer
+                    if prompt.contains(
+                        "alpha-r1-1 at a.src:3 and beta-r1-1 at a.src:40: both name `pendingFireErrs`",
+                    ) =>
+                {
+                    if merge {
+                        r#"{"same": [["alpha-r1-1", "beta-r1-1"]]}"#.to_string()
+                    } else {
+                        r#"{"same": []}"#.to_string()
+                    }
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        (run, cfg)
+    }
+
+    #[test]
+    fn one_defect_two_lenses_found_at_two_places_is_one_blocker_with_both_places() {
+        let (mut run, cfg) = at_two_places(true);
+        let beta = &run.lenses["beta"].rounds[0].findings[0];
+        assert_eq!(
+            beta.same_as.as_deref(),
+            Some("alpha-r1-1"),
+            "{:?}",
+            run.lenses
+        );
+        // Asked once, with both places and both lenses.
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Missed"]);
+        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
+        let q = &ask.carousels[0].questions[0].question;
+        assert!(q.contains("also found by beta at a.src:40"), "{q}");
+        assert!(q.contains("found by 2 lenses at 2 places"), "{q}");
+        assert!(q.contains("At a.src:3."), "{q}");
+        // The fixer reads it once, with every place to fix.
+        let a = answered(&run, &cfg, &[("Blocker 1", "Fix it".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        let brief = fix_list(&to_fix(&run), &[]);
+        assert_eq!(brief.matches("- alpha-r1-1").count(), 1, "{brief}");
+        assert!(!brief.contains("- beta-r1-1"), "{brief}");
+        assert!(brief.contains("beta (at a.src:40)"), "{brief}");
+        assert!(
+            brief.contains("fix it at each: a.src:3, a.src:40"),
+            "{brief}"
+        );
+        let note = run
+            .lenses
+            .values()
+            .flat_map(|l| l.rounds.iter().flat_map(|r| r.notes.iter()))
+            .find(|n| n.contains("put to the dedupe"))
+            .expect("the pair is noted");
+        assert!(note.contains("ruled 1 the same defect"), "{note}");
+    }
+
+    #[test]
+    fn a_pair_the_dedupe_rules_different_stays_two_blockers() {
+        let (run, cfg) = at_two_places(false);
+        assert!(
+            run.lenses
+                .values()
+                .all(|l| l.rounds[0].findings.iter().all(|f| f.same_as.is_none()))
+        );
+        assert_eq!(headers(&run, &cfg), ["Blocker 1", "Blocker 2", "Missed"]);
+        let note = run
+            .lenses
+            .values()
+            .flat_map(|l| l.rounds.iter().flat_map(|r| r.notes.iter()))
+            .find(|n| n.contains("put to the dedupe"))
+            .expect("the pair is noted");
+        assert!(note.contains("ruled 0 the same defect"), "{note}");
+        // It was the dedupe's ruling on the pair that kept them apart, not
+        // an answer it couldn't read.
+        assert!(
+            run.lenses
+                .values()
+                .flat_map(|l| l.rounds.iter().flat_map(|r| r.notes.iter()))
+                .all(|n| !n.contains("weren't grouped")),
+            "{:?}",
+            run.lenses
+        );
     }
 
     #[test]
