@@ -3565,7 +3565,7 @@ fn add_learned(
         return;
     };
     let record = super::learned::Learned::load(&path);
-    let changed: BTreeSet<String> = built.files.iter().map(|f| f.path.clone()).collect();
+    let changed: BTreeSet<String> = built.current().map(|f| f.path.clone()).collect();
     // Every reviewer and Judge reads a given file again each turn, so only
     // a file more than one reviewer call opened is worth that.
     let ranked: Vec<(String, u32)> = record
@@ -3771,7 +3771,7 @@ fn share_facts(
         "round {}: the facts: {} file(s){with_pr}, {} bytes, ahead of every reviewer's and \
          Judge's own text",
         run.round,
-        built.files.len(),
+        built.current().count(),
         text.len()
     ));
     run.facts.retain(|f| f.round != run.round);
@@ -3779,7 +3779,7 @@ fn share_facts(
         round: run.round,
         key: facts::Facts::key(&text),
         bytes: text.len() as u64,
-        files: built.files.len() as u64,
+        files: built.current().count() as u64,
         given: false,
     });
     let cfg = s.cfg;
@@ -4455,7 +4455,7 @@ fn focus_note(run: &Run, s: &Setting) -> Option<String> {
     let diff = fs::read_to_string(s.work_dir.join(format!("round-{}.fix.diff", fix.round))).ok()?;
     let mut affects: BTreeSet<String> = BTreeSet::new();
     if let Some((facts, _)) = super::facts::kept(&s.work_dir, run.round) {
-        for f in facts.files.iter().filter(|f| fix.files.contains(&f.path)) {
+        for f in facts.current().filter(|f| fix.files.contains(&f.path)) {
             affects.extend(f.references.iter().cloned());
             affects.extend(f.tests.iter().cloned());
         }
