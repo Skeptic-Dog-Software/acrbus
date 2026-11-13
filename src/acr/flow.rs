@@ -6429,6 +6429,10 @@ fn fix_call(
         .fixer
         .as_ref()
         .map(|_| if fixer.is_some() { "easy" } else { "hard" });
+    // The checkout as the fix found it: what both sessions' work is set
+    // against, so a restart that finds the first's edits in place isn't
+    // taken for one that did nothing.
+    let baseline = caller.snapshot(&run.repo);
     let first = fix_once(
         run,
         s,
@@ -6439,6 +6443,7 @@ fn fix_call(
         blockers,
         fixer.unwrap_or(orchestrator),
         route,
+        baseline.clone(),
     );
     let fixed = restarter.once(&label, first, |again| {
         if fixer.is_some() {
@@ -6447,16 +6452,35 @@ fn fix_call(
                 orchestrator.0
             ));
         }
+        // What the first session left in the working tree, said, so the
+        // restart builds on it rather than finding nothing to do.
+        let left = baseline.as_deref().and_then(|from| {
+            let now = caller.snapshot(&run.repo)?;
+            (now != from)
+                .then(|| caller.delta(&run.repo, from, &now))
+                .flatten()
+        });
+        let restart_prompt = match &left {
+            Some((files, diff)) => format!(
+                "{prompt}\n\n# Already in the working tree\n\nA session before you began \
+                 this fix and made these edits, to {}, before its answer was lost. Check \
+                 them, keep what's right, and finish the fix:\n\n```diff\n{}\n```\n",
+                files.join(", "),
+                diff.trim_end()
+            ),
+            None => prompt.to_string(),
+        };
         fix_once(
             run,
             s,
             caller,
-            prompt,
+            &restart_prompt,
             again.to_string(),
             part,
             blockers,
             orchestrator,
             route.map(|_| "hard"),
+            baseline,
         )
     });
     restarter.mark(&mut run.usage[start..]);
@@ -6475,6 +6499,7 @@ fn fix_once(
     blockers: &[String],
     on: (&str, &Binding),
     route: Option<&str>,
+    baseline: Option<String>,
 ) -> Result<roles::Fixed> {
     let cfg = s.cfg;
     let repo = run.repo.clone();
@@ -6491,7 +6516,9 @@ fn fix_once(
         label,
     };
     let used = |c: &Call, a: &Answer| usage(cfg, c, c.prompt.len(), a);
-    let before = caller.snapshot(&repo);
+    // Set against the checkout as the fix found it, not as this session
+    // did: a restart's own changes and its predecessor's both count.
+    let before = baseline.or_else(|| caller.snapshot(&repo));
     let legs = relayed(caller, &call, &used)?;
     for mut u in legs.usage.iter().cloned() {
         u.round = run.round;
@@ -7510,6 +7537,10 @@ lenses:
         still: bool,
         /// The labels of calls restarted with a new cache key.
         rekeyed: Mutex<Vec<String>>,
+        /// The checkout reads "base" until a fixer's first call, then
+        /// "edited": a fix's edits, left whatever its answer.
+        edits_once: bool,
+        edited: std::sync::atomic::AtomicBool,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -7536,6 +7567,8 @@ lenses:
                 stuck: false,
                 still: false,
                 rekeyed: Mutex::new(Vec::new()),
+                edits_once: false,
+                edited: Default::default(),
             }
         }
 
@@ -7547,6 +7580,9 @@ lenses:
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Caller for Fake<F> {
         fn call(&self, call: &Call) -> Result<Answer> {
+            if self.edits_once && call.writes {
+                self.edited.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.calls.lock().unwrap().push((
                 call.role,
                 call.binding_name.to_string(),
@@ -7618,6 +7654,10 @@ lenses:
         fn snapshot(&self, _repo: &Path) -> Option<String> {
             if self.still {
                 return Some("the same tree".into());
+            }
+            if self.edits_once {
+                let edited = self.edited.load(std::sync::atomic::Ordering::SeqCst);
+                return Some(if edited { "edited" } else { "base" }.into());
             }
             (self.fixes.is_some() || self.changed.is_some()).then(new_id)
         }
@@ -14220,6 +14260,37 @@ lenses:
         super::super::carousel::apply(&mut run, &asked, &a, 1).unwrap();
         assert_eq!(run.reattack, Some(Reattack::All));
         assert!(!headers(&run, &asked).contains(&"Re-attack".to_string()));
+    }
+
+    #[test]
+    fn a_fixers_restart_builds_on_the_edits_its_lost_session_left() {
+        let cfg = plain("exception", 3, 1);
+        let fixes = Mutex::new(0);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && *fixes.lock().unwrap() == 0 => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                // The first session edits, then answers in words no repair
+                // reads; its restart finishes the job.
+                Role::Orchestrator if prompt.contains("# Already in the working tree") => {
+                    *fixes.lock().unwrap() += 1;
+                    r#"{"done": "checked the edits and finished the fix"}"#.to_string()
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => "I fixed it.".to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        fake.edits_once = true;
+        fake.fixes = Some(vec!["a.src".into()]);
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let told = said(&fake);
+        assert!(!told.contains("did no work"), "{told}");
+        assert!(told.contains("restarted fresh"), "{told}");
+        assert_eq!(*fixes.lock().unwrap(), 1);
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
     }
 
     #[test]
