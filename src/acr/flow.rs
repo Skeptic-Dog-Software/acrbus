@@ -2213,6 +2213,11 @@ fn attack(
     // rather than only when the round ends.
     let repairs: std::sync::Mutex<Vec<Usage>> = Default::default();
     let repairs = &repairs;
+    // What a reviewer's sessions used when its answer couldn't be used:
+    // spent all the same, so counted with the round's other calls.
+    let unused: std::sync::Mutex<Vec<Usage>> = Default::default();
+    let unused = &unused;
+    let spent = |usage: Vec<Usage>| lock_vec(unused).extend(usage);
     let read = |text: &str, call: &Call| -> Result<Vec<Raw>> {
         findings_of(caller, cfg, text, call, repairs).inspect_err(|e| {
             caller.say(&format!(
@@ -2309,18 +2314,19 @@ fn attack(
             label: call.label.clone(),
         };
         let legs = relayed(caller, &scout, used)?;
-        read_something(caller, &call.label, &legs)?;
-        let mut lists = Vec::new();
-        for text in &legs.handed {
-            lists.push(roles::read_suspects(text)?);
-        }
-        lists.push(
-            roles::read_suspects(&legs.last)
-                .with_context(|| format!("{}: the scout's list couldn't be read", call.label))?,
-        );
-        let suspects = merged(lists, |s: &roles::Suspect| {
-            (s.title.clone(), s.file.clone(), s.line)
-        });
+        let listed =
+            read_something(caller, &call.label, &legs).and_then(|()| {
+                let mut lists = Vec::new();
+                for text in &legs.handed {
+                    lists.push(roles::read_suspects(text)?);
+                }
+                lists.push(roles::read_suspects(&legs.last).with_context(|| {
+                    format!("{}: the scout's list couldn't be read", call.label)
+                })?);
+                Ok(merged(lists, |s: &roles::Suspect| {
+                    (s.title.clone(), s.file.clone(), s.line)
+                }))
+            });
         let mut usage: Vec<Usage> = legs
             .usage
             .into_iter()
@@ -2332,6 +2338,13 @@ fn attack(
                 u
             })
             .collect();
+        let suspects = match listed {
+            Ok(suspects) => suspects,
+            Err(e) => {
+                spent(usage);
+                return Err(e);
+            }
+        };
         caller.say(&format!(
             "{}: the scout suspects {} thing(s), each to be verified on its own",
             call.label,
@@ -2345,33 +2358,43 @@ fn attack(
                     scope.spawn(move || -> Result<(Vec<Usage>, Vec<Raw>)> {
                         let n = i + 1;
                         let prompt = format!("{}{}", call.prompt, roles::verify_part(suspect));
-                        let check = Call {
-                            role: call.role,
-                            binding_name: call.binding_name,
-                            binding: call.binding,
-                            prompt: &prompt,
-                            artifact: call.artifact,
-                            writes: false,
-                            no_tools: false,
-                            relay_tokens: call.relay_tokens,
-                            repo: call.repo,
-                            label: format!("{}: verify {n}", call.label),
+                        let verify = |label: &str| -> Result<(Vec<Usage>, Vec<Raw>)> {
+                            let check = Call {
+                                role: call.role,
+                                binding_name: call.binding_name,
+                                binding: call.binding,
+                                prompt: &prompt,
+                                artifact: call.artifact,
+                                writes: false,
+                                no_tools: false,
+                                relay_tokens: call.relay_tokens,
+                                repo: call.repo,
+                                label: label.to_string(),
+                            };
+                            let legs = relayed(caller, &check, used)?;
+                            let found = read_something(caller, &check.label, &legs)
+                                .and_then(|()| gathered(&legs, &check));
+                            let usage: Vec<Usage> = legs
+                                .usage
+                                .into_iter()
+                                .map(|mut u| {
+                                    u.part = Some(match u.part {
+                                        Some(leg) => format!("verify {n}, {leg}"),
+                                        None => format!("verify {n}"),
+                                    });
+                                    u
+                                })
+                                .collect();
+                            match found {
+                                Ok(found) => Ok((usage, found)),
+                                Err(e) => {
+                                    spent(usage);
+                                    Err(e)
+                                }
+                            }
                         };
-                        let legs = relayed(caller, &check, used)?;
-                        read_something(caller, &check.label, &legs)?;
-                        let found = gathered(&legs, &check)?;
-                        let usage = legs
-                            .usage
-                            .into_iter()
-                            .map(|mut u| {
-                                u.part = Some(match u.part {
-                                    Some(leg) => format!("verify {n}, {leg}"),
-                                    None => format!("verify {n}"),
-                                });
-                                u
-                            })
-                            .collect();
-                        Ok((usage, found))
+                        let label = format!("{}: verify {n}", call.label);
+                        again_if_unreadable(caller, &label, verify(&label), verify)
                     })
                 })
                 .collect();
@@ -2395,6 +2418,7 @@ fn attack(
             }
         }
         if !failed.is_empty() {
+            spent(usage);
             bail!(
                 "{}: {} of its suspicions couldn't be checked, so the lens isn't clean: {}",
                 call.label,
@@ -2450,19 +2474,20 @@ fn attack(
             return scouted(&call, &used);
         }
         let legs = relayed(caller, &call, &used)?;
-        match brief {
+        let got = match brief {
             Brief::Mutate { runs, command, .. } => {
-                let mutants = stages::read_mutants(&legs.last)?;
-                let runner = stages::Runner {
-                    repo: checkout,
-                    dir: runs,
-                    command,
-                    parallel,
-                    limit,
-                };
-                let (found, summary) = stages::run_mutants(&runner, &mutants)
-                    .map_err(|e| idle_said(caller, label, e))?;
-                Ok((legs.usage, found, Some(summary)))
+                stages::read_mutants(&legs.last).and_then(|mutants| {
+                    let runner = stages::Runner {
+                        repo: checkout,
+                        dir: runs,
+                        command,
+                        parallel,
+                        limit,
+                    };
+                    let (found, summary) = stages::run_mutants(&runner, &mutants)
+                        .map_err(|e| idle_said(caller, label, e))?;
+                    Ok((found, Some(summary)))
+                })
             }
             Brief::Probe { kept, before, .. } => {
                 // Kept before its answer is read, so a prober
@@ -2474,20 +2499,26 @@ fn attack(
                 // A prober writes its probes in its copy and runs them: a
                 // copy as it was given is one that probed nothing.
                 if wrote == Some(false) {
-                    return Err(no_work(
+                    Err(no_work(
                         caller,
                         label,
                         "it wrote no probe in its copy, so it ran none",
-                    ));
+                    ))
+                } else {
+                    read_something(caller, label, &legs)
+                        .and_then(|()| gathered(&legs, &call))
+                        .map(|found| (found, note))
                 }
-                read_something(caller, label, &legs)?;
-                let found = gathered(&legs, &call)?;
-                Ok((legs.usage, found, note))
             }
-            _ => {
-                read_something(caller, label, &legs)?;
-                let found = gathered(&legs, &call)?;
-                Ok((legs.usage, found, None))
+            _ => read_something(caller, label, &legs)
+                .and_then(|()| gathered(&legs, &call))
+                .map(|found| (found, None)),
+        };
+        match got {
+            Ok((found, note)) => Ok((legs.usage, found, note)),
+            Err(e) => {
+                spent(legs.usage);
+                Err(e)
             }
         }
     };
@@ -2837,6 +2868,19 @@ fn attack(
                                 let first = warm_reviewers.enter(label, caller, "reviewers");
                                 let result = review(lens, brief, label, first);
                                 warm_reviewers.done(label);
+                                // A reviewer's, not a stage's: a prober asked
+                                // again would find its own probes in its copy.
+                                let result = if matches!(brief, Brief::Review { .. }) {
+                                    again_if_unreadable(caller, label, result, |again| {
+                                        let again = again.to_string();
+                                        warm_reviewers.enter(&again, caller, "reviewers");
+                                        let result = review(lens, brief, &again, false);
+                                        warm_reviewers.done(&again);
+                                        result
+                                    })
+                                } else {
+                                    result
+                                };
                                 board.answered(&lens.id);
                                 result
                             })
@@ -2895,6 +2939,10 @@ fn attack(
         run.usage.push(u);
     }
     for mut u in std::mem::take(&mut *lock_vec(repairs)) {
+        u.round = run.round;
+        run.usage.push(u);
+    }
+    for mut u in std::mem::take(&mut *lock_vec(unused)) {
         u.round = run.round;
         run.usage.push(u);
     }
@@ -3746,9 +3794,55 @@ fn findings_of(
     let mut spent = usage(cfg, &call, prompt.len(), &answer);
     spent.repaired = Some(Repaired::of(asked));
     lock_vec(repairs).push(spent);
-    roles::read_findings(&answer.text).with_context(|| {
-        format!("{unread:#}, and putting its report in the form asked didn't work either")
+    roles::read_findings(&answer.text).map_err(|e| {
+        anyhow::Error::new(Unreadable(format!(
+            "{unread:#}, and putting its report in the form asked didn't work either: {e:#}"
+        )))
     })
+}
+
+/// A reviewer's answer that couldn't be read even once the Sizer had put it
+/// in form: the session gave no answer, so it's asked again (see
+/// `again_if_unreadable`).
+#[derive(Debug)]
+struct Unreadable(String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// The label of a reviewer's session asked again after `label`'s answer
+/// couldn't be read.
+fn again_label(label: &str) -> String {
+    format!("{label}, again")
+}
+
+/// Runs `attempt` once more, in a fresh session labeled by `again_label`,
+/// when its answer couldn't be read even put in form: an answer lost to its
+/// form is that session's failure, not its lens's, so it doesn't leave the
+/// lens unreviewed. One that's no better fails as any reviewer does, to be
+/// asked about at the gate.
+fn again_if_unreadable<T>(
+    caller: &dyn Caller,
+    label: &str,
+    first: Result<T>,
+    attempt: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
+    match first {
+        Err(e) if e.downcast_ref::<Unreadable>().is_some() => {
+            let again = again_label(label);
+            caller.say(&format!(
+                "{label}: no answer could be read, even put in form, so it's asked again in a \
+                 fresh session, as \"{again}\""
+            ));
+            attempt(&again)
+        }
+        other => other,
+    }
 }
 
 /// Turns a Judge's ratings into a lens's findings for this round.
@@ -7918,13 +8012,82 @@ lenses:
             "{:?}",
             fake.told.lock().unwrap()
         );
-        // A report that can't be put in form is still a failure.
+        // A report that can't be put in form is asked for again, in a
+        // fresh session, and one that's no better is still a failure.
         let fake = put_in_form("unreadable");
         let (run, _) = go(&cfg, &["a.src"], &fake);
         assert_ne!(run.status, Status::Confirmed);
         assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
         let said = failures(&run).join(" ");
         assert!(said.contains("didn't work either"), "{said}");
+        assert_eq!(prompts(&fake, Role::Reviewer, "alpha").len(), 2);
+        assert_eq!(
+            *reformats.lock().unwrap(),
+            3,
+            "once, then once for each session"
+        );
+        let told = super::tests::said(&fake);
+        assert!(
+            told.contains("so it's asked again in a fresh session"),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_whose_answer_cant_be_read_even_put_in_form_is_asked_again_fresh() {
+        let cfg = plain("exception", 3, 1);
+        let asked = &Mutex::new(0);
+        let fake = Fake::new(move |role, prompt: &str| match role {
+            Role::Reviewer if prompt.contains("alpha") => {
+                let mut n = asked.lock().unwrap();
+                *n += 1;
+                Ok(if *n == 1 {
+                    "I looked.".into()
+                } else {
+                    CLEAN.into()
+                })
+            }
+            Role::Reviewer => Ok(CLEAN.into()),
+            Role::Sizer if prompt.contains("A reviewer wrote this report") => {
+                Ok("still prose".into())
+            }
+            _ => Ok(NOTHING.into()),
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        // The fresh session answered, so the lens was reviewed.
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
+        assert!(failures(&run).is_empty(), "{:?}", failures(&run));
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert_eq!(alpha.len(), 2);
+        assert_eq!(
+            alpha[0], alpha[1],
+            "the same brief, in a session of its own"
+        );
+        let told = said(&fake);
+        assert!(
+            told.contains(
+                "alpha: reviewer: no answer could be read, even put in form, so it's asked again \
+                 in a fresh session, as \"alpha: reviewer, again\""
+            ),
+            "{told}"
+        );
+        // Both sessions are counted, each as its own call.
+        let calls: Vec<&str> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Reviewer && u.lens.as_deref() == Some("alpha"))
+            .filter_map(|u| u.call.as_deref())
+            .collect();
+        assert_eq!(calls, vec!["alpha: reviewer", "alpha: reviewer, again"]);
+        // A reviewer that answered but failed otherwise isn't asked again.
+        let fake = Fake::new(|role, prompt: &str| match role {
+            Role::Reviewer if prompt.contains("alpha") => bail!("the bridge is down"),
+            Role::Reviewer => Ok(CLEAN.into()),
+            _ => Ok(NOTHING.into()),
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
+        assert_eq!(prompts(&fake, Role::Reviewer, "alpha").len(), 1);
     }
 
     #[test]
@@ -11385,6 +11548,46 @@ lenses:
             assert_ne!(run.status, Status::Confirmed, "{broken}");
             assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
             assert!(run.escalations[0].reason.contains("wasn't fully reviewed"));
+        }
+    }
+
+    #[test]
+    fn a_suspicion_whose_check_cant_be_read_is_checked_again_fresh() {
+        let cfg = config("exception", 3, 1, "", "sessions: {scout: [alpha]}");
+        for (fresh, confirmed) in [(CLEAN, true), ("still prose", false)] {
+            let checks = &Mutex::new(0);
+            let fake = Fake::new(move |role, prompt: &str| {
+                Ok(match role {
+                    Role::Reviewer if prompt.contains("# This session: scout") => {
+                        r#"{"suspects": [{"title": "S1"}, {"title": "S2"}]}"#.into()
+                    }
+                    Role::Reviewer if prompt.contains("Title: S2") => {
+                        let mut n = checks.lock().unwrap();
+                        *n += 1;
+                        if *n == 1 {
+                            "I couldn't tell.".into()
+                        } else {
+                            fresh.into()
+                        }
+                    }
+                    Role::Reviewer => CLEAN.into(),
+                    _ => NOTHING.into(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert_eq!(*checks.lock().unwrap(), 2, "S2's check, then once more");
+            assert!(
+                said(&fake).contains("alpha: reviewer: verify 2: no answer could be read"),
+                "{}",
+                said(&fake)
+            );
+            // The scout isn't asked again: only the check that gave no answer.
+            let scouts = prompts(&fake, Role::Reviewer, "alpha")
+                .iter()
+                .filter(|p| p.contains("# This session: scout"))
+                .count();
+            assert_eq!(scouts, 1);
+            assert_eq!(run.status == Status::Confirmed, confirmed, "{fresh}");
         }
     }
 
