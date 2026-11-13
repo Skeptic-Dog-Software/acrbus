@@ -431,6 +431,12 @@ pub struct FactsPolicy {
     /// cache before the rest start. 0 starts them all at once. Default 60.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_secs: Option<u64>,
+    /// Seconds between the starts of a fan-out's other calls once its
+    /// first has warmed the cache: a burst of new sessions can be spread
+    /// over a provider's replicas, of which only one holds the prefix, where
+    /// calls a little apart land on it. 0 starts them all at once. Default 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagger_secs: Option<u64>,
     /// Seconds between refreshes of a role's cached prefix while its calls
     /// run, so the provider doesn't evict it. 0 turns it off. Default 240.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,6 +472,7 @@ impl FactsPolicy {
         FactsPolicy {
             shared: later.shared.or(self.shared),
             warm_secs: later.warm_secs.or(self.warm_secs),
+            stagger_secs: later.stagger_secs.or(self.stagger_secs),
             keep_alive_secs: later.keep_alive_secs.or(self.keep_alive_secs),
             judges: later.judges.or(self.judges),
             reviewers: later.reviewers.or(self.reviewers),
@@ -514,6 +521,39 @@ pub struct SavingsPolicy {
     /// blocker rereads all it has done on every turn. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_fixes: Option<bool>,
+    /// A cheaper binding for the fix groups the rules call easy: every
+    /// blocker in the group at or below `max_severity`, the group citing at
+    /// most `max_files` files, each with its cause stated, file, line and
+    /// detail, none a person's call or a defect a person reported missed,
+    /// and none like one fixed in an earlier round. Every other group, and
+    /// an easy one's restart after its fix failed, goes to the
+    /// Orchestrator's binding, as do its other calls. Left out, the
+    /// Orchestrator's binding fixes every group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixer: Option<FixerPolicy>,
+}
+
+/// `savings.fixer`: the binding easy fix groups go to, and what makes one
+/// easy. Each threshold left out takes its default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixerPolicy {
+    /// A binding in `allowed_bindings` that may write.
+    pub binding: String,
+    /// The most severe a blocker in an easy group may be. Default Medium.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_severity: Option<Severity>,
+    /// The most files an easy group's blockers may cite. Default 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<u32>,
+}
+
+/// `savings.fixer`, resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixerConfig {
+    pub binding: String,
+    pub max_severity: Severity,
+    pub max_files: u32,
 }
 
 impl SavingsPolicy {
@@ -524,6 +564,7 @@ impl SavingsPolicy {
             focus_after_fix: later.focus_after_fix.or(self.focus_after_fix),
             blast_radius: later.blast_radius.or(self.blast_radius),
             group_fixes: later.group_fixes.or(self.group_fixes),
+            fixer: later.fixer.or(self.fixer),
         }
     }
 }
@@ -539,6 +580,8 @@ pub struct SavingsConfig {
     pub focus_after_fix: bool,
     pub blast_radius: bool,
     pub group_fixes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixer: Option<FixerConfig>,
 }
 
 impl Default for SavingsConfig {
@@ -549,6 +592,7 @@ impl Default for SavingsConfig {
             focus_after_fix: false,
             blast_radius: false,
             group_fixes: true,
+            fixer: None,
         }
     }
 }
@@ -563,6 +607,14 @@ impl SavingsConfig {
             focus_after_fix: p.focus_after_fix.unwrap_or(d.focus_after_fix),
             blast_radius: p.blast_radius.unwrap_or(d.blast_radius),
             group_fixes: p.group_fixes.unwrap_or(d.group_fixes),
+            fixer: p
+                .fixer
+                .map(|f| FixerConfig {
+                    binding: f.binding,
+                    max_severity: f.max_severity.unwrap_or(Severity::Medium),
+                    max_files: f.max_files.unwrap_or(1),
+                })
+                .or(d.fixer),
         }
     }
 }
@@ -590,6 +642,7 @@ pub enum ReviewerInput {
 pub struct FactsConfig {
     pub shared: bool,
     pub warm_secs: u64,
+    pub stagger_secs: u64,
     pub keep_alive_secs: u64,
     pub judges: JudgeMode,
     pub reviewers: ReviewerInput,
@@ -603,6 +656,7 @@ impl Default for FactsConfig {
         FactsConfig {
             shared: true,
             warm_secs: 60,
+            stagger_secs: 3,
             keep_alive_secs: 240,
             judges: JudgeMode::PerLens,
             reviewers: ReviewerInput::All,
@@ -620,6 +674,7 @@ impl FactsConfig {
         FactsConfig {
             shared: p.shared.unwrap_or(d.shared),
             warm_secs: p.warm_secs.unwrap_or(d.warm_secs),
+            stagger_secs: p.stagger_secs.unwrap_or(d.stagger_secs),
             keep_alive_secs: p.keep_alive_secs.unwrap_or(d.keep_alive_secs),
             judges: p.judges.unwrap_or(d.judges),
             reviewers: p.reviewers.unwrap_or(d.reviewers),
@@ -1109,6 +1164,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
     config.check()?;
     config.check_models()?;
     config.first_pass_judge()?;
+    config.fixer()?;
     let config = with_stage_lenses(with_universal_lenses(default_probes(config, chosen)))?;
     config.check_sessions()?;
     Ok(config)
@@ -1383,7 +1439,8 @@ impl Config {
             .bindings
             .values()
             .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()))
-            .chain(self.savings.first_pass_judge.iter());
+            .chain(self.savings.first_pass_judge.iter())
+            .chain(self.savings.fixer.iter().map(|f| &f.binding));
         for name in names {
             if let Some(b) = self.allowed_bindings.get(name)
                 && !out.iter().any(|(n, _)| *n == name.as_str())
@@ -1499,6 +1556,25 @@ impl Config {
             format!("savings.first_pass_judge: binding {name} isn't in your allowed_bindings")
         })?;
         Ok(Some((name, binding)))
+    }
+
+    /// `savings.fixer`, if set, with its binding, which must be one in
+    /// `allowed_bindings` that may write.
+    pub fn fixer(&self) -> Result<Option<(&FixerConfig, &Binding)>> {
+        let Some(f) = self.savings.fixer.as_ref() else {
+            return Ok(None);
+        };
+        let name = &f.binding;
+        let binding = self.allowed_bindings.get(name).with_context(|| {
+            format!("savings.fixer: binding {name} isn't in your allowed_bindings")
+        })?;
+        if !binding.writes {
+            bail!(
+                "savings.fixer: binding {name} can't apply fixes: give it `writes: true` in your \
+                 acr.yaml"
+            );
+        }
+        Ok(Some((f, binding)))
     }
 
     /// What a severity does in a lens.

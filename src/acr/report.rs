@@ -327,6 +327,180 @@ pub fn repairs(usage: &[Usage]) -> Vec<Repairs> {
         .collect()
 }
 
+/// Fixes by the binding they went to under `savings.fixer`, easy or hard:
+/// their groups, calls and dollars, and how many of their blockers held,
+/// not raised again the next round, of those a next round attacked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FixBinding {
+    pub binding: String,
+    pub easy: bool,
+    pub groups: usize,
+    pub calls: usize,
+    pub usd: Option<f64>,
+    pub blockers: usize,
+    /// Its blockers a next round attacked, and of those, the ones not
+    /// raised again.
+    pub judged: usize,
+    pub held: usize,
+}
+
+impl FixBinding {
+    /// One line of it, for a person.
+    pub fn line(&self) -> String {
+        let cost = self.usd.map_or_else(String::new, |d| format!(", ${d:.3}"));
+        format!(
+            "fixes on {} ({}): {} group(s), {} call(s){cost}; {} of {} blocker(s) a next round \
+             attacked held",
+            self.binding,
+            if self.easy { "easy" } else { "hard" },
+            self.groups,
+            self.calls,
+            self.held,
+            self.judged
+        )
+    }
+}
+
+/// The run's fixes by binding, where `savings.fixer` routed them.
+pub fn fix_routes(run: &super::flow::Run) -> Vec<FixBinding> {
+    let mut out: Vec<FixBinding> = Vec::new();
+    let found = |id: &str| -> Option<(&str, u32, &super::flow::Finding)> {
+        run.lenses.values().find_map(|l| {
+            l.rounds.iter().find_map(|r| {
+                r.findings
+                    .iter()
+                    .find(|f| f.id == id)
+                    .map(|f| (l.id.as_str(), r.round, f))
+            })
+        })
+    };
+    for route in &run.routes {
+        let at = match out
+            .iter()
+            .position(|b| b.binding == route.binding && b.easy == route.easy)
+        {
+            Some(at) => at,
+            None => {
+                out.push(FixBinding {
+                    binding: route.binding.clone(),
+                    easy: route.easy,
+                    groups: 0,
+                    calls: 0,
+                    usd: Some(0.0),
+                    blockers: 0,
+                    judged: 0,
+                    held: 0,
+                });
+                out.len() - 1
+            }
+        };
+        let b = &mut out[at];
+        b.groups += 1;
+        b.blockers += route.ids.len();
+        for id in &route.ids {
+            let Some((lens, round, f)) = found(id) else {
+                continue;
+            };
+            let key = super::flow::claim_key(&f.title);
+            let Some(next) = run
+                .lenses
+                .get(lens)
+                .and_then(|l| l.rounds.iter().find(|r| r.round == round + 1))
+            else {
+                continue;
+            };
+            b.judged += 1;
+            if !next
+                .findings
+                .iter()
+                .any(|g| g.blocks() && super::flow::claim_key(&g.title) == key)
+            {
+                b.held += 1;
+            }
+        }
+    }
+    for b in &mut out {
+        let tag = if b.easy { "easy" } else { "hard" };
+        for u in run
+            .usage
+            .iter()
+            .filter(|u| u.route.as_deref() == Some(tag) && u.binding == b.binding)
+        {
+            b.calls += 1;
+            b.usd = match (b.usd, u.usd) {
+                (Some(a), Some(c)) => Some(a + c),
+                _ => None,
+            };
+        }
+    }
+    out
+}
+
+/// A round's units restarted fresh after coming back unusable: how many,
+/// what their fresh sessions cost, and why each was restarted. Counted
+/// apart from repairs, which put an answer in form without a fresh session.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Restarts {
+    pub round: u32,
+    /// The restarted units, each once, with why.
+    pub units: Vec<(String, String)>,
+    /// Their fresh sessions' calls.
+    pub calls: usize,
+    pub tokens: u64,
+    pub usd: Option<f64>,
+}
+
+impl Restarts {
+    /// One line of it, for a person.
+    pub fn line(&self) -> String {
+        let cost = self.usd.map_or_else(String::new, |d| format!(", ${d:.3}"));
+        format!(
+            "round {}: restarted fresh: {} unit(s), {} call(s), {} tokens{cost}: {}",
+            self.round,
+            self.units.len(),
+            self.calls,
+            self.tokens,
+            self.units
+                .iter()
+                .map(|(unit, why)| format!("{unit} ({why})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+
+/// Each round's restarts, from the calls marked as a restart's.
+pub fn restarts(usage: &[Usage]) -> Vec<Restarts> {
+    let mut by: BTreeMap<u32, Restarts> = BTreeMap::new();
+    for u in usage {
+        let Some(why) = &u.restart else {
+            continue;
+        };
+        let r = by.entry(u.round).or_insert_with(|| Restarts {
+            round: u.round,
+            units: Vec::new(),
+            calls: 0,
+            tokens: 0,
+            usd: Some(0.0),
+        });
+        let unit = u
+            .call
+            .clone()
+            .or_else(|| u.label.clone())
+            .unwrap_or_default();
+        if !r.units.iter().any(|(n, _)| *n == unit) {
+            r.units.push((unit, why.clone()));
+        }
+        r.calls += 1;
+        r.tokens += u.tokens_in + u.cache_read + u.tokens_out;
+        r.usd = match (r.usd, u.usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+    }
+    by.into_values().collect()
+}
+
 /// One role's calls in a round, or in the whole run: what a review's cost
 /// is compared by. Keep-alive calls, and the Sizer's call that finds the
 /// defects more than one lens found, are counted apart.

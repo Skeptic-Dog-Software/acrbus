@@ -48,6 +48,12 @@ const REPLY_WAIT: u64 = 24 * 3600;
 /// `run` and `resume` exit with these for a review that needs a person.
 const WAITING: u8 = 3;
 const ESCALATED: u8 = 4;
+/// `run` and `resume` exit with this for a review paused by an outage: its
+/// calls couldn't reach their model. It's saved, and `acr resume` goes on.
+const OUTAGE: u8 = 5;
+/// How long a unit whose call couldn't reach its model waits to tell an
+/// outage from its own failure, before it restarts.
+const OUTAGE_WAIT_SECS: u64 = 60;
 
 #[derive(Args, Clone)]
 pub struct Target {
@@ -1380,6 +1386,9 @@ struct BridgeCaller {
     sent: std::sync::Mutex<std::collections::HashMap<String, (String, String, bool)>>,
     /// Agents asked to relay that can't be steered mid-call, said once each.
     unrelayed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Calls, by label, restarted after their model couldn't be reached:
+    /// they go with a new cache key.
+    rekeyed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1417,6 +1426,7 @@ impl BridgeCaller {
             shared: std::sync::Mutex::new(None),
             sent: Default::default(),
             unrelayed: Default::default(),
+            rekeyed: Default::default(),
         })
     }
 
@@ -1688,6 +1698,13 @@ impl Caller for BridgeCaller {
         ))
     }
 
+    fn rekey(&self, label: &str) {
+        self.rekeyed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(label.to_string());
+    }
+
     fn has_room(&self, binding: &config::Binding) -> bool {
         let bridge = binding.agent.split('@').next().unwrap_or_default();
         // One slot always left over for the review's own calls.
@@ -1715,6 +1732,34 @@ impl Caller for BridgeCaller {
     }
 }
 
+/// The exit code acrbus's pi extension ends a call with when its model
+/// requests keep getting no response.
+const NO_RESPONSE_EXIT: i32 = 75;
+
+/// What an agent says when it couldn't reach its model: a connection
+/// refused, reset or timed out, or a name that didn't resolve.
+fn unreachable_said(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "econnrefused",
+        "econnreset",
+        "enotfound",
+        "eai_again",
+        "etimedout",
+        "ehostunreach",
+        "enetunreach",
+        "fetch failed",
+        "connection error",
+        "connection refused",
+        "connection reset",
+        "network is unreachable",
+        "socket hang up",
+        "getaddrinfo",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
 impl BridgeCaller {
     fn call_once(&self, call: &Call, bridge: &str, token: progress::Token) -> Result<Answer> {
         // A label an earlier round used is this call's now.
@@ -1738,6 +1783,17 @@ impl BridgeCaller {
             .as_ref()
         {
             with_shared(&mut options, call, shared);
+        }
+        // A restart after its model couldn't be reached: a new key, so it
+        // may land on another replica than the one that didn't answer.
+        if self
+            .rekeyed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&call.label)
+            && let Some(key) = options.cache_key.as_mut()
+        {
+            key.push_str("-fresh");
         }
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {
@@ -1765,17 +1821,25 @@ impl BridgeCaller {
         };
         let wait = REPLY_WAIT;
         let asked = std::time::Instant::now();
-        let mut client = Client::connect(&self.socket)?;
-        client.send(&Request::Call {
-            agent: self.agent.clone(),
-            to: b.agent.clone(),
-            body,
-            reply_to: None,
-            expects_reply: Some(true),
-            ext: Some(Box::new(ext)),
-            wait_secs: Some(wait),
-        })?;
-        let sent: Sent = client.reply()?;
+        let unreachable = |e: anyhow::Error| {
+            anyhow::Error::new(flow::CallFailed {
+                failure: flow::Failure::Unreachable,
+                message: format!("the bus couldn't be reached: {e:#}"),
+            })
+        };
+        let mut client = Client::connect(&self.socket).map_err(unreachable)?;
+        client
+            .send(&Request::Call {
+                agent: self.agent.clone(),
+                to: b.agent.clone(),
+                body,
+                reply_to: None,
+                expects_reply: Some(true),
+                ext: Some(Box::new(ext)),
+                wait_secs: Some(wait),
+            })
+            .map_err(unreachable)?;
+        let sent: Sent = client.reply().map_err(unreachable)?;
         self.progress.sent(token, &sent.id);
         self.sent.lock().unwrap_or_else(|e| e.into_inner()).insert(
             call.label.clone(),
@@ -1801,7 +1865,7 @@ impl BridgeCaller {
             // The reply is kept for this agent, so wait for it again.
             Err(_) => {
                 let left = wait.saturating_sub(asked.elapsed().as_secs()).max(1);
-                self.await_again(&sent.id, left)?
+                self.await_again(&sent.id, left).map_err(unreachable)?
             }
         };
         match awaited {
@@ -1809,16 +1873,34 @@ impl BridgeCaller {
                 let msg = &item.msg;
                 let result = msg.result();
                 let status = result.map_or(RunStatus::Ok, |r| r.status);
-                if status == RunStatus::Timeout {
-                    bail!(
-                        "{} timeout: {}. It ran as long as {bridge} allows, so raise its \
-                         timeout_secs and max_timeout_secs if a call needs longer",
-                        b.agent,
-                        msg.body
-                    );
-                }
                 if status != RunStatus::Ok {
-                    bail!("{} {}: {}", b.agent, status.as_str(), msg.body);
+                    let said = |text: &str| unreachable_said(text);
+                    let failure = match status {
+                        RunStatus::Timeout => flow::Failure::TimedOut,
+                        RunStatus::Refused => flow::Failure::Refused,
+                        RunStatus::Cancelled => flow::Failure::Cancelled,
+                        _ if result.and_then(|r| r.exit_code) == Some(NO_RESPONSE_EXIT) => {
+                            flow::Failure::NoResponse
+                        }
+                        _ if said(&msg.body)
+                            || result
+                                .and_then(|r| r.stderr_tail.as_deref())
+                                .is_some_and(said) =>
+                        {
+                            flow::Failure::Unreachable
+                        }
+                        _ => flow::Failure::Failed,
+                    };
+                    let message = if status == RunStatus::Timeout {
+                        format!(
+                            "{} timeout: {}. It ran as long as {bridge} allows, so raise its \
+                             timeout_secs and max_timeout_secs if a call needs longer",
+                            b.agent, msg.body
+                        )
+                    } else {
+                        format!("{} {}: {}", b.agent, status.as_str(), msg.body)
+                    };
+                    return Err(anyhow::Error::new(flow::CallFailed { failure, message }));
                 }
                 let whole = result
                     .and_then(|r| r.full_reply.as_ref())
@@ -1856,9 +1938,18 @@ impl BridgeCaller {
                     secs: Some(asked.elapsed().as_secs()),
                 })
             }
-            Awaited::Undelivered { why } => bail!("{}: {why}", b.agent),
-            Awaited::Unanswered => bail!("{} marked it handled without answering", b.agent),
-            Awaited::TimedOut => bail!("{} didn't answer in {wait} seconds", b.agent),
+            Awaited::Undelivered { why } => Err(anyhow::Error::new(flow::CallFailed {
+                failure: flow::Failure::Unreachable,
+                message: format!("{}: {why}", b.agent),
+            })),
+            Awaited::Unanswered => Err(anyhow::Error::new(flow::CallFailed {
+                failure: flow::Failure::Failed,
+                message: format!("{} marked it handled without answering", b.agent),
+            })),
+            Awaited::TimedOut => Err(anyhow::Error::new(flow::CallFailed {
+                failure: flow::Failure::TimedOut,
+                message: format!("{} didn't answer in {wait} seconds", b.agent),
+            })),
         }
     }
 }
@@ -2319,6 +2410,26 @@ fn with_unrecorded(paths: &Paths, run: &Run) -> Run {
     whole
 }
 
+/// A review an outage paused: saved as it stands, with what its round's
+/// units finished kept in its folder, and said how to go on. None if it
+/// wasn't paused, and an error that isn't an outage's, as it was.
+fn paused(paths: &Paths, run: &Run, cfg: &Config, driven: Result<()>) -> Result<Option<ExitCode>> {
+    match driven {
+        Ok(()) => Ok(None),
+        Err(e) if flow::is_outage(&e) => {
+            save(paths, run, cfg)?;
+            eprintln!(
+                "{APP_NAME}: gateway unreachable: saved, continue with `{APP_NAME} acr resume {}` \
+                 once it's back. Round {} keeps what its reviewers and Judges finished, and runs \
+                 only the rest. ({e:#})",
+                run.id, run.round
+            );
+            Ok(Some(ExitCode::from(OUTAGE)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<ExitCode> {
     // A run stopped mid-round counts that round's finished calls too.
     let run = &with_unrecorded(paths, run);
@@ -2675,6 +2786,7 @@ fn setting<'a>(
         description: None,
         converge: false,
         stop_on_failure: false,
+        outage_wait_secs: OUTAGE_WAIT_SECS,
         copies: Some(copies_root(paths)),
         head_copy: None,
         pr: None,
@@ -2805,6 +2917,13 @@ fn describe_plan(plan: &plan::Plan) {
             fix.binding,
             tokens(fix)
         );
+        if let Some(f) = &plan.fixer {
+            println!(
+                "Easy fix groups go to {} instead: each blocker {:?} or lower, citing at most {} \
+                 file(s), its cause stated, no one's call and not recurring",
+                f.binding, f.max_severity, f.max_files
+            );
+        }
     }
     // Tokens always. Dollars only for calls billed in them.
     let figure = |e: &plan::Estimate| {
@@ -3013,8 +3132,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
-            flow::drive(&mut run, &s, &caller, &reloading)?;
-            attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
+            let driven = flow::drive(&mut run, &s, &caller, &reloading)
+                .and_then(|()| attend(paths, &mut run, &cfg, &s, &caller, &reloading));
+            if let Some(code) = paused(paths, &run, &cfg, driven)? {
+                return Ok(code);
+            }
             return finish(paths, &run, &cfg, post_pr);
         }
         AcrCmd::Clean { dry_run } => clean(paths, dry_run)?,
@@ -3023,6 +3145,8 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let rows = report::by_role(&run.usage);
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
+            let restarts = report::restarts(&run.usage);
+            let fixes = report::fix_routes(&run);
             let unreported = report::writes_unreported(&run.usage);
             let sessions = report::sessions(&run.usage);
             let adj = report::adjusted(&run.usage);
@@ -3061,6 +3185,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
+                    "restarts": restarts, "fix_routes": fixes,
                     "sessions": sessions, "session_calls": parts,
                     "calls": calls, "cost": billed, "cost_adjusted": cost_adjusted,
                     "cache_shortfall_tokens": shortfall,
@@ -3079,6 +3204,12 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for r in &repairs {
                     println!("{}", r.line());
+                }
+                for r in &restarts {
+                    println!("{}", r.line());
+                }
+                for f in &fixes {
+                    println!("{}", f.line());
                 }
                 for f in &firsts {
                     println!("{}", f.line());
@@ -3243,7 +3374,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             // running by a process that's gone.
             if stop {
                 flow::end_here(&mut run);
-            } else if !answered && !fixed {
+            } else if !answered && !fixed && run.outage.is_none() {
                 let decision = Decision {
                     fold,
                     waive,
@@ -3277,8 +3408,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let head = run.head.clone();
             let reloading =
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
-            flow::drive(&mut run, &s, &caller, &reloading)?;
-            attend(paths, &mut run, &cfg, &s, &caller, &reloading)?;
+            let driven = flow::drive(&mut run, &s, &caller, &reloading)
+                .and_then(|()| attend(paths, &mut run, &cfg, &s, &caller, &reloading));
+            if let Some(code) = paused(paths, &run, &cfg, driven)? {
+                return Ok(code);
+            }
             let code = finish(paths, &run, &cfg, post_pr)?;
             if stop {
                 eprint!("{}", left_behind(paths, &run));
@@ -4606,6 +4740,21 @@ fn stored_config(bytes: &[u8]) -> Result<Config> {
 mod tests {
     use super::change::tests::{branch, commit, repo_with};
     use super::*;
+
+    #[test]
+    fn a_call_that_couldnt_reach_its_model_is_told_by_what_its_agent_said() {
+        for said in [
+            "Error: fetch failed (ECONNREFUSED 127.0.0.1:8080)",
+            "getaddrinfo ENOTFOUND api.example.com",
+            "Connection error.",
+            "socket hang up",
+        ] {
+            assert!(unreachable_said(said), "{said}");
+        }
+        for said in ["the answer has no JSON", "exit 1: out of memory"] {
+            assert!(!unreachable_said(said), "{said}");
+        }
+    }
 
     const LENS: &str = "version: 1\ntiers: [{id: t, match: {paths: ['**']}, fan_out: 1}]\n";
 
