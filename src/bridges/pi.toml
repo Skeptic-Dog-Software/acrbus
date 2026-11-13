@@ -15,6 +15,13 @@ max_concurrent = 3
 # are for questions about pi itself: "0" keeps it. acrbus's extension, which
 # every review call gets, does it.
 ACRBUS_DROP_PI_DOCS = "1"
+# A model request with no response, no headers or no stream event, for this
+# many seconds is aborted as timed out and retried by pi; after this many in
+# a row the call ends, failed, so acrbus retries or escalates it. Bytes with
+# no event don't count as a response, and an answering request is never cut
+# off. "0" turns it off.
+ACRBUS_NO_RESPONSE_SECS = "300"
+ACRBUS_NO_RESPONSE_TRIES = "3"
 
 [options]
 max_timeout_secs = 14400

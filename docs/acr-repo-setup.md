@@ -516,11 +516,27 @@ Scouting suits a lens whose reviewers read widely and long, where most of a
 long session is rereading; a lens whose reviews are short gains little.
 
 **`stall_warn_secs`: a call with no new turn.** A pi call logs each turn
-as it ends, and progress warns once when a call has logged no new turn for
-this long, with how many it has: its provider may be slow, or a request
-lost. It warns again if the call moves on and then stops again. Nothing cuts
-a call off for it: that's still the bridge's watch for a run that uses no
-CPU and writes no file (`idle_secs`), which this is apart from.
+as it ends, and progress warns when a call has logged no new turn for
+this long, with how many it has, and again at each multiple of it while
+the silence lasts, saying how long it has been: its provider may be slow,
+or a request lost. It warns again if the call moves on and then stops
+again. Nothing cuts a call off for it: that's still the bridge's watch for
+a run that uses no CPU and writes no file (`idle_secs`), which this is
+apart from.
+
+**A lost request.** A pi call's extension watches each model request it
+sends. One that gets no response, no headers or, once its stream has
+begun, no event, for `ACRBUS_NO_RESPONSE_SECS` (300 by default) is aborted
+as timed out, and pi's own retry sends it again; its log says
+`acrbus cache: turn N: no response in 300s, aborted and retried`. Bytes
+that carry no event, such as a gateway's keep-alive, aren't a response,
+and pi's own timeout of the same silence counts too. After
+`ACRBUS_NO_RESPONSE_TRIES` (3) in a row the call ends with exit code 75,
+which its bridge fails, never passes, so the review retries or escalates
+it as it does any failed call. A request that's answering, however
+slowly, is never cut off. Both are in the pi kind's `[env]`, and a
+bridge's own `[env]` in `config.toml` overrides them, for every binding
+that names it; `"0"` turns the watch off.
 
 **What it shows.** Progress says when a session hands off and how many
 suspicions a scout listed. Each session is a call of its own in `acrbus acr

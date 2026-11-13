@@ -51,7 +51,9 @@ minute:
 - each round's setup, what each lens's Judge has to rate, and a lens that
   has none, such as one whose reviewers found nothing;
 - a call whose agent has logged no new turn for `sessions.stall_warn_secs`
-  (3 minutes by default), once, apart from the bridge's own idle watch;
+  (3 minutes by default), and again at each multiple of it while the
+  silence lasts, with how long it has been, apart from the bridge's own
+  idle watch;
 - after a fix, the files it changed, and those flagged for you.
 
 Where each lens of the round stands is kept in `lenses.json` in the

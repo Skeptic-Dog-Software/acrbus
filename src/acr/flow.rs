@@ -445,6 +445,10 @@ pub struct Usage {
     /// first turn read from the cache, which shows a warm-up worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_turn: Option<crate::proto::TurnUsage>,
+    /// It finished in a round that didn't: a run stopped mid-round, its
+    /// usage read from the answer as it came, not from the round's end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unfinished: bool,
     /// Its part of a call broken into sessions: "leg 2" of a relay,
     /// "scout", or "verify 3".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -931,6 +935,82 @@ pub struct Decision {
 /// What a call cost: by the agent's count if it gave one, or else by the
 /// text it took and gave and by the config. Either is priced by the config,
 /// falling back to what the agent said.
+/// A call answered, as its caller kept it the moment its answer came, in
+/// the run's folder: what a run stopped mid-round still counts, since a
+/// round's calls are recorded only when the round ends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Answered {
+    /// The bridge's request.
+    pub id: String,
+    pub role: Role,
+    pub binding: String,
+    pub agent: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subscription: bool,
+    pub label: String,
+    #[serde(default)]
+    pub secs: Option<u64>,
+    #[serde(default)]
+    pub usage: Option<RunUsage>,
+}
+
+/// The file in a run's folder its answered calls are kept in, a line each.
+pub const ANSWERED: &str = "answered";
+
+impl Answered {
+    /// Every answered call kept in run folder `dir`, oldest first: none if
+    /// it has none, and a line that can't be read is passed over.
+    pub fn read(dir: &Path) -> Vec<Answered> {
+        fs::read_to_string(dir.join(ANSWERED))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Its usage as the run would have recorded it in `round`, priced by
+    /// what its agent said it cost, and marked as from a round that didn't
+    /// finish.
+    pub fn usage(&self, round: u32) -> Usage {
+        let counted = self.usage.clone().unwrap_or_default();
+        Usage {
+            role: self.role,
+            binding: self.binding.clone(),
+            agent: self.agent.clone(),
+            model: self.model.clone(),
+            run_id: self.id.clone(),
+            tokens_in: counted.input_tokens,
+            cache_read: counted.cache_read_tokens,
+            cache_write: counted.cache_write_tokens,
+            tokens_out: counted.output_tokens,
+            usd: if self.subscription { None } else { counted.usd },
+            measured: self.usage.is_some(),
+            agent_usd: counted.usd,
+            subscription: self.subscription,
+            round,
+            secs: self.secs,
+            label: Some(self.label.clone()),
+            fan_out: None,
+            first: false,
+            repaired: None,
+            lens: None,
+            opened: counted.opened.clone(),
+            call: None,
+            first_turn: counted.first_turn,
+            unfinished: true,
+            part: None,
+            cache_shortfall: counted.cache_shortfall_tokens,
+            usd_input: counted.usd_input,
+            usd_cache_read: counted.usd_cache_read,
+            price_rates: None,
+            turns: counted.calls,
+            tool_calls: counted.tool_calls,
+        }
+    }
+}
+
 fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usage {
     let mut usage = Usage {
         role: call.role,
@@ -960,6 +1040,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
             .unwrap_or_default(),
         call: None,
         first_turn: None,
+        unfinished: false,
         part: None,
         cache_shortfall: 0,
         usd_input: None,

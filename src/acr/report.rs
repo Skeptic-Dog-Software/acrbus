@@ -399,6 +399,20 @@ impl RoleUsage {
 }
 
 /// What a cache-adjusted figure is, said wherever one is shown.
+/// Said when a run stopped in a round that didn't finish: that round's
+/// calls that did are counted, from their answers as they came. None when
+/// every call is from a round that finished.
+pub fn unfinished_line(usage: &[Usage]) -> Option<String> {
+    let late: Vec<&Usage> = usage.iter().filter(|u| u.unfinished).collect();
+    let round = late.iter().map(|u| u.round).max()?;
+    let usd: f64 = late.iter().filter_map(|u| u.usd).sum();
+    Some(format!(
+        "round {round} didn't finish: its {} finished call(s), ${usd:.3}, are counted from their \
+         answers as they came",
+        late.len()
+    ))
+}
+
 pub const ADJUSTED_IS: &str = "cache-adjusted is derived, not billed: the cost had the \
     provider served from its cache what a turn had just sent, or, for a call after its \
     fan-out's first, the opening that first call sent; the billed figure is what was charged";

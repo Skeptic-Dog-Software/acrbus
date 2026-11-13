@@ -6643,6 +6643,135 @@ console.log(JSON.stringify({
     }
 
     #[test]
+    fn the_pi_extension_ends_a_request_with_no_response_and_retries_it() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-ext-noresp-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        // The provider as fetch sees it, by mode: silent (no headers ever),
+        // quiet (headers, then no stream event), talking (an event every
+        // 100ms for 600ms), quick (a whole answer at once), or pi's own
+        // headers timeout. Each ends only when its signal aborts.
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import { writeSync } from "node:fs";
+let mode = "silent";
+globalThis.fetch = (url, init = {}) => new Promise((resolve, reject) => {
+  const sig = init.signal;
+  const gone = () => sig.reason ?? new Error("aborted");
+  if (mode === "own") { const e = new Error("Headers Timeout Error"); e.code = "UND_ERR_HEADERS_TIMEOUT"; return reject(e); }
+  if (mode === "quick") return resolve(new Response("{}", { status: 200 }));
+  if (mode === "silent") { sig.addEventListener("abort", () => reject(gone())); return; }
+  const body = new ReadableStream({ start(c) {
+    sig.addEventListener("abort", () => { try { c.error(gone()); } catch {} });
+    if (mode === "talking") {
+      let n = 0;
+      const t = setInterval(() => {
+        n += 1;
+        events();
+        c.enqueue(new TextEncoder().encode("data: {}\n\n"));
+        if (n === 6) { clearInterval(t); c.close(); }
+      }, 100);
+    }
+  } });
+  resolve(new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }));
+});
+const handlers = {};
+const { default: acrbus } = await import("./acrbus-pi.mjs");
+acrbus({ on: (name, f) => { (handlers[name] ??= []).push(f); } });
+const events = () => { for (const f of handlers.provider_stream_event ?? []) f({ data: {} }, {}); };
+const fire = (name, ...args) => { for (const f of handlers[name] ?? []) f(...args); };
+// Each request is the model's, as pi sends it: after before_provider_request.
+const ask = (init) => { fire("before_provider_request", { payload: {} }, {}); return fetch("http://x", init); };
+const streamed = { method: "POST", body: JSON.stringify({ model: "m", stream: true, messages: [] }) };
+const out = {};
+const timed = async (f) => { const at = Date.now(); try { await f(); return ["ok", Date.now() - at]; } catch (e) { return [String(e?.message ?? e), Date.now() - at]; } };
+const drain = async (r) => { const rd = r.body.getReader(); for (;;) { const { done } = await rd.read(); if (done) return; } };
+mode = "silent";
+out.silent = await timed(() => ask(streamed));
+mode = "quiet";
+out.quiet = await timed(async () => drain(await ask(streamed)));
+mode = "talking";
+out.talking = await timed(async () => drain(await ask(streamed)));
+mode = "quick";
+out.quick = await timed(async () => (await ask({ method: "POST", body: "{}" })).text());
+// Past the turn's end, a fetch isn't the model's: never watched.
+fire("message_end", { message: { role: "assistant" } });
+const mine = new AbortController();
+mode = "silent";
+const outside = fetch("http://x", { ...streamed, signal: mine.signal }).catch((e) => `ended: ${e?.message ?? e}`);
+out.outside = await Promise.race([outside, new Promise((r) => setTimeout(() => r("waiting"), 500))]);
+mine.abort();
+writeSync(1, JSON.stringify(out) + "\n");
+// Three in a row with no response, pi's own timeout among them: the call ends.
+mode = "own";
+await timed(() => ask(streamed));
+mode = "silent";
+await timed(() => ask(streamed));
+await timed(() => ask(streamed));
+await new Promise((r) => setTimeout(r, 3000));
+writeSync(1, "still running\n");
+"#,
+        )
+        .unwrap();
+        let ran = Command::new("node")
+            .arg(dir.join("check.mjs"))
+            .env("ACRBUS_TURNS", "1")
+            .env("ACRBUS_NO_RESPONSE_SECS", "0.2")
+            .env("ACRBUS_NO_RESPONSE_TRIES", "3")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&ran.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&ran.stderr).to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let first = stdout
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("{stdout}\n{stderr}"));
+        let out: serde_json::Value = serde_json::from_str(first).unwrap();
+        let took = |k: &str| out[k][1].as_u64().unwrap();
+        let said = |k: &str| out[k][0].as_str().unwrap().to_string();
+        // No headers: ended at the wait, as a timeout pi retries.
+        assert!(said("silent").contains("timed out"), "{out}");
+        assert!((150..2000).contains(&took("silent")), "{out}");
+        // Headers, then nothing: the stream is ended the same way.
+        assert!(said("quiet").contains("timed out"), "{out}");
+        // Answering, however long: never cut off.
+        assert_eq!(said("talking"), "ok", "{out}");
+        assert!(took("talking") >= 500, "{out}");
+        assert_eq!(said("quick"), "ok", "{out}");
+        assert_eq!(out["outside"], "waiting", "{out}");
+        assert_eq!(
+            stderr
+                .matches("no response in 0.2s, aborted and retried")
+                .count(),
+            3,
+            "silent and quiet, then one in the run of three, whose third ends the call: {stderr}"
+        );
+        assert!(
+            stderr.contains("acrbus cache: turn 1: no response in 0.2s, aborted and retried"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("its own timeout"),
+            "pi's own timeout counts too: {stderr}"
+        );
+        // Three in a row: the call ends, so its bridge fails it, never quietly.
+        assert!(
+            stderr.contains("no response 3 times in a row: ending the call"),
+            "{stderr}"
+        );
+        assert_eq!(ran.status.code(), Some(75), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("still running"), "{stdout}");
+    }
+
+    #[test]
     fn a_relays_size_reaches_pi_and_loads_acrbus_extension() {
         let rig = Rig::new();
         let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'relay=%s\n' "$ACRBUS_RELAY_TOKENS""#;

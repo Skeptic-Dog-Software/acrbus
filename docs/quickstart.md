@@ -262,7 +262,10 @@ stopped, lets go of its claim on Grayboard, and says what it left: its
 kept files, the copies it worked in, and anything uncommitted in the
 checkout, which may hold an Orchestrator's fixes, with the commands to see
 or discard them. It touches none of that. `acr resume <id> --stop` does
-the same.
+the same. Its report and `acrbus acr usage <id>` count every call that
+finished, even in a round that didn't, and say so: `round N didn't
+finish: its K finished call(s), $X, are counted from their answers as
+they came`.
 
 The old answers still work: `--approve`, `--stop`, `--fold <ids>`,
 `--defer <ids>` and `--waive <ids>`.
