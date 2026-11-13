@@ -233,10 +233,24 @@ structure, not a sandbox: an agent with a shell runs as you. A pi call is
 held to the tools its binding names: any other, one a gateway added to the
 request or one the model made up, is refused, and any call's model reaching
 for a tool its binding doesn't name is said, and listed in the report. The
-host's MCP servers reach a pi call only if its binding names them. A fix
-keeps to the source, and
-every file it changes is listed: a binary, or a file none of its blockers
-points at, is put to you, to keep or revert.
+host's MCP servers reach a pi call only if its binding names them.
+
+A fix keeps to its own files: the ones its blockers point at or name, test
+files beside them for tests that pin it, and any a person allowed. A pi
+fixer is refused a write anywhere else. Whatever agent fixes, what it
+changed outside those files, a rebuilt binary or a rewritten doc, is put
+back as each of its sessions ends, before any reviewer reads it, and no fix
+may change that file again unless a blocker points at it. Paying to write,
+review and then revert an edit nobody asked for is the waste this stops.
+
+What a fix truly needs elsewhere, such as a caller of a signature it
+changed, it notes instead, and a doc its fix left wrong it notes as stale.
+Under a gate that asks at rounds, those notes, and any file the session
+that ran the review changed outside its blockers, are put to you right
+after the fix and before the next round's reviewers: fix it now, in a
+follow-up held to that file, leave it for a ticket, or leave it. A fixer's
+brief carries its files as they are, so its sessions don't spend turns
+reading them again.
 
 ## It's measurable
 

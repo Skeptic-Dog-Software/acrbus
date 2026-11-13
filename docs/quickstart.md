@@ -281,11 +281,17 @@ The Orchestrator fixes in groups, a fresh session for each file's blockers
 and is told to keep the fix to the source: no rebuilt binaries or
 artifacts, and no command that rewrites tracked files beyond the fix.
 
-**What a fix changed.** After every fix, whoever made it, progress lists
-the files it changed, and flags each binary and each file no blocker it was
-given points at. The next gate asks about the flagged ones, a few to a
-question: choose any to revert to how it was before the fix, and the rest
-stay. Each choice shows the exact command that reverts it, for you to run
+**What a fix changed.** An Orchestrator's fix may change only its own
+files: those its blockers point at or name, and test files beside them.
+What it changes anywhere else is put back as its session ends, said in
+progress, and locked for the rest of the run; what it needed there, or a doc
+it left stale, it notes for you instead. After every fix, whoever made it,
+progress lists the files it changed, and flags each binary and each file no
+blocker it was given points at, which only the session that ran the review
+can leave. Under a gate that asks at rounds, the flagged files and the notes
+are asked about right after the fix, before the next round's reviewers;
+under `ends`, at the result. Choose any flagged file to revert to how it was
+before the fix, and the rest stay. Each choice shows the exact command that reverts it, for you to run
 yourself if you'd rather. Nothing is reverted without you, and a review
 never stops for it. The report's `flags` lists them all with what you
 chose, and a review that ends with one unanswered says so, with its
