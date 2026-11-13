@@ -414,6 +414,11 @@ pub enum AcrCmd {
         /// what the fixes changed.
         #[arg(long, value_name = "FILE", requires = "fixed")]
         brief: Option<PathBuf>,
+        /// With `--fixed`: what the fix needs changed outside its files, and
+        /// the docs it left stale, as JSON: {"needs": [{"path", "why"}],
+        /// "stale": [{"file", "line", "says"}]}. Each is put to a person.
+        #[arg(long, value_name = "FILE", requires = "fixed")]
+        notes: Option<PathBuf>,
         /// Blockers to fix, by ID, with commas.
         #[arg(long, value_delimiter = ',')]
         fold: Vec<String>,
@@ -2234,7 +2239,12 @@ fn attend(
                     },
                 )?;
             } else {
-                flow::fixed_by_session(run, s, caller, Default::default())?;
+                // Refused, it may still have put files back and locked
+                // them: kept, so the next try is held to them too.
+                if let Err(e) = flow::fixed_by_session(run, s, caller, Default::default(), None) {
+                    save(paths, run, cfg)?;
+                    return Err(e);
+                }
             }
         } else {
             let ask = carousel::ask(run, cfg, &APP_NAME.to_string());
@@ -3488,6 +3498,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     answers: None,
                     fixed: false,
                     brief: None,
+                    notes: None,
                     fold: Vec::new(),
                     waive: Vec::new(),
                     defer: Vec::new(),
@@ -3505,6 +3516,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             answers,
             fixed,
             brief,
+            notes,
             fold,
             waive,
             defer,
@@ -3649,7 +3661,21 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     .transpose()?
                     .map(|b| b.lenses)
                     .unwrap_or_default();
-                flow::fixed_by_session(&mut run, &s, &caller, briefs)?;
+                let notes = notes
+                    .as_deref()
+                    .map(|f| {
+                        fs::read_to_string(f)
+                            .with_context(|| format!("reading {}", f.display()))
+                            .and_then(|t| roles::read_session_notes(&t))
+                            .with_context(|| format!("{}: notes as JSON", f.display()))
+                    })
+                    .transpose()?;
+                // Refused, it may still have put files back and locked them:
+                // kept, so the next try is held to them too.
+                if let Err(e) = flow::fixed_by_session(&mut run, &s, &caller, briefs, notes) {
+                    save(paths, &run, &cfg)?;
+                    return Err(e);
+                }
             }
             // Under way again, as its record says to anyone who looks.
             run.status = flow::Status::Running;
@@ -5399,6 +5425,7 @@ mod tests {
             answers: None,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),
@@ -5559,6 +5586,7 @@ mod tests {
             answers,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),
@@ -5613,6 +5641,7 @@ mod tests {
             answers: None,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),

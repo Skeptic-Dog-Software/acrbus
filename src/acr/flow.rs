@@ -7830,7 +7830,9 @@ fn to_fix(run: &Run) -> Vec<(String, Finding)> {
 
 /// What the session that ran the review is to fix, as it reads it: less
 /// what groups of the Orchestrator's fix already did, which it's told.
-pub fn fix_brief(run: &Run) -> String {
+/// What's left for the session that ran the review to fix: the folded
+/// blockers and reported defects no Orchestrator group already fixed.
+fn session_left(run: &Run) -> (Vec<(String, Finding)>, Vec<Reported>) {
     let partial = run
         .partial_fix
         .as_ref()
@@ -7847,6 +7849,22 @@ pub fn fix_brief(run: &Run) -> String {
         .into_iter()
         .filter(|(_, f)| !done(&f.id))
         .collect();
+    (left, reported)
+}
+
+/// The files the session that ran the review may change in its fix: as an
+/// agent fixer's, from what's left for it.
+pub fn session_scope(run: &Run) -> FixScope {
+    let (left, reported) = session_left(run);
+    fix_scope(run, &left, &reported)
+}
+
+pub fn fix_brief(run: &Run) -> String {
+    let partial = run
+        .partial_fix
+        .as_ref()
+        .filter(|p| p.round == run.round && !p.groups.is_empty());
+    let (left, reported) = session_left(run);
     let mut out = fix_list(&left, &reported);
     if let Some(p) = partial {
         out.push_str("\nAlready fixed by the Orchestrator, in the working tree:\n");
@@ -7854,8 +7872,20 @@ pub fn fix_brief(run: &Run) -> String {
             out.push_str(&format!("- {}: {}\n", g.ids.join(", "), g.done.trim()));
         }
     }
+    out.push_str(&session_scope(run).told());
+    out.push_str(SESSION_FIX_SCOPE);
     out
 }
+
+/// What the session that ran the review is told of its scope, after the
+/// files: what happens to anything else, and how to note it instead.
+const SESSION_FIX_SCOPE: &str = "When you say the fixes are in, anything changed outside these \
+     files, and any binary no blocker points at, is put back before the next round reads it. \
+     Build into a temporary directory, never the working tree. Note what the fix needs changed \
+     elsewhere, and docs it left saying something no longer true, in a JSON file passed with \
+     `--notes <file>`: {\"needs\": [{\"path\": \"<file>\", \"why\": \"<why>\"}], \
+     \"stale\": [{\"file\": \"<doc>\", \"line\": <number>, \"says\": \"<what it says that's \
+     no longer true>\"}]}. Each is put to a person: fix it now, ticket it, or leave it.\n";
 
 /// The session that ran the review has fixed what was folded in, in the
 /// working tree: the next round attacks the change as it is now, with the
@@ -7865,6 +7895,7 @@ pub fn fixed_by_session(
     s: &Setting,
     caller: &dyn Caller,
     briefs: BTreeMap<String, String>,
+    notes: Option<roles::SessionNotes>,
 ) -> Result<()> {
     if run.waiting != Some(Gate::Fix) {
         bail!(
@@ -7887,6 +7918,52 @@ pub fn fixed_by_session(
             "{line}. Fold them into the working tree, then resume with --fixed again, or end \
              the review with --stop"
         );
+    }
+    // Held to its files as an agent fixer is: what it changed outside them,
+    // and any binary no blocker points at, put back before anything reads
+    // it, and locked. Set against the tree as the session was asked to fix.
+    if let Some(asked) = run.fixing.as_ref().and_then(|f| f.from.clone()) {
+        let scope = session_scope(run);
+        let label = "the session that ran the review";
+        let reverted = put_back(caller, &run.repo, &asked, &scope, label);
+        for (path, _) in &reverted {
+            if !run.locked.iter().any(|l| &l.path == path) {
+                run.locked.push(Locked {
+                    path: path.clone(),
+                    round: run.round,
+                    by: "acrbus".into(),
+                });
+            }
+        }
+        if !reverted.is_empty() {
+            run.guarded.push(Guarded {
+                round: run.round,
+                fix: "the session's fix".into(),
+                paths: scope.paths.clone(),
+                reverted: reverted.clone(),
+                usd: None,
+            });
+        }
+        // All it changed was outside its files: put back, it did no work.
+        if caller.snapshot(&run.repo).as_deref() == Some(asked.as_str()) {
+            let line = format!(
+                "{label}: did no work: everything it changed was outside the files its fix may \
+                 change, and was put back: {}",
+                reverted
+                    .iter()
+                    .map(|(p, why)| format!("{p} ({why})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            caller.say(&line);
+            bail!(
+                "{line}. Fix the blockers in their own files, noting anything else with \
+                 --notes, then resume with --fixed again, or end the review with --stop"
+            );
+        }
+    }
+    if let Some(n) = &notes {
+        keep_notes(run, s, caller, &n.as_fixed());
     }
     let folded = to_fix(run);
     let done = "fixed by the session that ran the review".to_string();
@@ -8538,6 +8615,19 @@ lenses:
             if self.edits_once {
                 let edited = self.edited.load(std::sync::atomic::Ordering::SeqCst);
                 return Some(if edited { "edited" } else { "base" }.into());
+            }
+            // Every file it changed put back: the tree is as it was put
+            // back to.
+            if let Some(all) = &self.changed {
+                let reverted = self.reverted.lock().unwrap();
+                if !all.is_empty()
+                    && all
+                        .iter()
+                        .all(|c| reverted.iter().any(|(p, _, _)| p == &c.path))
+                    && let Some((_, from, _)) = reverted.last()
+                {
+                    return Some(from.clone());
+                }
             }
             (self.fixes.is_some() || self.changed.is_some()).then(new_id)
         }
@@ -11513,7 +11603,7 @@ lenses:
                 .contains("acr resume r --fixed")
         );
         fixed.store(true, std::sync::atomic::Ordering::SeqCst);
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
         // Every lens attacks the fix, since a missed defect is nobody's lens's.
         assert_eq!(run.round, 2);
@@ -15108,7 +15198,7 @@ lenses:
             brief.contains("Already fixed by the Orchestrator, in the working tree:\n- alpha-r1-1, alpha-r1-2: fixed first and second"),
             "{brief}"
         );
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap();
         assert!(run.partial_fix.is_none());
         assert_eq!(run.stage, Stage::Review);
     }
@@ -15337,7 +15427,7 @@ lenses:
             "alpha".to_string(),
             "Start at the new lock in a.src.".to_string(),
         )]);
-        fixed_by_session(&mut run, &s, &fake, briefs).unwrap();
+        fixed_by_session(&mut run, &s, &fake, briefs, None).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
         let alpha = prompts(&fake, Role::Reviewer, "alpha");
         assert!(alpha.len() >= 2, "{}", alpha.len());
@@ -15362,11 +15452,108 @@ lenses:
         run.fixer = Fixer::Session;
         drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
         assert_eq!(run.waiting, Some(Gate::Fix));
-        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap_err();
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap_err();
         assert!(format!("{e:#}").contains("did no work"), "{e:#}");
         assert!(said(&fake).contains("did no work: it said the fixes are in"));
         // Still waiting for the fixes, in the same round.
         assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
+    }
+
+    #[test]
+    fn a_session_fix_is_held_to_its_files_and_its_notes_are_kept() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.changed = rebuilt();
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        // It's told its files, and how to note anything else.
+        let brief = fix_brief(&run);
+        assert!(brief.contains("# The files this fix may change"), "{brief}");
+        assert!(brief.contains("`a.src`"), "{brief}");
+        assert!(brief.contains("--notes <file>"), "{brief}");
+        let notes = roles::read_session_notes(
+            r#"{"needs": [{"path": "b.src", "why": "its caller"}],
+                "stale": [{"file": "README.md", "line": 3, "says": "the old flag"}]}"#,
+        )
+        .unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), Some(notes)).unwrap();
+        // What it changed outside a.src, and the binary, were put back
+        // before the next round, and are locked.
+        let reverted = fake.reverted.lock().unwrap();
+        let paths: Vec<&str> = reverted.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(paths, ["build/tool.bin", "notes.md"]);
+        drop(reverted);
+        assert!(said(&fake).contains(
+            "the session that ran the review: put back 2 file(s) it changed outside its scope"
+        ));
+        let locked: Vec<&str> = run.locked.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(locked, ["build/tool.bin", "notes.md"]);
+        assert_eq!(run.guarded[0].fix, "the session's fix");
+        assert!(run.flags.is_empty(), "{:?}", run.flags);
+        // Its notes are kept, as an agent fixer's are: tickets, under a gate
+        // that doesn't ask at rounds.
+        let notes: Vec<(&str, &str, NoteState)> = run
+            .fix_notes
+            .iter()
+            .map(|n| (n.kind.as_str(), n.path.as_str(), n.state))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("needs", "b.src", NoteState::Ticket),
+                ("stale", "README.md", NoteState::Ticket)
+            ]
+        );
+        assert_eq!(run.stage, Stage::Review);
+    }
+
+    #[test]
+    fn a_session_fix_that_changed_only_files_outside_its_scope_did_no_work() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        let c1 = |path: &str| super::super::change::Changed {
+            path: path.into(),
+            binary: false,
+            existed: true,
+        };
+        fake.changed = Some(vec![c1("CONTRIBUTING.md"), c1("other/b.src")]);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("did no work: everything it changed was outside"),
+            "{e}"
+        );
+        assert!(
+            e.contains("CONTRIBUTING.md (a doc no blocker points at)"),
+            "{e}"
+        );
+        // Still waiting for the fix, with what was put back locked.
+        assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
+        assert_eq!(run.locked.len(), 2);
+    }
+
+    #[test]
+    fn a_reviewer_reports_a_real_defect_outside_its_lens_without_hunting_for_one() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        go(&cfg, &["a.src"], &fake);
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(!alpha[0].contains("and nothing outside it"), "{}", alpha[0]);
+        assert!(
+            alpha[0].contains("don't go looking outside it")
+                && alpha[0].contains("say in its detail which lens it belongs to"),
+            "{}",
+            alpha[0]
+        );
     }
 
     /// What a fix changed: the file its blocker points at, a rebuilt
@@ -15652,21 +15839,5 @@ lenses:
         );
         // Asked again, with the escalation.
         assert_eq!(headers(&run, &cfg), ["Escalated", "Escalated", "Flagged"]);
-    }
-
-    #[test]
-    fn a_fix_by_the_session_that_ran_the_review_is_flagged_too() {
-        let cfg = plain("exception", 3, 1);
-        let mut fake = Fake::new(defect_in("alpha", 1));
-        fake.changed = rebuilt();
-        let s = setting(&cfg);
-        let c = change(&["a.src"]);
-        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
-        run.fixer = Fixer::Session;
-        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
-        assert_eq!(run.waiting, Some(Gate::Fix));
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
-        assert_eq!(run.flags.len(), 2);
-        assert!(run.flags.iter().all(|f| f.round == 1));
     }
 }

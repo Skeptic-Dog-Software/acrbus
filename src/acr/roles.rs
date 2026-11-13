@@ -507,8 +507,11 @@ pub fn reviewer_parts(lens: &Lens, call: &ReviewerCall) -> Vec<Part> {
     parts.push(part(
         Source::Config,
         format!(
-            "# Your lens\n\nYou are the reviewer for {id}. Attack the change in this lens, and \
-             nothing outside it. What wrong means here: {criteria}\n\n",
+            "# Your lens\n\nYou are the reviewer for {id}. Attack the change in this lens: \
+             spend your effort here, and don't go looking outside it. But a real defect you come \
+             on outside it, above all one where another dimension interacts with this one, is \
+             still a finding: report it, and say in its detail which lens it belongs to. What \
+             wrong means here: {criteria}\n\n",
             id = lens.id,
             criteria = lens.criteria,
         ),
@@ -1474,6 +1477,36 @@ pub struct Fixed {
 }
 
 pub fn read_fixed(text: &str) -> Result<Fixed> {
+    json_in(text)
+}
+
+/// What the session that ran a review notes when it says its fixes are in,
+/// as an agent fixer does in its answer: what it needs changed outside its
+/// files, and the docs its fix left stale. Both are put to a person.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNotes {
+    #[serde(default, deserialize_with = "lenient::list")]
+    pub needs: Vec<Need>,
+    #[serde(default, deserialize_with = "lenient::list")]
+    pub stale: Vec<Stale>,
+}
+
+impl SessionNotes {
+    /// As an agent fixer's answer carries them, for the same handling.
+    pub fn as_fixed(&self) -> Fixed {
+        Fixed {
+            done: String::new(),
+            needs: self.needs.clone(),
+            stale: self.stale.clone(),
+            declined: Vec::new(),
+            briefs: Default::default(),
+        }
+    }
+}
+
+/// A session's notes, from a file: JSON with `needs` and `stale`, as an
+/// agent fixer answers them.
+pub fn read_session_notes(text: &str) -> Result<SessionNotes> {
     json_in(text)
 }
 
