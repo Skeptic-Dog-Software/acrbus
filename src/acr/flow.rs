@@ -2035,6 +2035,49 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
     })
 }
 
+/// A call outside a round's fan-out, watched for an outage: one that
+/// couldn't reach its model waits `outage_wait_secs` and goes once more,
+/// and if that can't either, the review pauses, saved, as a round's
+/// outage does, rather than taking a gateway that's down for a step that
+/// failed. Anything else it returns as it came.
+fn watched<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    label: &str,
+    mut f: impl FnMut(&mut Run) -> Result<T>,
+) -> Result<T> {
+    match f(run) {
+        Err(e) if is_connection(&e) => {
+            caller.say(&format!(
+                "{label}: its model couldn't be reached, so it waits {}s and goes once more",
+                s.outage_wait_secs
+            ));
+            thread::sleep(std::time::Duration::from_secs(s.outage_wait_secs));
+            match f(run) {
+                Err(e) if is_connection(&e) => {
+                    let why = format!("{label}: {e:#}");
+                    run.outage = Some(Paused {
+                        round: run.round,
+                        why: why.clone(),
+                    });
+                    Err(anyhow::Error::new(Outage(why)))
+                }
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
+
+/// An outage out of a step's result, to go up: anything else stays in it.
+fn outage_out<T>(r: Result<T>) -> Result<Result<T>> {
+    match r {
+        Err(e) if is_outage(&e) => Err(e),
+        other => Ok(other),
+    }
+}
+
 /// One call to a role, on the record.
 #[allow(clippy::too_many_arguments)]
 fn ask(
@@ -2246,14 +2289,10 @@ fn choose_tier(
             s.description.as_deref(),
             &change.commits,
         );
-        let quick = ask_bare(
-            run,
-            s,
-            caller,
-            Role::Sizer,
-            "the Sizer, choosing a tier from the file list",
-            &light,
-        )
+        let what = "the Sizer, choosing a tier from the file list";
+        let quick = outage_out(watched(run, s, caller, what, |run| {
+            ask_bare(run, s, caller, Role::Sizer, what, &light)
+        }))?
         .and_then(|text| roles::read_sized(&text));
         let (answer, how) = match quick {
             // Only a sure answer: otherwise it reads the change, with its
@@ -2274,15 +2313,10 @@ fn choose_tier(
                 };
                 caller.say(&format!("the Sizer {why}, so it reads the change"));
                 let prompt = roles::sizer_prompt(&described, &change.files);
-                let full = ask(
-                    run,
-                    s,
-                    caller,
-                    Role::Sizer,
-                    "the Sizer, choosing a tier",
-                    &prompt,
-                    Some(artifact),
-                )
+                let what = "the Sizer, choosing a tier";
+                let full = outage_out(watched(run, s, caller, what, |run| {
+                    ask(run, s, caller, Role::Sizer, what, &prompt, Some(artifact))
+                }))?
                 .and_then(|text| roles::read_sized(&text));
                 (full, "having read the change")
             }
@@ -2352,15 +2386,18 @@ fn choose_lenses(
     let mut wanted: Option<Vec<String>> = None;
     if !described.is_empty() || !escalating.is_empty() {
         let prompt = roles::orchestrator_prompt(&described, escalating);
-        let answer = ask(
-            run,
-            s,
-            caller,
-            Role::Orchestrator,
-            "the Orchestrator, choosing lenses",
-            &prompt,
-            Some(artifact),
-        )
+        let what = "the Orchestrator, choosing lenses";
+        let answer = outage_out(watched(run, s, caller, what, |run| {
+            ask(
+                run,
+                s,
+                caller,
+                Role::Orchestrator,
+                what,
+                &prompt,
+                Some(artifact),
+            )
+        }))?
         .and_then(|text| selected_of(run, s, caller, &text, &described, escalating));
         match answer {
             Ok(selected) => {
@@ -6197,6 +6234,9 @@ fn fix(
             }
             run.stage = Stage::Review;
         }
+        // A gateway that's down pauses the review, saved, with what the
+        // groups before it did kept for its continuing.
+        Err(e) if is_outage(&e) => return Err(e),
         Err(e) => {
             let carries = run
                 .partial_fix
@@ -6611,7 +6651,8 @@ fn fix_once(
     // Set against the checkout as the fix found it, not as this session
     // did: a restart's own changes and its predecessor's both count.
     let before = baseline.or_else(|| caller.snapshot(&repo));
-    let legs = relayed(caller, &call, &used)?;
+    let what = call.label.clone();
+    let legs = watched(run, s, caller, &what, |_| relayed(caller, &call, &used))?;
     for mut u in legs.usage.iter().cloned() {
         u.round = run.round;
         u.route = route.map(str::to_string);
@@ -14444,6 +14485,42 @@ lenses:
         assert!(told.contains("restarted fresh"), "{told}");
         assert_eq!(*fixes.lock().unwrap(), 1);
         assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
+    }
+
+    #[test]
+    fn an_outage_at_the_sizer_pauses_the_review_saved_instead_of_failing_a_step() {
+        let cfg = plain("exception", 3, 1);
+        let down = std::sync::atomic::AtomicBool::new(true);
+        let fake = Fake::new(|role, _: &str| {
+            if role == Role::Sizer && down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::Error::new(CallFailed {
+                    failure: Failure::Unreachable,
+                    message: "fetch failed (ECONNREFUSED)".into(),
+                }));
+            }
+            Ok(match role {
+                Role::Sizer => r#"{"tier": "small", "sure": true, "reason": "docs"}"#.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["docs/a.md"]);
+        // The Sizer runs as the review starts: an outage there is said as
+        // one, not taken for a tier it couldn't choose.
+        let e = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap_err();
+        assert!(is_outage(&e), "{e:#}");
+        assert!(said(&fake).contains("its model couldn't be reached, so it waits"));
+        // Back up, it goes on.
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.tier, "small");
+        assert!(
+            !run.escalations
+                .iter()
+                .any(|e| e.reason.contains("unreachable"))
+        );
     }
 
     #[test]

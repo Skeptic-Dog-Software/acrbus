@@ -3262,7 +3262,18 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 );
             }
             caller.budget(paths, &cfg, &change, repo, &[]);
-            let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
+            let mut run = match flow::start(&id, repo, base, head, &s, &change, &caller) {
+                // Before the review exists there's nothing to save: said, and
+                // the same exit as a paused round's.
+                Err(e) if flow::is_outage(&e) => {
+                    eprintln!(
+                        "{APP_NAME}: gateway unreachable before the review could start, so \
+                         nothing was saved: run it again once it's back. ({e:#})"
+                    );
+                    return Ok(ExitCode::from(OUTAGE));
+                }
+                started => started?,
+            };
             run.starter = starter;
             if !weakened.is_empty() {
                 caller.note(&format!(
