@@ -173,6 +173,10 @@ pub trait Caller: Sync {
 
     /// The review's spend cap, from now on: None for none.
     fn set_cap(&self, _cap: Option<super::config::SpendCap>) {}
+
+    /// The review's config, to price what its calls spend as its report
+    /// does, for the spend cap.
+    fn set_prices(&self, _cfg: &Config) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1878,6 +1882,69 @@ impl Caller for Watched<'_> {
     fn set_cap(&self, cap: Option<super::config::SpendCap>) {
         self.inner.set_cap(cap)
     }
+    fn set_prices(&self, cfg: &Config) {
+        self.inner.set_prices(cfg)
+    }
+}
+
+/// A caller that starts no call past the review's spend cap: for calls
+/// made one after another inside a step, such as a fix's relay sessions.
+struct CapChecked<'a> {
+    inner: &'a dyn Caller,
+}
+
+impl Caller for CapChecked<'_> {
+    fn call(&self, call: &Call) -> Result<Answer> {
+        if let Some(why) = self.inner.over_cap() {
+            return Err(anyhow::Error::new(Outage(format!("{SPEND_CAP}: {why}"))));
+        }
+        self.inner.call(call)
+    }
+    fn note(&self, what: &str) {
+        self.inner.note(what)
+    }
+    fn say(&self, what: &str) {
+        self.inner.say(what)
+    }
+    fn share(&self, shared: Option<Shared>) -> bool {
+        self.inner.share(shared)
+    }
+    fn warmed(&self, label: &str) -> Option<bool> {
+        self.inner.warmed(label)
+    }
+    fn has_room(&self, binding: &Binding) -> bool {
+        self.inner.has_room(binding)
+    }
+    fn fingerprint(&self, repo: &Path) -> Option<String> {
+        self.inner.fingerprint(repo)
+    }
+    fn snapshot(&self, repo: &Path) -> Option<String> {
+        self.inner.snapshot(repo)
+    }
+    fn delta(&self, repo: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
+        self.inner.delta(repo, from, to)
+    }
+    fn changed(&self, repo: &Path, from: &str, to: &str) -> Option<Vec<super::change::Changed>> {
+        self.inner.changed(repo, from, to)
+    }
+    fn revert(&self, repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+        self.inner.revert(repo, from, path, existed)
+    }
+    fn rekey(&self, label: &str) {
+        self.inner.rekey(label)
+    }
+    fn fix_scope(&self, scope: Option<&FixScope>) {
+        self.inner.fix_scope(scope)
+    }
+    fn over_cap(&self) -> Option<String> {
+        self.inner.over_cap()
+    }
+    fn set_cap(&self, cap: Option<super::config::SpendCap>) {
+        self.inner.set_cap(cap)
+    }
+    fn set_prices(&self, cfg: &Config) {
+        self.inner.set_prices(cfg)
+    }
 }
 
 /// A reviewer's work: its sessions' usage, its findings, and its stage's
@@ -2308,13 +2375,10 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
 /// and if that can't either, the review pauses, saved, as a round's
 /// outage does, rather than taking a gateway that's down for a step that
 /// failed. Anything else it returns as it came.
-fn watched<T>(
-    run: &mut Run,
-    s: &Setting,
-    caller: &dyn Caller,
-    label: &str,
-    mut f: impl FnMut(&mut Run) -> Result<T>,
-) -> Result<T> {
+/// Past the review's spend cap, a call that would start here doesn't: the
+/// review pauses, as for an outage, keeping what its calls finished, for a
+/// person to raise the cap, go on without it, or stop.
+fn cap_pause(run: &mut Run, caller: &dyn Caller) -> Result<()> {
     if let Some(why) = caller.over_cap() {
         let why = format!("{SPEND_CAP}: {why}");
         run.outage = Some(Paused {
@@ -2323,7 +2387,31 @@ fn watched<T>(
         });
         return Err(anyhow::Error::new(Outage(why)));
     }
+    Ok(())
+}
+
+fn watched<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    label: &str,
+    mut f: impl FnMut(&mut Run) -> Result<T>,
+) -> Result<T> {
+    cap_pause(run, caller)?;
     match f(run) {
+        // A call within it found the cap reached, as a fix's later relay
+        // session does: paused, as above.
+        Err(e) if is_outage(&e) => {
+            if run.outage.is_none()
+                && let Some(o) = find::<Outage>(&e)
+            {
+                run.outage = Some(Paused {
+                    round: run.round,
+                    why: o.0.clone(),
+                });
+            }
+            Err(e)
+        }
         Err(e) if is_connection(&e) => {
             caller.say(&format!(
                 "{label}: its model couldn't be reached, so it waits {}s and goes once more",
@@ -4746,6 +4834,7 @@ fn gate_round(
     let dir = Copies::fresh(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
+    cap_pause(run, caller)?;
     let proposed = ask_in_form(
         run,
         s,
@@ -4807,6 +4896,7 @@ fn gate_round(
                 ..g.raw.clone()
             })
             .collect();
+        cap_pause(run, caller)?;
         let judged = roles::judge_prompt(lens, &[tagged], &s.not_findings).and_then(|prompt| {
             let prompt = prompt
                 + "\n\nKeep each finding's title as it's given, with its [G..] tag, and don't \
@@ -6210,6 +6300,17 @@ fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
             )
         })
         .collect();
+    // Past the spend cap it starts no call: nothing is grouped, which costs
+    // nothing now, and the review's next call pauses at the cap.
+    if let Some(why) = caller.over_cap() {
+        if let Some(r) = run.lenses.values_mut().find_map(|l| l.rounds.last_mut()) {
+            r.notes.push(format!(
+                "findings more than one lens made of one defect weren't grouped: {SPEND_CAP} is \
+                 reached ({why}), so no new call starts"
+            ));
+        }
+        return;
+    }
     let what = DEDUPE;
     let groups = ask(
         run,
@@ -7171,8 +7272,10 @@ fn fix_once(
         }
     };
     caller.fix_scope(Some(scope));
+    // Each of its sessions after the first checks the spend cap too.
+    let capped = CapChecked { inner: caller };
     let legs = watched(run, s, caller, &what, |_| {
-        relayed_with(caller, &call, &used, Some(&guard))
+        relayed_with(&capped, &call, &used, Some(&guard))
     });
     // Its last session, which handed nothing off.
     guard();
@@ -7714,6 +7817,15 @@ fn blast_radius(run: &mut Run, s: &Setting, caller: &dyn Caller) {
         caller.say("the blast-radius check has no Sizer binding, so every lens attacks");
         return;
     };
+    // Past the spend cap it starts no call: every lens attacks, which costs
+    // nothing now, and the round's own calls pause at the cap.
+    if let Some(why) = caller.over_cap() {
+        caller.say(&format!(
+            "the blast-radius check doesn't run, since {SPEND_CAP} is reached ({why}), so every \
+             lens attacks"
+        ));
+        return;
+    }
     let repo = run.reading().to_path_buf();
     let call = Call {
         role: Role::Sizer,
@@ -8044,6 +8156,7 @@ pub fn drive(
 ) -> Result<()> {
     run.status = Status::Running;
     run.waiting = None;
+    caller.set_prices(s.cfg);
     caller.set_cap(run.spend_cap);
     loop {
         let known = failures(run).len();
@@ -15367,6 +15480,112 @@ lenses:
             !run.escalations
                 .iter()
                 .any(|e| e.reason.contains("unreachable"))
+        );
+    }
+
+    #[test]
+    fn a_call_one_after_another_within_a_step_checks_the_spend_cap_and_pauses() {
+        let cfg = plain("exception", 1, 1);
+        let mut fake = Fake::new(|_, _: &str| Ok(NOTHING.into()));
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let before = fake.calls.lock().unwrap().len();
+        // Reached once one more call is in, as by a fix's first session.
+        fake.capped_after = Some(before + 1);
+        fake.set_cap(Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        }));
+        let binding = cfg.binding(Role::Orchestrator, None).unwrap();
+        let call = Call {
+            role: Role::Orchestrator,
+            binding_name: "large",
+            binding,
+            prompt: "fix it",
+            artifact: None,
+            writes: true,
+            no_tools: false,
+            relay_tokens: None,
+            repo: Path::new("."),
+            label: "a fix".into(),
+        };
+        let capped = CapChecked { inner: &fake };
+        let Err(e) = watched(&mut run, &s, &fake, "a fix", |_| {
+            capped.call(&call)?;
+            capped.call(&call)
+        }) else {
+            panic!("its second session started past the cap");
+        };
+        assert!(is_outage(&e), "{e:#}");
+        // Its second session never started, and the review is paused at
+        // the cap, for drive to put to a person.
+        assert_eq!(fake.calls.lock().unwrap().len(), before + 1);
+        assert!(
+            run.outage
+                .as_ref()
+                .is_some_and(|o| o.why.starts_with(SPEND_CAP)),
+            "{:?}",
+            run.outage
+        );
+    }
+
+    #[test]
+    fn the_test_gate_starts_no_call_past_the_spend_cap() {
+        // Where the gate's proposer comes, without a cap.
+        let (_, calls) = gated(Some("warn"));
+        let proposer = calls
+            .iter()
+            .position(|c| c.0 == Role::Reviewer && c.3.contains("proposing small breaks"))
+            .expect("the gate proposes mutants");
+        use super::super::change::tests::repo_with;
+        let mut cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "stages: [gate]\ntests: {command: 'true', gate: warn}",
+        );
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-gate-cap-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    r#"{"mutants": [{"file": "a.src", "find": "x = 1", "replace": "x = 2", "why": "x is one", "tests": []}]}"#
+                        .to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached once the proposer has answered: the gate's Judge never
+        // starts.
+        fake.capped_after = Some(proposer + 1);
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.about == Some(About::SpendCap)),
+            "{:?}",
+            run.escalations
+        );
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.0 == Role::Judge && c.3.contains("[G0]")),
+            "the gate's Judge started past the cap"
         );
     }
 

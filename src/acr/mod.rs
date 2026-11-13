@@ -1441,9 +1441,36 @@ fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<C
 
 /// Reaches models through bridges, as `acrbus call` does. Each call is a
 /// fresh session, limited to its binding's tools.
+/// A finished call's tokens, its dollars priced as the review's report
+/// prices them: by the config's price for its binding or model, or else
+/// what its agent said, and none for a subscription. So a spend cap trips
+/// on an agent that reports no cost, as Claude Code doesn't.
+fn priced(
+    cfg: Option<&Config>,
+    name: &str,
+    binding: &config::Binding,
+    u: &crate::proto::RunUsage,
+) -> crate::bridge::LiveTokens {
+    let mut t = crate::bridge::LiveTokens::of(u);
+    if binding.subscription {
+        t.usd = None;
+    } else if let Some(p) = cfg.and_then(|c| c.price(name, binding)) {
+        t.usd = Some(p.usd(
+            u.input_tokens,
+            u.cache_read_tokens,
+            u.cache_write_tokens,
+            u.output_tokens,
+        ));
+    }
+    t
+}
+
 struct BridgeCaller {
     /// The review's spend cap, set as it runs.
     cap: std::sync::Mutex<Option<config::SpendCap>>,
+    /// The review's config, to price each call as its report does, for the
+    /// spend cap and progress.
+    prices: std::sync::Mutex<Option<Config>>,
     socket: PathBuf,
     agent: String,
     store: Attachments,
@@ -1519,6 +1546,7 @@ impl BridgeCaller {
             rekeyed: Default::default(),
             fix_scope: Default::default(),
             cap: Default::default(),
+            prices: Default::default(),
         })
     }
 
@@ -1812,6 +1840,10 @@ impl Caller for BridgeCaller {
         *self.cap.lock().unwrap_or_else(|e| e.into_inner()) = cap;
     }
 
+    fn set_prices(&self, cfg: &Config) {
+        *self.prices.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+    }
+
     fn has_room(&self, binding: &config::Binding) -> bool {
         let bridge = binding.agent.split('@').next().unwrap_or_default();
         // One slot always left over for the review's own calls.
@@ -1829,11 +1861,16 @@ impl Caller for BridgeCaller {
             self.answered(call, a);
         }
         let failed = answer.as_ref().err().map(|e| format!("{e:#}"));
+        let prices = self
+            .prices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let used = answer
             .as_ref()
             .ok()
             .and_then(|a| a.usage.as_ref())
-            .map(crate::bridge::LiveTokens::of);
+            .map(|u| priced(prices.as_ref(), call.binding_name, call.binding, u));
         self.progress.end(token, failed.as_deref(), used);
         answer
     }
@@ -5092,6 +5129,48 @@ mod tests {
              defaults:\n  bindings: {sizer: fits, reviewer: fits, orchestrator: fits, judge: fits}\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn what_a_call_spent_is_priced_as_the_report_prices_it_for_the_spend_cap() {
+        let cfg = config::resolve(
+            &config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap(),
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n\
+                 costs: {prices: {example/medium-model: {input_per_mtok: 2, output_per_mtok: 10, \
+                 cached_input_per_mtok: 0.2}}}\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // An agent that reports no cost, as Claude Code doesn't.
+        let u = crate::proto::RunUsage {
+            input_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+            output_tokens: 100_000,
+            usd: None,
+            ..Default::default()
+        };
+        let medium = cfg.binding(Role::Reviewer, None).unwrap().clone();
+        let t = priced(Some(&cfg), "medium", &medium, &u);
+        // 1M fresh at $2, 1M cached at $0.20, 100k out at $10.
+        assert!((t.usd.unwrap() - 3.2).abs() < 1e-9, "{:?}", t.usd);
+        // With no price for it, what its agent said, or nothing.
+        let large = cfg.binding(Role::Judge, None).unwrap().clone();
+        let said = crate::proto::RunUsage {
+            usd: Some(0.5),
+            ..u.clone()
+        };
+        assert_eq!(priced(Some(&cfg), "large", &large, &said).usd, Some(0.5));
+        assert_eq!(priced(Some(&cfg), "large", &large, &u).usd, None);
+        // A subscription's calls cost no dollars.
+        let mut sub = medium.clone();
+        sub.subscription = true;
+        assert_eq!(priced(Some(&cfg), "medium", &sub, &u).usd, None);
+        // Before the review's config is known, what the agent said.
+        assert_eq!(priced(None, "medium", &medium, &said).usd, Some(0.5));
     }
 
     #[test]
