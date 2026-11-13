@@ -2,18 +2,22 @@
 
 acrbus runs adversarial convergence review (ACR) on code changes. Point it
 at a change, and fresh reviewers attack it one dimension at a time. A
-separate Judge rules on what they find, the blockers get fixed, and fresh
-reviewers attack the new version. It stops when a round finds nothing that
-blocks.
+separate Judge checks what they find against the code, the blockers get
+fixed, and fresh reviewers attack the new version. It stops when no lens it
+attacks has a blocker, or at its round cap, where you decide.
 
 acrbus doesn't review anything itself. Its reviewers and its Judge are
 models running headless in harnesses you already use, such as Claude Code,
 pi or omp. acrbus orchestrates them: each gets a clean session and one job,
-fixed rules decide what blocks, and the review keeps going until it
-converges.
+the Judge states facts about each finding and fixed rules turn them into
+rulings, and the review keeps attacking until no lens has a blocker or its
+round cap puts the rest to you.
 
-It runs on one machine. It has no server and opens no ports: its bus is a
-local socket, and the harnesses reach their models the way they always do.
+It runs on one machine. Its daemon serves a Unix socket on this machine,
+and opens no TCP port, except a loopback one briefly during
+`grayboard login`. Your code still leaves the machine: each harness sends
+what it reviews to its model's provider, and `--pr`, `--post-pr` and
+Grayboard reach GitHub and the team server.
 [tailbus](https://github.com/Skeptic-Dog-Software/tailbus), built on
 acrbus, carries the same bus between machines over Tailscale.
 
@@ -26,13 +30,16 @@ acrbus, carries the same bus between machines over Tailscale.
    change what you like, and accept it. acrbus won't review a repository
    until you have.
 2. **The builder briefs the reviewers.** The session that built the change
-   says what it's for, and where each lens should look. Without a brief,
-   reviewers go off on tangents. The brief directs; it doesn't judge.
-3. **The change is sized.** A tier, picked from what the change touches,
-   decides which lenses run and how many reviewers each gets. A docs fix
-   doesn't pay for a security review.
-4. **acrbus gathers evidence.** With its stages on, it runs the change's
-   tests itself before any reviewer starts: coverage of the changed lines,
+   says what it's for, and where each lens should look. The brief directs;
+   it doesn't judge, though where a reviewer is pointed shapes what it
+   finds.
+3. **The change is sized.** Each lens's triggers decide whether it runs on
+   the change, and a tier, picked from what the change touches, sets how
+   many reviewers each gets and can require lenses. A docs fix skips a
+   security lens whose triggers don't match docs, though by default it
+   still pays for the `elegance` and `probes` lenses.
+4. **acrbus gathers evidence.** With its `gate` stage on, which is off by
+   default, it runs the change's tests itself before any reviewer starts: coverage of the changed lines,
    mutants of the changed code, and the tests again in random order. Nobody
    has to take a model's word that the tests ran.
 5. **Reviewers attack.** Each lens gets its own reviewers, in fresh sessions
@@ -40,23 +47,30 @@ acrbus, carries the same bus between machines over Tailscale.
    itself is a claim to check, not a fact.
 6. **The Judge rules.** A separate Judge checks each finding against the
    code and states facts about it: is it real, was it there before, does the
-   change make it worse. Fixed rules turn those facts into a ruling.
+   change make it worse. Fixed rules turn those facts into a ruling;
+   whether a finding meets its lens's blocker definition, and otherwise its
+   severity, is still the Judge's call.
 7. **You decide.** At the scope, at each round's blockers and at the
    result, the review asks you short multiple-choice questions: in Claude
    Code, in a terminal, or on your phone through Grayboard.
 8. **Fix, and attack again.** The blockers you choose are fixed, by the
    review's Orchestrator or by the session that started the review, and
-   fresh reviewers attack the new version: the lenses that had blockers,
-   any that didn't finish, and any the fix now brings in. A lens that
-   passed before isn't attacked again unless you ask for another round. A
-   review to convergence, which `acrbus acr trial` runs, attacks every lens
-   after each fix and ends only when they all pass the same version.
-9. **It learns.** You say how the review did, finding by finding, and what
-   it missed. Recalibrating folds that into the repository's config.
+   fresh reviewers attack the new version: with `reattack: blocked`, the
+   lenses that had blockers, any that didn't finish, and any the fix now
+   brings in; with `reattack: all`, every lens. Each fix is held to the
+   files its blockers point at. A lens that passed before isn't attacked
+   again under `blocked` unless you ask for another round or report a
+   defect the reviewers missed. A review to convergence, which `acrbus acr
+   trial --arm converge` runs, attacks the lenses each fix touched, then
+   every lens that hasn't attacked the final version, so it ends only when
+   they all pass the same version.
+9. **It learns, when you recalibrate.** You say how the review did,
+   finding by finding, and what it missed. `acrbus acr calibrate` folds
+   that into a config kept outside the repository, for you to accept.
 
 [How it works](docs/how-it-works.md) covers each step in more depth,
-including how acrbus keeps calls cheap and what it does when an agent
-stalls.
+including how acrbus avoids paying twice for what calls share and what it
+does when an agent stalls.
 
 ## Install
 
@@ -112,7 +126,7 @@ the config, for reading a proposal or writing one yourself.
 | `acrbus acr validate`, `acrbus acr schema` | Checks a repository's config, or prints its schema. |
 | `acrbus acr plan` | Shows the tier, lenses, bindings and estimated cost, with no model calls. |
 | `acrbus acr configure` | Has the configurer review the whole repository and propose its config. |
-| `acrbus acr calibration --accept` | Accepts the proposed config, or your own. That calibrates the repository. |
+| `acrbus acr calibration --accept` | Accepts the proposed config, or your own. acrbus calls that calibrating: you've read and accepted it; nothing is measured. |
 | `acrbus acr run` | Reviews a change. |
 | `acrbus acr ask <run id>` | Shows what a review waiting for you asks, as question carousels or `--text`, or, while it runs, where each lens of its round stands. |
 | `acrbus acr resume <run id>` | Answers it (`--answers <json>`, or `--fold`, `--defer` and `--waive` by blocker), or says your fixes are in (`--fixed`). |
