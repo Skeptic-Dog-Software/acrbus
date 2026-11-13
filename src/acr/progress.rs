@@ -198,6 +198,12 @@ impl Progress {
         self.shared.say(&[what.to_string()]);
     }
 
+    /// What the review's finished calls have used so far, before this
+    /// process included.
+    pub fn spent(&self) -> Spent {
+        lock(&self.shared.state).spent
+    }
+
     /// The plan's estimate, and what the review used before this process,
     /// to say the run's total against it as it goes.
     pub fn budget(&self, budget: Budget, spent: Spent) {
@@ -552,7 +558,7 @@ fn spent(t: &LiveTokens) -> String {
     )
 }
 
-/// A count to a tenth of a thousand, `36.8k`: what tells a first turn that
+/// A count to a tenth of a thousand, `24.4k`: what tells a first turn that
 /// read the whole shared prefix from one that read part of it.
 fn tenths(n: u64) -> String {
     if n < 1_000 {
@@ -880,15 +886,15 @@ mod tests {
             r,
             None,
             Some(LiveTokens {
-                input: 55_000,
-                cache_read: 2_300_000,
+                input: 41_000,
+                cache_read: 1_700_000,
                 cache_write: 0,
-                output: 27_000,
-                usd: Some(0.09),
+                output: 22_000,
+                usd: Some(0.07),
                 first_turn: Some(crate::proto::TurnUsage {
-                    input_tokens: 205,
+                    input_tokens: 344,
                     output_tokens: 104,
-                    cache_read_tokens: 36_812,
+                    cache_read_tokens: 24_356,
                     cache_write_tokens: 0,
                 }),
                 turns: 0,
@@ -905,8 +911,8 @@ mod tests {
         );
         assert!(
             text.contains(
-                "correctness: reviewer 1: answered after 0s, 55k in, 27k out, 2.3M from cache, \
-                 $0.09, first turn 36.8k of 37.0k from cache"
+                "correctness: reviewer 1: answered after 0s, 41k in, 22k out, 1.7M from cache, \
+                 $0.07, first turn 24.4k of 24.7k from cache"
             ),
             "{text}"
         );

@@ -17,7 +17,7 @@ use crate::proto::RunUsage;
 
 use super::change::{self, Change};
 use super::config::{
-    Action, Binding, Config, GateMode, JudgeMode, Lens, ReviewerInput, Role, Severity,
+    Action, Binding, Config, GateMode, JudgeMode, Lens, Reattack, ReviewerInput, Role, Severity,
     Stage as Kind,
 };
 use super::plan::{self, Why, tokens_in};
@@ -159,6 +159,15 @@ pub trait Caller: Sync {
     /// reached: it goes with a new cache key, so it may land on another
     /// replica than the one that didn't answer.
     fn rekey(&self, _label: &str) {}
+
+    /// Why no new call may start, if the review's spend cap is reached by
+    /// what its calls have spent so far.
+    fn over_cap(&self) -> Option<String> {
+        None
+    }
+
+    /// The review's spend cap, from now on: None for none.
+    fn set_cap(&self, _cap: Option<super::config::SpendCap>) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +373,9 @@ pub enum About {
     MaxRounds,
     /// The Orchestrator couldn't fix what was folded in.
     Unfixed,
+    /// The review reached its spend cap: raise it, go on without it, or
+    /// stop.
+    SpendCap,
 }
 
 /// A defect a person says the reviewers missed. It's folded in like a
@@ -486,6 +498,11 @@ pub struct Usage {
     /// binding, "hard" on the Orchestrator's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// The tools its model asked for that its binding doesn't name, and how
+    /// often, whether or not they ran: one a gateway added to the request,
+    /// or one the model made up. Said as it answers, and in the report.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unnamed_tools: BTreeMap<String, u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -574,6 +591,29 @@ pub struct Run {
     /// What each steelman between rounds did, in order.
     #[serde(default)]
     pub steelmans: Vec<Steelman>,
+    /// The briefs the session that fixed gave for the round after its fix,
+    /// outside a review to convergence, where a steelman's carry them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_briefs: Option<FixBriefs>,
+    /// The review's spend cap, as its config or flag set it, or a person
+    /// raised or lifted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<super::config::SpendCap>,
+    /// Which lenses attack again after a fix, as the config, a flag or a
+    /// person at the scope gate chose. None: nobody chose, so `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// The builder's brief the run started with, kept so a resumed run
+    /// briefs its reviewers as one that never stopped does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_brief: Option<stages::BuilderBrief>,
+    /// What the run's flags made weaker than the repository's config, each
+    /// said at its start, at every gate and in the report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weakened: Vec<String>,
+    /// Where each gate's answers came from, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered_by: Vec<AnswerSource>,
     /// Defects a person reported the reviewers missed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<Reported>,
@@ -861,6 +901,24 @@ pub(super) fn first_pass_escalates(
 }
 
 impl Run {
+    /// Which lenses attack again after a fix: as chosen, or `blocked`.
+    pub fn reattacks(&self) -> Reattack {
+        self.reattack.unwrap_or(Reattack::Blocked)
+    }
+
+    /// What the report says of it: the choice, and whose it was.
+    pub fn reattack_line(&self) -> String {
+        match self.reattack {
+            Some(Reattack::All) => "re-attack: every lens after each fix".into(),
+            Some(Reattack::Blocked) => {
+                "re-attack: only the lenses with blockers after each fix".into()
+            }
+            None => "re-attack: only the lenses with blockers after each fix, the default: \
+                     nobody chose"
+                .into(),
+        }
+    }
+
     /// Whether a fix has gone in. From then on the review is of the
     /// checkout's working tree, where the fixes are.
     pub fn fixed(&self) -> bool {
@@ -897,6 +955,36 @@ pub struct Steelman {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub briefs: BTreeMap<String, String>,
     pub declined: Vec<roles::Declined>,
+}
+
+/// Where a gate's answers came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerSource {
+    pub round: u32,
+    pub gate: String,
+    /// A terminal's prompt, a Grayboard reply and its sender, or
+    /// `acr resume` and its flags.
+    pub by: String,
+}
+
+impl Run {
+    /// Records that the gate it waits at was answered, and by what.
+    pub fn answered(&mut self, by: impl Into<String>) {
+        let gate = self.waiting.map_or("none", Gate::as_str).to_string();
+        self.answered_by.push(AnswerSource {
+            round: self.round,
+            gate,
+            by: by.into(),
+        });
+    }
+}
+
+/// A fixing session's briefs for the round after its fix, by lens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixBriefs {
+    /// The round they brief.
+    pub round: u32,
+    pub briefs: BTreeMap<String, String>,
 }
 
 /// What a steelman's fixes changed: the round whose blockers they fixed,
@@ -1052,8 +1140,22 @@ impl Answered {
             tool_calls: counted.tool_calls,
             restart: None,
             route: None,
+            unnamed_tools: BTreeMap::new(),
         }
     }
+}
+
+/// The tools in `used` that `binding` doesn't name, with how often each was
+/// asked for.
+pub fn unnamed_tools(binding: &Binding, used: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    binding
+        .unnamed(used.keys())
+        .into_iter()
+        .map(|name| {
+            let n = used.get(&name).copied().unwrap_or_default();
+            (name, n)
+        })
+        .collect()
 }
 
 fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usage {
@@ -1095,6 +1197,11 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         tool_calls: 0,
         restart: None,
         route: None,
+        unnamed_tools: answer
+            .usage
+            .as_ref()
+            .map(|u| unnamed_tools(call.binding, &u.tools))
+            .unwrap_or_default(),
     };
     match &answer.usage {
         Some(counted) => {
@@ -1314,6 +1421,9 @@ fn restartable(e: &anyhow::Error) -> Option<bool> {
     unusable.then_some(false)
 }
 
+/// What a pause for the spend cap says first, to tell it from an outage.
+pub const SPEND_CAP: &str = "the review's spend cap";
+
 /// The label of a unit's session restarted fresh.
 fn restarted_label(label: &str) -> String {
     format!("{label}, restarted")
@@ -1457,6 +1567,15 @@ impl OutageWatch {
         self.lock().declared.clone()
     }
 
+    /// Stops the round's new calls, for `why`, if nothing has yet.
+    fn declare(&self, why: String) {
+        let mut st = self.lock();
+        if st.declared.is_none() {
+            st.declared = Some(why);
+        }
+        self.changed.notify_all();
+    }
+
     fn started(&self) {
         let mut st = self.lock();
         st.in_flight += 1;
@@ -1524,6 +1643,11 @@ struct Watched<'a> {
 
 impl Caller for Watched<'_> {
     fn call(&self, call: &Call) -> Result<Answer> {
+        // Past the spend cap, no new call starts: the round pauses as for
+        // an outage, keeping what its calls finished.
+        if let Some(why) = self.inner.over_cap() {
+            self.watch.declare(format!("{SPEND_CAP}: {why}"));
+        }
         if let Some(why) = self.watch.declared() {
             return Err(anyhow::Error::new(Outage(why)));
         }
@@ -1567,6 +1691,12 @@ impl Caller for Watched<'_> {
     }
     fn rekey(&self, label: &str) {
         self.inner.rekey(label)
+    }
+    fn over_cap(&self) -> Option<String> {
+        self.inner.over_cap()
+    }
+    fn set_cap(&self, cap: Option<super::config::SpendCap>) {
+        self.inner.set_cap(cap)
     }
 }
 
@@ -1944,6 +2074,57 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
     })
 }
 
+/// A call outside a round's fan-out, watched for an outage: one that
+/// couldn't reach its model waits `outage_wait_secs` and goes once more,
+/// and if that can't either, the review pauses, saved, as a round's
+/// outage does, rather than taking a gateway that's down for a step that
+/// failed. Anything else it returns as it came.
+fn watched<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    label: &str,
+    mut f: impl FnMut(&mut Run) -> Result<T>,
+) -> Result<T> {
+    if let Some(why) = caller.over_cap() {
+        let why = format!("{SPEND_CAP}: {why}");
+        run.outage = Some(Paused {
+            round: run.round,
+            why: why.clone(),
+        });
+        return Err(anyhow::Error::new(Outage(why)));
+    }
+    match f(run) {
+        Err(e) if is_connection(&e) => {
+            caller.say(&format!(
+                "{label}: its model couldn't be reached, so it waits {}s and goes once more",
+                s.outage_wait_secs
+            ));
+            thread::sleep(std::time::Duration::from_secs(s.outage_wait_secs));
+            match f(run) {
+                Err(e) if is_connection(&e) => {
+                    let why = format!("{label}: {e:#}");
+                    run.outage = Some(Paused {
+                        round: run.round,
+                        why: why.clone(),
+                    });
+                    Err(anyhow::Error::new(Outage(why)))
+                }
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
+
+/// An outage out of a step's result, to go up: anything else stays in it.
+fn outage_out<T>(r: Result<T>) -> Result<Result<T>> {
+    match r {
+        Err(e) if is_outage(&e) => Err(e),
+        other => Ok(other),
+    }
+}
+
 /// One call to a role, on the record.
 #[allow(clippy::too_many_arguments)]
 fn ask(
@@ -1972,6 +2153,66 @@ fn ask(
     let answer = caller.call(&call)?;
     record(run, s.cfg, &call, input_bytes(prompt, artifact), &answer);
     Ok(answer.text)
+}
+
+/// The form an answer is asked in: the reminder its prompt ends with, its
+/// shape for a repair, and what reads it.
+type InForm<'a, T> = (&'a str, roles::Shape, fn(&str) -> Result<T>);
+
+/// [`ask`], for an answer in a JSON form: the form said again at the end
+/// of its prompt; an answer that can't be read put in form by the Sizer;
+/// and one that still can't be, asked again once, fresh, before it fails.
+#[allow(clippy::too_many_arguments)]
+fn ask_in_form<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    role: Role,
+    what: &str,
+    prompt: &str,
+    artifact: Option<&Path>,
+    (reminder, shape, read): InForm<'_, T>,
+) -> Result<T> {
+    let prompt = format!("{prompt}{reminder}");
+    let once = |run: &mut Run, label: &str| -> Result<T> {
+        let text = ask(run, s, caller, role, label, &prompt, artifact)?;
+        let repo = run.reading().to_path_buf();
+        let asked = Call {
+            role,
+            binding_name: s.cfg.binding_name(role, None)?,
+            binding: s.cfg.binding(role, None)?,
+            prompt: &prompt,
+            artifact,
+            writes: false,
+            no_tools: false,
+            relay_tokens: None,
+            repo: &repo,
+            label: label.to_string(),
+        };
+        let repairs = std::sync::Mutex::new(Vec::new());
+        let got = repaired(caller, s.cfg, &text, &asked, &repairs, shape, read);
+        for mut u in repairs.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            u.round = run.round;
+            run.usage.push(u);
+        }
+        got
+    };
+    match once(run, what) {
+        Err(first) if first.downcast_ref::<Unreadable>().is_some() => {
+            let why = "its answer couldn't be read, even put in form";
+            caller.say(&format!(
+                "restarted fresh: {what}, attempt 2, because {why}"
+            ));
+            let start = run.usage.len();
+            let again = once(run, &format!("{what}, again"));
+            for u in &mut run.usage[start..] {
+                u.restart = Some(why.to_string());
+            }
+            again
+                .map_err(|then| anyhow!("came back unusable twice: first {first:#}; then {then:#}"))
+        }
+        other => other,
+    }
 }
 
 /// [`ask`], of a call with no tools and no attachment: it answers from its
@@ -2095,14 +2336,10 @@ fn choose_tier(
             s.description.as_deref(),
             &change.commits,
         );
-        let quick = ask_bare(
-            run,
-            s,
-            caller,
-            Role::Sizer,
-            "the Sizer, choosing a tier from the file list",
-            &light,
-        )
+        let what = "the Sizer, choosing a tier from the file list";
+        let quick = outage_out(watched(run, s, caller, what, |run| {
+            ask_bare(run, s, caller, Role::Sizer, what, &light)
+        }))?
         .and_then(|text| roles::read_sized(&text));
         let (answer, how) = match quick {
             // Only a sure answer: otherwise it reads the change, with its
@@ -2123,15 +2360,10 @@ fn choose_tier(
                 };
                 caller.say(&format!("the Sizer {why}, so it reads the change"));
                 let prompt = roles::sizer_prompt(&described, &change.files);
-                let full = ask(
-                    run,
-                    s,
-                    caller,
-                    Role::Sizer,
-                    "the Sizer, choosing a tier",
-                    &prompt,
-                    Some(artifact),
-                )
+                let what = "the Sizer, choosing a tier";
+                let full = outage_out(watched(run, s, caller, what, |run| {
+                    ask(run, s, caller, Role::Sizer, what, &prompt, Some(artifact))
+                }))?
                 .and_then(|text| roles::read_sized(&text));
                 (full, "having read the change")
             }
@@ -2201,15 +2433,18 @@ fn choose_lenses(
     let mut wanted: Option<Vec<String>> = None;
     if !described.is_empty() || !escalating.is_empty() {
         let prompt = roles::orchestrator_prompt(&described, escalating);
-        let answer = ask(
-            run,
-            s,
-            caller,
-            Role::Orchestrator,
-            "the Orchestrator, choosing lenses",
-            &prompt,
-            Some(artifact),
-        )
+        let what = "the Orchestrator, choosing lenses";
+        let answer = outage_out(watched(run, s, caller, what, |run| {
+            ask(
+                run,
+                s,
+                caller,
+                Role::Orchestrator,
+                what,
+                &prompt,
+                Some(artifact),
+            )
+        }))?
         .and_then(|text| selected_of(run, s, caller, &text, &described, escalating));
         match answer {
             Ok(selected) => {
@@ -2291,6 +2526,12 @@ pub fn start(
         description: s.description.clone(),
         converge: s.converge,
         steelmans: Vec::new(),
+        fix_briefs: None,
+        reattack: s.cfg.reattack,
+        builder_brief: s.builder_brief.clone(),
+        spend_cap: s.cfg.spend_cap,
+        weakened: Vec::new(),
+        answered_by: Vec::new(),
         fix: None,
         sweep: false,
         reported: Vec::new(),
@@ -2536,6 +2777,12 @@ fn attack(
             .last()
             .filter(|m| m.round + 1 == run.round)
             .map(|m| m.briefs.clone())
+            .or_else(|| {
+                run.fix_briefs
+                    .as_ref()
+                    .filter(|b| b.round == run.round)
+                    .map(|b| b.briefs.clone())
+            })
             .unwrap_or_default()
     };
     let unbriefed: Vec<String> = open
@@ -2735,7 +2982,7 @@ fn attack(
                             &scope,
                             cfg.tests.mutants.unwrap_or(12),
                             &guide,
-                        ),
+                        ) + roles::MUTANTS_REMINDER,
                         repo,
                         runs: stages::mutation_dir(dir, &lens.id, n),
                         command: command.clone(),
@@ -2836,8 +3083,17 @@ fn attack(
     // already held, then its last answer, each once.
     let gathered = |legs: &Legs, asked: &Call| -> Result<Vec<Raw>> {
         let mut lists = Vec::new();
+        // A handoff's findings, put in form as an answer's are.
         for text in &legs.handed {
-            lists.push(roles::read_findings(text).map_err(unreadable)?);
+            lists.push(repaired(
+                caller,
+                cfg,
+                text,
+                asked,
+                repairs,
+                roles::Shape::Findings,
+                roles::read_findings,
+            )?);
         }
         let last = Call {
             role: asked.role,
@@ -2880,22 +3136,30 @@ fn attack(
             label: call.label.clone(),
         };
         let legs = relayed(caller, &scout, used)?;
-        let listed = read_something(caller, &call.label, &legs).and_then(|()| {
-            let mut lists = Vec::new();
-            for text in &legs.handed {
-                lists.push(roles::read_suspects(text).map_err(unreadable)?);
-            }
-            lists.push(
-                roles::read_suspects(&legs.last)
-                    .map_err(unreadable)
-                    .with_context(|| {
-                        format!("{}: the scout's list couldn't be read", call.label)
-                    })?,
-            );
-            Ok(merged(lists, |s: &roles::Suspect| {
-                (s.title.clone(), s.file.clone(), s.line)
-            }))
-        });
+        let listed =
+            read_something(caller, &call.label, &legs).and_then(|()| {
+                let mut lists = Vec::new();
+                let in_form = |text: &str| {
+                    repaired(
+                        caller,
+                        cfg,
+                        text,
+                        &scout,
+                        repairs,
+                        roles::Shape::Suspects,
+                        roles::read_suspects,
+                    )
+                };
+                for text in &legs.handed {
+                    lists.push(in_form(text)?);
+                }
+                lists.push(in_form(&legs.last).with_context(|| {
+                    format!("{}: the scout's list couldn't be read", call.label)
+                })?);
+                Ok(merged(lists, |s: &roles::Suspect| {
+                    (s.title.clone(), s.file.clone(), s.line)
+                }))
+            });
         let mut usage: Vec<Usage> = legs
             .usage
             .into_iter()
@@ -3066,20 +3330,27 @@ fn attack(
         }
         let legs = relayed(caller, &call, &used)?;
         let got = match brief {
-            Brief::Mutate { runs, command, .. } => stages::read_mutants(&legs.last)
-                .map_err(unreadable)
-                .and_then(|mutants| {
-                    let runner = stages::Runner {
-                        repo: checkout,
-                        dir: runs,
-                        command,
-                        parallel,
-                        limit,
-                    };
-                    let (found, summary) = stages::run_mutants(&runner, &mutants)
-                        .map_err(|e| idle_said(caller, label, e))?;
-                    Ok((found, Some(summary)))
-                }),
+            Brief::Mutate { runs, command, .. } => repaired(
+                caller,
+                cfg,
+                &legs.last,
+                &call,
+                repairs,
+                roles::Shape::Mutants,
+                stages::read_mutants,
+            )
+            .and_then(|mutants| {
+                let runner = stages::Runner {
+                    repo: checkout,
+                    dir: runs,
+                    command,
+                    parallel,
+                    limit,
+                };
+                let (found, summary) = stages::run_mutants(&runner, &mutants)
+                    .map_err(|e| idle_said(caller, label, e))?;
+                Ok((found, Some(summary)))
+            }),
             Brief::Probe { kept, before, .. } => {
                 // Kept before its answer is read, so a prober
                 // that answers badly still leaves its probes.
@@ -3319,7 +3590,16 @@ fn attack(
                 Ok((mut spent_now, mut ratings)) => {
                     restarter.mark(&mut spent_now);
                     usages.append(&mut spent_now);
-                    if !ratings
+                    // A finding it left unrated isn't settled: the Judge
+                    // rules on every one, rather than one being lost.
+                    let unrated = findings.saturating_sub(ratings.len());
+                    if unrated > 0 {
+                        caller.say(&format!(
+                            "{label}: the first pass rated {} of the {findings} finding(s) it \
+                             was given, so the Judge rules on them all",
+                            ratings.len()
+                        ));
+                    } else if !ratings
                         .iter()
                         .any(|r| first_pass_escalates(cfg, lens, r, changed_now))
                     {
@@ -3330,11 +3610,12 @@ fn attack(
                             "{label}: the first pass ({name}) settled it, so no Judge call"
                         ));
                         return Ok((usages, ratings));
+                    } else {
+                        caller.say(&format!(
+                            "{label}: the first pass sends it on to the Judge, which rules on \
+                             it fresh"
+                        ));
                     }
-                    caller.say(&format!(
-                        "{label}: the first pass sends it on to the Judge, which rules on it \
-                         fresh"
-                    ));
                 }
                 // An outage leaves the lens's ruling for the review's
                 // continuing.
@@ -4233,7 +4514,7 @@ fn gate_round(
     let dir = Copies::fresh(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
-    let proposed = ask(
+    let proposed = ask_in_form(
         run,
         s,
         caller,
@@ -4241,8 +4522,12 @@ fn gate_round(
         &format!("{}: proposing mutants", lens.id),
         &prompt,
         Some(&artifacts.diff),
-    )
-    .and_then(|text| stages::read_mutants(&text));
+        (
+            roles::MUTANTS_REMINDER,
+            roles::Shape::Mutants,
+            stages::read_mutants,
+        ),
+    );
     let mutants = match proposed {
         Ok(m) => m,
         Err(e) => {
@@ -4294,7 +4579,7 @@ fn gate_round(
             let prompt = prompt
                 + "\n\nKeep each finding's title as it's given, with its [G..] tag, and don't \
                    merge them.";
-            let text = ask(
+            ask_in_form(
                 run,
                 s,
                 caller,
@@ -4302,8 +4587,12 @@ fn gate_round(
                 &format!("{}: the Judge", lens.id),
                 &prompt,
                 Some(artifacts.for_lens(lens)),
-            )?;
-            roles::read_ratings(&text)
+                (
+                    roles::RATINGS_REMINDER,
+                    roles::Shape::Ratings,
+                    roles::read_ratings,
+                ),
+            )
         });
         match judged {
             Ok(ratings) => {
@@ -5246,6 +5535,10 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     if let Some(round) = &gate_done {
         gate_text.push_str(&gate_report(round));
     }
+    // The gate runs before this round's facts exist, since they carry its
+    // results: its calls get none, rather than the last round's facts and
+    // cache key, which describe the change before its fix.
+    caller.share(None);
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
         gate_done.is_none()
             && cfg.stages.contains(&Kind::Gate)
@@ -5982,10 +6275,16 @@ fn fix(
             } else if saving {
                 note_fix(run, s, caller, before_fix.as_deref());
             }
+            reattack(run, caller);
             run.round += 1;
-            blast_radius(run, s, caller);
+            if run.reattacks() == Reattack::Blocked {
+                blast_radius(run, s, caller);
+            }
             run.stage = Stage::Review;
         }
+        // A gateway that's down pauses the review, saved, with what the
+        // groups before it did kept for its continuing.
+        Err(e) if is_outage(&e) => return Err(e),
         Err(e) => {
             let carries = run
                 .partial_fix
@@ -6105,7 +6404,7 @@ fn fix_route(run: &Run, fixer: &super::config::FixerConfig, group: &FixGroup) ->
     let mut files = BTreeSet::new();
     let mut worst: Option<Severity> = None;
     for (lens, f) in &group.findings {
-        if f.severity < fixer.max_severity {
+        if f.severity < fixer.max_severity || f.severity == Severity::Critical {
             hard.push(format!("a {:?} blocker", f.severity));
         }
         worst = Some(worst.map_or(f.severity, |w| w.min(f.severity)));
@@ -6310,6 +6609,10 @@ fn fix_call(
         .fixer
         .as_ref()
         .map(|_| if fixer.is_some() { "easy" } else { "hard" });
+    // The checkout as the fix found it: what both sessions' work is set
+    // against, so a restart that finds the first's edits in place isn't
+    // taken for one that did nothing.
+    let baseline = caller.snapshot(&run.repo);
     let first = fix_once(
         run,
         s,
@@ -6320,6 +6623,7 @@ fn fix_call(
         blockers,
         fixer.unwrap_or(orchestrator),
         route,
+        baseline.clone(),
     );
     let fixed = restarter.once(&label, first, |again| {
         if fixer.is_some() {
@@ -6328,16 +6632,35 @@ fn fix_call(
                 orchestrator.0
             ));
         }
+        // What the first session left in the working tree, said, so the
+        // restart builds on it rather than finding nothing to do.
+        let left = baseline.as_deref().and_then(|from| {
+            let now = caller.snapshot(&run.repo)?;
+            (now != from)
+                .then(|| caller.delta(&run.repo, from, &now))
+                .flatten()
+        });
+        let restart_prompt = match &left {
+            Some((files, diff)) => format!(
+                "{prompt}\n\n# Already in the working tree\n\nA session before you began \
+                 this fix and made these edits, to {}, before its answer was lost. Check \
+                 them, keep what's right, and finish the fix:\n\n```diff\n{}\n```\n",
+                files.join(", "),
+                diff.trim_end()
+            ),
+            None => prompt.to_string(),
+        };
         fix_once(
             run,
             s,
             caller,
-            prompt,
+            &restart_prompt,
             again.to_string(),
             part,
             blockers,
             orchestrator,
             route.map(|_| "hard"),
+            baseline,
         )
     });
     restarter.mark(&mut run.usage[start..]);
@@ -6356,6 +6679,7 @@ fn fix_once(
     blockers: &[String],
     on: (&str, &Binding),
     route: Option<&str>,
+    baseline: Option<String>,
 ) -> Result<roles::Fixed> {
     let cfg = s.cfg;
     let repo = run.repo.clone();
@@ -6372,8 +6696,11 @@ fn fix_once(
         label,
     };
     let used = |c: &Call, a: &Answer| usage(cfg, c, c.prompt.len(), a);
-    let before = caller.snapshot(&repo);
-    let legs = relayed(caller, &call, &used)?;
+    // Set against the checkout as the fix found it, not as this session
+    // did: a restart's own changes and its predecessor's both count.
+    let before = baseline.or_else(|| caller.snapshot(&repo));
+    let what = call.label.clone();
+    let legs = watched(run, s, caller, &what, |_| relayed(caller, &call, &used))?;
     for mut u in legs.usage.iter().cloned() {
         u.round = run.round;
         u.route = route.map(str::to_string);
@@ -6613,6 +6940,28 @@ fn fix_list(findings: &[(String, Finding)], reported: &[Reported]) -> String {
 
 /// Every lens attacks again: what a person asks for, or what a defect
 /// nobody's lens found needs, since any lens could own it.
+/// After a fix, with `reattack: all`, every lens attacks the new version,
+/// not only those that had blockers: a fix for one lens can break another.
+/// Said, so a round's size isn't a surprise.
+fn reattack(run: &mut Run, caller: &dyn Caller) {
+    if run.reattacks() != Reattack::All {
+        return;
+    }
+    let confirmed = run
+        .lenses
+        .values()
+        .filter(|l| l.outcome == Outcome::Confirmed)
+        .count();
+    reopen_all(run);
+    if confirmed > 0 {
+        caller.say(&format!(
+            "round {}'s fix: every lens attacks the new version, as reattack: all asks, {} \
+             that had passed included",
+            run.round, confirmed
+        ));
+    }
+}
+
 pub(super) fn reopen_all(run: &mut Run) {
     for lens in run.lenses.values_mut() {
         if lens.outcome == Outcome::Confirmed {
@@ -6877,6 +7226,19 @@ pub fn fixed_by_session(
                 .unwrap_or_default()
         );
     }
+    // A session that says it fixed, with the working tree as it was when
+    // the fixes were asked for, did no work: refused, never taken for a fix.
+    if let Some(before) = run.fixing.as_ref().and_then(|f| f.from.as_deref())
+        && caller.snapshot(&run.repo).as_deref() == Some(before)
+    {
+        let line = "the session that ran the review: did no work: it said the fixes are in, but \
+                    the working tree is as it was when they were asked for";
+        caller.say(line);
+        bail!(
+            "{line}. Fold them into the working tree, then resume with --fixed again, or end \
+             the review with --stop"
+        );
+    }
     let folded = to_fix(run);
     let done = "fixed by the session that ran the review".to_string();
     for (id, _) in &folded {
@@ -6918,9 +7280,18 @@ pub fn fixed_by_session(
         if reported {
             reopen_all(run);
         }
+        // Its briefs go to the next round's reviewers, as a steelman's do
+        // in a review to convergence.
+        run.fix_briefs = (!briefs.is_empty()).then(|| FixBriefs {
+            round: run.round + 1,
+            briefs,
+        });
     }
+    reattack(run, caller);
     run.round += 1;
-    blast_radius(run, s, caller);
+    if run.reattacks() == Reattack::Blocked {
+        blast_radius(run, s, caller);
+    }
     run.stage = Stage::Review;
     run.status = Status::Running;
     run.waiting = None;
@@ -6947,9 +7318,32 @@ pub fn drive(
 ) -> Result<()> {
     run.status = Status::Running;
     run.waiting = None;
+    caller.set_cap(run.spend_cap);
     loop {
         let known = failures(run).len();
-        let stepped = step(run, s, caller, reload)?;
+        let capped = |run: &Run| {
+            run.outage
+                .as_ref()
+                .is_some_and(|o| o.why.starts_with(SPEND_CAP))
+        };
+        let stepped = match step(run, s, caller, reload) {
+            // The spend cap, reached: its calls at work finished, and a
+            // person decides whether it goes on.
+            Err(e) if is_outage(&e) && capped(run) => {
+                let why = run
+                    .outage
+                    .as_ref()
+                    .map(|o| o.why.clone())
+                    .unwrap_or_default();
+                caller.say(&format!(
+                    "{why}: no new call starts; raise the cap, go on without it, or stop"
+                ));
+                escalate_about(run, why, Some(About::SpendCap));
+                pause(run, Gate::Escalation);
+                return Ok(());
+            }
+            stepped => stepped?,
+        };
         if s.stop_on_failure {
             let now = failures(run);
             if now.len() > known {
@@ -7347,6 +7741,13 @@ lenses:
         still: bool,
         /// The labels of calls restarted with a new cache key.
         rekeyed: Mutex<Vec<String>>,
+        /// The checkout reads "base" until a fixer's first call, then
+        /// "edited": a fix's edits, left whatever its answer.
+        edits_once: bool,
+        edited: std::sync::atomic::AtomicBool,
+        /// Past this many calls, the spend cap is reached, while one is set.
+        capped_after: Option<usize>,
+        cap: Mutex<Option<super::super::config::SpendCap>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -7373,6 +7774,10 @@ lenses:
                 stuck: false,
                 still: false,
                 rekeyed: Mutex::new(Vec::new()),
+                edits_once: false,
+                edited: Default::default(),
+                capped_after: None,
+                cap: Mutex::new(None),
             }
         }
 
@@ -7384,6 +7789,9 @@ lenses:
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Caller for Fake<F> {
         fn call(&self, call: &Call) -> Result<Answer> {
+            if self.edits_once && call.writes {
+                self.edited.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.calls.lock().unwrap().push((
                 call.role,
                 call.binding_name.to_string(),
@@ -7452,9 +7860,23 @@ lenses:
             self.rekeyed.lock().unwrap().push(label.to_string());
         }
 
+        fn over_cap(&self) -> Option<String> {
+            let n = self.capped_after?;
+            self.cap.lock().unwrap().as_ref()?;
+            (self.calls.lock().unwrap().len() >= n).then(|| format!("{n} calls in"))
+        }
+
+        fn set_cap(&self, cap: Option<super::super::config::SpendCap>) {
+            *self.cap.lock().unwrap() = cap;
+        }
+
         fn snapshot(&self, _repo: &Path) -> Option<String> {
             if self.still {
                 return Some("the same tree".into());
+            }
+            if self.edits_once {
+                let edited = self.edited.load(std::sync::atomic::Ordering::SeqCst);
+                return Some(if edited { "edited" } else { "base" }.into());
             }
             (self.fixes.is_some() || self.changed.is_some()).then(new_id)
         }
@@ -8130,6 +8552,67 @@ lenses:
     }
 
     #[test]
+    fn the_gates_mutant_proposer_and_judge_are_reminded_put_in_form_and_restarted() {
+        use super::super::change::tests::repo_with;
+        let cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "stages: [gate]\ntests: {command: 'true', gate: warn}",
+        );
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-gate-form-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let judged = Mutex::new(0);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                // The proposer answers in words, which the Sizer puts in form.
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    assert!(prompt.ends_with(roles::MUTANTS_REMINDER));
+                    "I'd change x = 1 to x = 2 in a.src.".to_string()
+                }
+                Role::Sizer if prompt.contains("proposed these small breaks") => {
+                    r#"{"mutants": [{"file": "a.src", "find": "x = 1", "replace": "x = 2", "why": "x is one", "tests": []}]}"#
+                        .to_string()
+                }
+                // The gate's Judge: unreadable even in form the first time,
+                // then fresh, it answers.
+                Role::Judge if prompt.contains("[G0]") => {
+                    let mut n = judged.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        "no idea".to_string()
+                    } else {
+                        r#"{"findings": [{"title": "[G0] a mutant every test passes", "file": "a.src", "severity": "High"}]}"#
+                            .to_string()
+                    }
+                }
+                Role::Sizer => "unreadable".to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let gate = &run.lenses["tests"].rounds[0];
+        assert!(gate.failures.is_empty(), "{:?}", gate.failures);
+        assert_eq!(gate.findings.len(), 1);
+        assert_eq!(*judged.lock().unwrap(), 2, "restarted once");
+        let told = said(&fake);
+        assert!(
+            told.contains("restarted fresh: tests: the Judge, attempt 2"),
+            "{told}"
+        );
+        assert!(run.usage.iter().any(|u| u.repaired.is_some()));
+        assert!(run.usage.iter().any(|u| u.restart.is_some()));
+    }
+
+    #[test]
     fn a_test_gap_that_blocks_stops_the_round_before_the_reviewers() {
         let (run, calls) = gated(Some("stop"));
         let gate = &run.lenses["tests"].rounds[0];
@@ -8201,6 +8684,39 @@ lenses:
             run.usage.iter().filter(|u| u.role == Role::Judge).count(),
             2
         );
+    }
+
+    #[test]
+    fn a_runs_builder_brief_is_kept_so_a_resume_after_the_scope_gate_still_briefs_round_one() {
+        let cfg = plain("ends", 3, 1);
+        let fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
+        let mut s = setting(&cfg);
+        s.builder_brief = Some(stages::BuilderBrief {
+            scope: Some("It makes x one, in a.src.".into()),
+            lenses: BTreeMap::from([("alpha".to_string(), "Break the lookup.".to_string())]),
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Scope));
+        // Saved and read back, as `acr resume` does, with a Setting made
+        // afresh, which has no brief of its own.
+        let mut run: Run = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        assert!(run.builder_brief.is_some());
+        let mut later = setting(&cfg);
+        later.builder_brief = run.builder_brief.clone();
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &later, &fake, &|_| Ok(c.clone())).unwrap();
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(alpha[0].contains("Break the lookup."), "round 1 is briefed");
     }
 
     #[test]
@@ -9658,7 +10174,7 @@ lenses:
 
         // An easy group whose fix failed isn't easy: its restart goes to
         // the Orchestrator's binding.
-        let cfg = with_fixer(Severity::Critical);
+        let cfg = with_fixer(Severity::High);
         let (fixed, fixes) = (Mutex::new(false), Mutex::new(0));
         let fake = Fake::new(routed_blockers(&fixed, &fixes, true));
         let (run, _) = go(&cfg, &["a.src"], &fake);
@@ -9698,7 +10214,14 @@ lenses:
         };
         let cfg = resolved("{binding: large}").unwrap();
         let f = cfg.savings.fixer.clone().unwrap();
-        assert_eq!((f.max_severity, f.max_files), (Severity::Medium, 1));
+        assert_eq!((f.max_severity, f.max_files), (Severity::High, 1));
+        assert!(
+            format!(
+                "{:#}",
+                resolved("{binding: large, max_severity: Critical}").unwrap_err()
+            )
+            .contains("can't be Critical")
+        );
         assert!(cfg.chosen_bindings().iter().any(|(n, _)| *n == "large"));
         let cfg = resolved("{binding: large, max_severity: High, max_files: 2}").unwrap();
         let f = cfg.savings.fixer.unwrap();
@@ -10238,9 +10761,10 @@ lenses:
         let reload = move |_| Ok(again.clone());
         let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
-        // The scope first, and who fixes, before any reviewer runs.
+        // The scope first, who fixes, and, with nothing chosen, which lenses
+        // attack again after a fix, before any reviewer runs.
         assert_eq!(run.waiting, Some(Gate::Scope));
-        assert_eq!(headers(&run, &cfg), ["Scope", "Fixer"]);
+        assert_eq!(headers(&run, &cfg), ["Scope", "Fixer", "Re-attack"]);
         assert_eq!(fake.count(Role::Reviewer), 0);
         // The default fixer comes first, marked: an Orchestrator that may
         // write is it.
@@ -12669,6 +13193,36 @@ lenses:
     }
 
     #[test]
+    fn a_finding_the_first_pass_leaves_unrated_goes_on_to_the_judge() {
+        let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
+        let two = r#"{"findings": [{"title": "a defect", "file": "a.src"}, {"title": "another", "file": "a.src", "line": 9}]}"#;
+        let fake = Fake::new(move |role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => two.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                // It rates one of the two, Low: nothing it rated escalates.
+                Role::Judge if prompt.contains("You're the first pass") => {
+                    r#"{"findings": [{"title": "a defect", "file": "a.src", "severity": "Low"}]}"#
+                        .to_string()
+                }
+                Role::Judge => r#"{"findings": [{"title": "a defect", "file": "a.src", "severity": "Low"}, {"title": "another", "file": "a.src", "line": 9, "severity": "Low"}]}"#.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let judged = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == Role::Judge && c.1 == "large")
+            .count();
+        assert_eq!(judged, 1, "the Judge rules on them all");
+        assert!(said(&fake).contains("the first pass rated 1 of the 2 finding(s)"));
+        assert_eq!(run.lenses["alpha"].rounds[0].findings.len(), 2, "none lost");
+    }
+
+    #[test]
     fn a_first_pass_that_settles_a_lens_saves_its_judge_call() {
         let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
         let fake = Fake::new(first_and_full(
@@ -13886,6 +14440,262 @@ lenses:
         fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
         assert!(run.partial_fix.is_none());
         assert_eq!(run.stage, Stage::Review);
+    }
+
+    #[test]
+    fn a_tool_a_calls_model_asked_for_that_its_binding_doesnt_name_is_recorded_and_reported() {
+        let cfg = plain("exception", 3, 1);
+        let reviewer = cfg.binding(Role::Reviewer, None).unwrap();
+        let own = reviewer.tools.clone().unwrap()[0].clone();
+        let mut fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
+        fake.usage = Some(RunUsage {
+            calls: 2,
+            input_tokens: 10,
+            output_tokens: 10,
+            tools: [(own, 3), ("sk_context-slack_query".to_string(), 1)].into(),
+            ..RunUsage::default()
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let reviewers: Vec<&Usage> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Reviewer)
+            .collect();
+        assert!(!reviewers.is_empty());
+        for u in &reviewers {
+            assert_eq!(
+                u.unnamed_tools,
+                [("sk_context-slack_query".to_string(), 1)].into(),
+                "{:?}",
+                u.label
+            );
+        }
+        let listed = super::super::report::unnamed_tools(&run.usage);
+        assert!(listed.len() >= reviewers.len());
+        assert!(
+            listed[0].line().contains(
+                "asked for tool(s) its binding doesn't name: sk_context-slack_query (1×)"
+            ),
+            "{}",
+            listed[0].line()
+        );
+    }
+
+    #[test]
+    fn reattack_all_attacks_every_lens_after_each_fix_and_blocked_only_those_with_blockers() {
+        // alpha blocks once; beta passes from the start.
+        let rounds_of = |cfg: &Config| -> (u32, usize, usize, Vec<String>) {
+            let fake = Fake::new(defect_in("alpha", 1));
+            let (run, _) = go(cfg, &["a.src"], &fake);
+            (
+                run.round,
+                run.lenses["alpha"].rounds.len(),
+                run.lenses["beta"].rounds.len(),
+                fake.told.lock().unwrap().clone(),
+            )
+        };
+        let blocked = config("exception", 3, 1, "", "reattack: blocked");
+        let (_, alpha, beta, _) = rounds_of(&blocked);
+        assert_eq!(
+            (alpha, beta),
+            (2, 1),
+            "beta passed, and isn't attacked again"
+        );
+        let all = config("exception", 3, 1, "", "reattack: all");
+        assert_eq!(all.reattack, Some(Reattack::All));
+        let (_, alpha, beta, told) = rounds_of(&all);
+        assert_eq!(
+            (alpha, beta),
+            (2, 2),
+            "every lens attacks the fixed version"
+        );
+        assert!(
+            told.iter()
+                .any(|t| t.contains("every lens attacks the new version, as reattack: all asks")),
+            "{told:?}"
+        );
+        // Unset, and nobody asked at scope: the default, said as nobody's.
+        let unset = plain("exception", 3, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        let (run, _) = go(&unset, &["a.src"], &fake);
+        assert_eq!(run.reattack, None);
+        assert_eq!(run.reattacks(), Reattack::Blocked);
+        assert!(run.reattack_line().contains("the default: nobody chose"));
+        // Asked at scope when unset, and the answer is kept.
+        let asked = plain("ends", 3, 1);
+        let s = setting(&asked);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert!(headers(&run, &asked).contains(&"Re-attack".to_string()));
+        let a = answered(
+            &run,
+            &asked,
+            &[
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
+                ("Re-attack", "Every lens".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &asked, &a, 1).unwrap();
+        assert_eq!(run.reattack, Some(Reattack::All));
+        assert!(!headers(&run, &asked).contains(&"Re-attack".to_string()));
+    }
+
+    #[test]
+    fn a_fixers_restart_builds_on_the_edits_its_lost_session_left() {
+        let cfg = plain("exception", 3, 1);
+        let fixes = Mutex::new(0);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && *fixes.lock().unwrap() == 0 => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                // The first session edits, then answers in words no repair
+                // reads; its restart finishes the job.
+                Role::Orchestrator if prompt.contains("# Already in the working tree") => {
+                    *fixes.lock().unwrap() += 1;
+                    r#"{"done": "checked the edits and finished the fix"}"#.to_string()
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => "I fixed it.".to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        fake.edits_once = true;
+        fake.fixes = Some(vec!["a.src".into()]);
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let told = said(&fake);
+        assert!(!told.contains("did no work"), "{told}");
+        assert!(told.contains("restarted fresh"), "{told}");
+        assert_eq!(*fixes.lock().unwrap(), 1);
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
+    }
+
+    #[test]
+    fn an_outage_at_the_sizer_pauses_the_review_saved_instead_of_failing_a_step() {
+        let cfg = plain("exception", 3, 1);
+        let down = std::sync::atomic::AtomicBool::new(true);
+        let fake = Fake::new(|role, _: &str| {
+            if role == Role::Sizer && down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::Error::new(CallFailed {
+                    failure: Failure::Unreachable,
+                    message: "fetch failed (ECONNREFUSED)".into(),
+                }));
+            }
+            Ok(match role {
+                Role::Sizer => r#"{"tier": "small", "sure": true, "reason": "docs"}"#.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["docs/a.md"]);
+        // The Sizer runs as the review starts: an outage there is said as
+        // one, not taken for a tier it couldn't choose.
+        let e = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap_err();
+        assert!(is_outage(&e), "{e:#}");
+        assert!(said(&fake).contains("its model couldn't be reached, so it waits"));
+        // Back up, it goes on.
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.tier, "small");
+        assert!(
+            !run.escalations
+                .iter()
+                .any(|e| e.reason.contains("unreachable"))
+        );
+    }
+
+    #[test]
+    fn at_its_spend_cap_a_review_starts_no_new_call_and_asks_whether_to_go_on() {
+        let mut cfg = plain("exception", 3, 1);
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let mut fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached once the first call is in.
+        fake.capped_after = Some(1);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        assert_eq!(run.spend_cap, cfg.spend_cap);
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.about == Some(About::SpendCap) && e.reason.starts_with(SPEND_CAP)),
+            "{:?}",
+            run.escalations
+        );
+        let calls_then = fake.calls.lock().unwrap().len();
+        assert!(said(&fake).contains("no new call starts"));
+        // Raised, in a person's words, it goes on, keeping what finished.
+        let a = answered(&run, &cfg, &[("Spend cap", "$5".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        assert_eq!(run.spend_cap.and_then(|c| c.usd), Some(5.0));
+        // Lifted, it goes on to the end.
+        run.spend_cap = None;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert!(fake.calls.lock().unwrap().len() > calls_then);
+        assert_eq!(run.status, Status::Confirmed, "{:?}", failures(&run));
+    }
+
+    #[test]
+    fn a_fixing_sessions_brief_reaches_the_next_rounds_reviewers() {
+        let cfg = plain("exception", 3, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        let reload = |_| Ok(c.clone());
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        assert!(!run.converge);
+        let briefs = BTreeMap::from([(
+            "alpha".to_string(),
+            "Start at the new lock in a.src.".to_string(),
+        )]);
+        fixed_by_session(&mut run, &s, &fake, briefs).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(alpha.len() >= 2, "{}", alpha.len());
+        assert!(!alpha[0].contains("Start at the new lock"));
+        assert!(
+            alpha
+                .last()
+                .unwrap()
+                .contains("Start at the new lock in a.src."),
+            "round 2 gets the fixing session's brief"
+        );
+    }
+
+    #[test]
+    fn a_session_that_says_it_fixed_with_the_tree_unchanged_did_no_work() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.still = true;
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap_err();
+        assert!(format!("{e:#}").contains("did no work"), "{e:#}");
+        assert!(said(&fake).contains("did no work: it said the fixes are in"));
+        // Still waiting for the fixes, in the same round.
+        assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
     }
 
     /// What a fix changed: the file its blocker points at, a rebuilt

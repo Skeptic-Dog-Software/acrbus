@@ -686,6 +686,11 @@ fn apply_reply(paths: &Paths, pending: &Pending, m: &Incoming) -> Result<String>
         .join("answers")
         .join(stamped(&format!("{run_id}-{}.json", m.id)));
     write_private(&file, &serde_json::to_vec_pretty(&answers)?)?;
+    // Who sent them, beside them, for the resume to record.
+    write_private(
+        &sidecar(&file),
+        &serde_json::to_vec(&json!({ "from": m.from, "message": m.id }))?,
+    )?;
     let mut p = pending.clone();
     p.answered = Some(m.id);
     save_json(&pending_dir(paths).join(format!("{run_id}.json")), &p)?;
@@ -716,6 +721,26 @@ fn apply_reply(paths: &Paths, pending: &Pending, m: &Incoming) -> Result<String>
     }
     resume(paths, run_id, &file)?;
     Ok("Resuming it with your answers. I'll write when it waits again or ends.".to_string())
+}
+
+/// Where the sender of a reply's answers is kept, beside them.
+fn sidecar(file: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.from", file.display()))
+}
+
+/// Who sent the answers in `file`, when this process is the resume a
+/// Grayboard reply started and `file` is the reply's answers as the daemon
+/// kept them: the owner's human handle, the only sender whose replies it
+/// takes. None for answers from anywhere else.
+pub fn answered_from(paths: &Paths, file: &Path) -> Option<String> {
+    crate::config::env_var(RESUMED)?;
+    let dir = gb::dir(paths).join("answers").canonicalize().ok()?;
+    let file = file.canonicalize().ok()?;
+    if !file.starts_with(&dir) {
+        return None;
+    }
+    let side: Value = serde_json::from_slice(&fs::read(sidecar(&file)).ok()?).ok()?;
+    side["from"].as_str().map(String::from)
 }
 
 /// A reply may start with the review's ID, or a unique start of it.
@@ -1565,6 +1590,15 @@ pub(super) mod tests {
         assert!(
             answers.values().any(|v| v == "The Orchestrator"),
             "{answers:?}"
+        );
+        // Beside them, who sent them, for the resume to record as the
+        // answers' source.
+        let from: Value = serde_json::from_slice(&fs::read(sidecar(&resumed.1)).unwrap()).unwrap();
+        assert_eq!(from["from"], format!("{ME}/human"));
+        assert_eq!(
+            answered_from(&paths, &resumed.1),
+            None,
+            "only in the resume it started"
         );
         reply(&fake, "1: 3", Some(sent_id));
         tick(&paths, &mut s, &log).unwrap();

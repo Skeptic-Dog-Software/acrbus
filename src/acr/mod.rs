@@ -78,6 +78,15 @@ pub struct Target {
     human_gate: Option<HumanGate>,
     #[arg(long)]
     max_rounds: Option<u32>,
+    /// After each fix, attack again with only the lenses that had blockers
+    /// (`blocked`), or with every lens (`all`). Left out, the config says,
+    /// or the review asks at its scope gate.
+    #[arg(long, value_parser = parse_reattack)]
+    reattack: Option<config::Reattack>,
+    /// A spend cap for this review, in dollars: past it, no new call
+    /// starts, and you're asked to raise it, go on without it, or stop.
+    #[arg(long, value_name = "USD")]
+    spend_cap_usd: Option<f64>,
     #[arg(long, value_parser = parse_scope)]
     review_scope: Option<ReviewScope>,
     /// Use a binding for a role, as `role=name`. Can be repeated.
@@ -134,6 +143,10 @@ fn description_of(target: &Target, post_pr: Option<u64>) -> Result<Option<String
 
 fn parse_gate(s: &str) -> Result<HumanGate, String> {
     serde_yaml_ng::from_str(s).map_err(|_| "use per-round, ends or exception".to_string())
+}
+
+fn parse_reattack(s: &str) -> Result<config::Reattack, String> {
+    serde_yaml_ng::from_str(s).map_err(|_| "use blocked or all".to_string())
 }
 
 fn parse_scope(s: &str) -> Result<ReviewScope, String> {
@@ -330,8 +343,8 @@ pub enum AcrCmd {
         #[arg(long, value_name = "NUMBER")]
         post_pr: Option<u64>,
         /// Review a repository that isn't calibrated, or whose config has
-        /// changed since: its rulings haven't been checked against a full
-        /// review.
+        /// changed since: nobody has read and accepted the config the review
+        /// would use. Calibrated means accepted, not measured.
         #[arg(long)]
         uncalibrated: bool,
     },
@@ -546,6 +559,8 @@ fn flags(t: &Target) -> Flags {
     Flags {
         human_gate: t.human_gate,
         max_rounds: t.max_rounds,
+        reattack: t.reattack,
+        spend_cap_usd: t.spend_cap_usd,
         review_scope: t.review_scope,
         bindings: t.bindings.iter().cloned().collect(),
     }
@@ -612,6 +627,68 @@ fn outside_config(paths: &Paths, repo: &Path) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.yaml", change::name(repo)?)))
 }
 
+/// What `acr run`'s flags make weaker than the repository's config, each
+/// said. Under `answers: person`, in that config or the one the run uses,
+/// a person at a terminal confirms them, or the run is refused: an agent
+/// that runs the review can't weaken it on its own say.
+fn weakened_by_flags(
+    paths: &Paths,
+    target: &Target,
+    cfg: &Config,
+    unaccepted: bool,
+) -> Result<Vec<String>> {
+    let user = config::load_user(&user_config_path(paths))?;
+    let unflagged = |file: Option<&Path>| -> Option<Config> {
+        let (text, _) = repo_layer(paths, &target.repo, Some(&target.base), file).ok()?;
+        config::resolve(&user, config::parse_repo(&text).ok()?, &Flags::default()).ok()
+    };
+    let own = unflagged(None);
+    let given = match &target.config {
+        Some(file) => unflagged(Some(file)),
+        None => own.clone(),
+    };
+    let mut out = given
+        .as_ref()
+        .map(|g| config::weakened(g, cfg))
+        .unwrap_or_default();
+    if let (Some(file), Some(_)) = (&target.config, &own)
+        && outside_config(paths, &target.repo).ok().as_deref() != Some(file.as_path())
+    {
+        out.push(format!(
+            "--config {}, in place of the repository's own config",
+            file.display()
+        ));
+    }
+    if unaccepted {
+        out.push("--uncalibrated: nobody has accepted the config it uses".into());
+    }
+    let person = cfg.answers == config::Answers::Person
+        || own
+            .as_ref()
+            .is_some_and(|c| c.answers == config::Answers::Person);
+    if person && !out.is_empty() {
+        let said = out.join("; ");
+        if !at_terminal() {
+            bail!(
+                "this repository's config takes a person's word only (answers: person), and \
+                 this run's flags make the review weaker than its config: {said}. Run it at a \
+                 terminal to confirm them, or leave them out"
+            );
+        }
+        eprint!(
+            "{APP_NAME}: this run's flags make the review weaker than its config: {said}.\n\
+             Type yes to confirm them: "
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("yes") {
+            bail!("not confirmed, so the review didn't start");
+        }
+        out.push("confirmed by a person at the terminal".into());
+    }
+    Ok(out)
+}
+
 /// The config for a review of a change into `base`.
 fn load_config(paths: &Paths, t: &Target, flags: &Flags) -> Result<(Config, Source)> {
     let user = config::load_user(&user_config_path(paths))?;
@@ -671,9 +748,10 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
 
 /// A reviewer's or Judge's call, given the round's shared facts: the facts
 /// file, the cache's key for its bridge and model, and, when its roles'
-/// tools are matched, every tool their calls are given, holding it to its
-/// own.
-fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
+/// tools are matched and its bridge `holds` a call to its own, every tool
+/// their calls are given, holding it to its own. A bridge that can't hold
+/// one, any but pi's, would refuse the call, so it keeps its own tools.
+fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared, holds: bool) {
     let b = call.binding;
     // A fix's sessions, one per group, all open the same way: its cache's
     // key keeps them on the replica that holds that opening. Nothing else
@@ -687,7 +765,7 @@ fn with_shared(options: &mut RunOptions, call: &Call, shared: &flow::Shared) {
     }
     options.facts = Some(shared.facts.display().to_string());
     options.cache_key = Some(cache_key(&shared.key, &b.agent, b.model.as_deref()));
-    if call.no_tools {
+    if call.no_tools || !holds {
         return;
     }
     let group = (b.agent.clone(), b.model.clone());
@@ -747,6 +825,8 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         allowed_tools: None,
         relay_tokens: None,
         relay_after_edit: None,
+        // The host's MCP servers it names, and none it doesn't.
+        mcp: b.mcp.clone(),
     }
 }
 
@@ -1356,6 +1436,8 @@ fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<C
 /// Reaches models through bridges, as `acrbus call` does. Each call is a
 /// fresh session, limited to its binding's tools.
 struct BridgeCaller {
+    /// The review's spend cap, set as it runs.
+    cap: std::sync::Mutex<Option<config::SpendCap>>,
     socket: PathBuf,
     agent: String,
     store: Attachments,
@@ -1427,6 +1509,7 @@ impl BridgeCaller {
             sent: Default::default(),
             unrelayed: Default::default(),
             rekeyed: Default::default(),
+            cap: Default::default(),
         })
     }
 
@@ -1705,6 +1788,16 @@ impl Caller for BridgeCaller {
             .insert(label.to_string());
     }
 
+    fn over_cap(&self) -> Option<String> {
+        let cap = (*self.cap.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let spent = self.progress.spent();
+        cap.reached(spent.usd, spent.fresh + spent.cached)
+    }
+
+    fn set_cap(&self, cap: Option<config::SpendCap>) {
+        *self.cap.lock().unwrap_or_else(|e| e.into_inner()) = cap;
+    }
+
     fn has_room(&self, binding: &config::Binding) -> bool {
         let bridge = binding.agent.split('@').next().unwrap_or_default();
         // One slot always left over for the review's own calls.
@@ -1782,7 +1875,8 @@ impl BridgeCaller {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            with_shared(&mut options, call, shared);
+            let holds = crate::bridge::holds_tools(&self.paths, bridge);
+            with_shared(&mut options, call, shared, holds);
         }
         // A restart after its model couldn't be reached: a new key, so it
         // may land on another replica than the one that didn't answer.
@@ -1931,10 +2025,29 @@ impl BridgeCaller {
                         b.agent
                     ));
                 }
+                let usage = result.and_then(|r| r.usage.clone());
+                // A tool its model reached for that its binding doesn't
+                // name: said, not refused here, since pi's bridge refuses it
+                // and others can't. It shows a gateway adding tools to its
+                // requests, or a model making one up.
+                if let Some(used) = &usage {
+                    let unnamed = flow::unnamed_tools(b, &used.tools);
+                    if !unnamed.is_empty() {
+                        let list: Vec<String> = unnamed
+                            .iter()
+                            .map(|(name, n)| format!("{name} ({n}×)"))
+                            .collect();
+                        self.progress.line(&format!(
+                            "{}: its model asked for tool(s) its binding doesn't name: {}",
+                            call.label,
+                            list.join(", ")
+                        ));
+                    }
+                }
                 Ok(Answer {
                     text,
                     run_id: sent.id,
-                    usage: result.and_then(|r| r.usage.clone()),
+                    usage,
                     secs: Some(asked.elapsed().as_secs()),
                 })
             }
@@ -2132,6 +2245,8 @@ fn attend(
                     }
                 }
             }
+            // Recorded at the gate it answers; taken back if they're refused.
+            run.answered("a person at the terminal");
             match carousel::apply(run, cfg, &answers, crate::util::now_ms()) {
                 Ok(applied) => {
                     keep_feedback(paths, run, &applied.feedback);
@@ -2140,6 +2255,7 @@ fn attend(
                     }
                 }
                 Err(e) => {
+                    run.answered_by.pop();
                     eprintln!("{APP_NAME}: {e:#}");
                     continue;
                 }
@@ -2466,6 +2582,22 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
+    }
+    eprintln!("{APP_NAME}: {}", run.reattack_line());
+    if !run.weakened.is_empty() {
+        eprintln!(
+            "{APP_NAME}: it ran weaker than its config: {}",
+            run.weakened.join("; ")
+        );
+    }
+    for a in &run.answered_by {
+        eprintln!(
+            "{APP_NAME}: round {}'s {} gate was answered by {}",
+            a.round, a.gate, a.by
+        );
+    }
+    for u in &summary.unnamed_tools {
+        eprintln!("{APP_NAME}: {}", u.line());
     }
     for x in &summary.sessions {
         eprintln!("{APP_NAME}: {}", x.line());
@@ -2953,6 +3085,32 @@ fn describe_plan(plan: &plan::Plan) {
         "  At most, with every lens through every round and a fix between: {}",
         figure(&plan.most)
     );
+    let reattack = match plan.reattack {
+        Some(config::Reattack::All) => "every lens attacks again after each fix (reattack: all)",
+        Some(config::Reattack::Blocked) => {
+            "only the lenses with blockers attack again after a fix (reattack: blocked)"
+        }
+        None => {
+            "which lenses attack again after a fix is asked at the scope gate; left unanswered, \
+             only those with blockers"
+        }
+    };
+    println!("Re-attack: {reattack}.");
+    if let Some(cap) = &plan.spend_cap {
+        println!(
+            "Spend cap: {}. Past it, no new call starts; calls at work finish, and you're asked \
+             to raise it, go on without it, or stop.",
+            cap.line()
+        );
+    }
+    if let (Some(e), Some(all)) = (&plan.expected, &plan.expected_all) {
+        println!(
+            "  Expected with every lens attacking after each fix: {}, against {} with only \
+             those that had blockers",
+            figure(all),
+            figure(e)
+        );
+    }
     if !plan.unpriced.is_empty() {
         println!(
             "No price for {}: add it under costs.prices, or mark its binding `subscription: true`",
@@ -3085,9 +3243,11 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             )?;
             let name = change::name(&target.repo)?;
             let now = fingerprint(&cfg, &text, &list)?;
-            if let Some(note) = calibrated(paths, &name, &now, uncalibrated)? {
+            let unaccepted = calibrated(paths, &name, &now, uncalibrated)?;
+            if let Some(note) = &unaccepted {
                 eprintln!("{note}");
             }
+            let weakened = weakened_by_flags(paths, &target, &cfg, unaccepted.is_some())?;
             check_machine(paths, &cfg, &target.repo, false)?;
             // The commit under review resolves before anything is made.
             let commit = change::reviewed_commit(
@@ -3127,8 +3287,33 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 );
             }
             caller.budget(paths, &cfg, &change, repo, &[]);
-            let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
+            let mut run = match flow::start(&id, repo, base, head, &s, &change, &caller) {
+                // Before the review exists there's nothing to save: said, and
+                // the same exit as a paused round's.
+                Err(e) if flow::is_outage(&e) => {
+                    eprintln!(
+                        "{APP_NAME}: gateway unreachable before the review could start, so \
+                         nothing was saved: run it again once it's back. ({e:#})"
+                    );
+                    return Ok(ExitCode::from(OUTAGE));
+                }
+                started => started?,
+            };
             run.starter = starter;
+            if !weakened.is_empty() {
+                caller.note(&format!(
+                    "this review runs weaker than its config: {}",
+                    weakened.join("; ")
+                ));
+            }
+            run.weakened = weakened;
+            if let Some(cap) = &run.spend_cap {
+                caller.note(&format!(
+                    "spend cap: {}; past it, no new call starts, and you're asked to raise it, \
+                     go on without it, or stop",
+                    cap.line()
+                ));
+            }
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
             save(paths, &run, &cfg)?;
@@ -3146,6 +3331,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
             let restarts = report::restarts(&run.usage);
+            let unnamed = report::unnamed_tools(&run.usage);
             let fixes = report::fix_routes(&run);
             let unreported = report::writes_unreported(&run.usage);
             let sessions = report::sessions(&run.usage);
@@ -3186,6 +3372,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
                     "restarts": restarts, "fix_routes": fixes,
+                    "unnamed_tools": unnamed,
                     "sessions": sessions, "session_calls": parts,
                     "calls": calls, "cost": billed, "cost_adjusted": cost_adjusted,
                     "cache_shortfall_tokens": shortfall,
@@ -3207,6 +3394,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for r in &restarts {
                     println!("{}", r.line());
+                }
+                for u in &unnamed {
+                    println!("{}", u.line());
                 }
                 for f in &fixes {
                     println!("{}", f.line());
@@ -3321,6 +3511,38 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             // calibration, before anything is called.
             let mut stop = stop;
             let answered = answers.is_some();
+            // Where they came from: a Grayboard reply's sender, or the flag.
+            let from = answers
+                .as_deref()
+                .and_then(|a| a.strip_prefix('@'))
+                .and_then(|file| grayboard::answered_from(paths, Path::new(file)));
+            let deciding = !fold.is_empty() || !waive.is_empty() || !defer.is_empty() || approve;
+            if cfg.answers == config::Answers::Person && !stop {
+                if answered && from.is_none() {
+                    bail!(
+                        "{run_id}'s config takes answers from a person only (answers: person), \
+                         so --answers is refused: answer at a terminal with `{APP_NAME} acr \
+                         resume {run_id}`, or on Grayboard"
+                    );
+                }
+                if deciding {
+                    bail!(
+                        "{run_id}'s config takes answers from a person only (answers: person), \
+                         so --fold, --waive, --defer and --approve are refused: answer at a \
+                         terminal with `{APP_NAME} acr resume {run_id}`, or on Grayboard"
+                    );
+                }
+            }
+            if answered || deciding {
+                let by = match (&from, answered) {
+                    (Some(sender), _) => format!("a Grayboard reply from {sender}"),
+                    (None, true) => "acr resume --answers".to_string(),
+                    (None, false) => {
+                        "acr resume's --fold, --waive, --defer or --approve".to_string()
+                    }
+                };
+                run.answered(by);
+            }
             if let Some(answers) = answers {
                 let applied = carousel::apply(
                     &mut run,
@@ -3386,6 +3608,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             }
             let mut s = setting(paths, &cfg, &run_id, None)?;
             s.description = run.description.clone();
+            // The builder's brief it started with: round 1 runs under a
+            // resume whenever the scope gate stopped it.
+            s.builder_brief = run.builder_brief.clone();
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
             following(&caller, paths, &run_id, &cfg, "resumed");
@@ -3471,6 +3696,8 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 head: None,
                 human_gate: None,
                 max_rounds: None,
+                reattack: None,
+                spend_cap_usd: None,
                 review_scope: None,
                 bindings: Vec::new(),
                 description: None,
@@ -3749,6 +3976,8 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4051,6 +4280,8 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -4087,6 +4318,8 @@ fn pipeline_arm(
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: if converge {
             vec![(Role::Orchestrator, STEELMAN_BINDING.to_string())]
@@ -4348,6 +4581,8 @@ fn calibrate(
         head: Some(key.head.clone()),
         human_gate: None,
         max_rounds: None,
+        reattack: None,
+        spend_cap_usd: None,
         review_scope: None,
         bindings: Vec::new(),
         description: None,
@@ -5270,6 +5505,57 @@ mod tests {
     }
 
     #[test]
+    fn under_answers_person_resume_refuses_answers_and_decisions_from_anywhere_but_a_person() {
+        use super::change::tests::repo_with;
+        let paths = paths();
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        let user = config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap();
+        let cfg = config::resolve(
+            &user,
+            config::parse_repo(
+                "version: 1\nanswers: person\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.answers, config::Answers::Person);
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-person", "repo": repo, "base": "main", "head": null,
+            "tier": "a", "tier_why": "", "fan_out": 1, "round": 1, "stage": "scope",
+            "status": "waiting", "waiting": "scope", "lenses": {},
+            "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        save(&paths, &run, &cfg).unwrap();
+        let resume = |answers: Option<String>, approve: bool| AcrCmd::Resume {
+            run_id: "r-person".into(),
+            answers,
+            fixed: false,
+            brief: None,
+            fold: Vec::new(),
+            waive: Vec::new(),
+            defer: Vec::new(),
+            approve,
+            stop: false,
+            post_pr: None,
+        };
+        let e = super::run(&paths, resume(Some("{}".into()), false), None).unwrap_err();
+        assert!(format!("{e:#}").contains("--answers is refused"), "{e:#}");
+        let e = super::run(&paths, resume(None, true), None).unwrap_err();
+        assert!(format!("{e:#}").contains("--approve are refused"), "{e:#}");
+        // Nothing was taken: it still waits at its scope gate.
+        let kept: Run = serde_json::from_slice(
+            &fs::read(run_dir(&paths, "r-person").join("run.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.waiting, Some(flow::Gate::Scope));
+        assert!(kept.answered_by.is_empty());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
+    }
+
+    #[test]
     fn a_running_review_stops_in_one_step() {
         use super::change::tests::repo_with;
         let paths = paths();
@@ -5462,6 +5748,8 @@ mod tests {
             config,
             human_gate: None,
             max_rounds: None,
+            reattack: None,
+            spend_cap_usd: None,
             review_scope: None,
             bindings: Vec::new(),
             description: None,
@@ -6036,7 +6324,7 @@ mod tests {
         };
         let given = |c: &flow::Call| {
             let mut o = call_options(c, false, None);
-            with_shared(&mut o, c, &shared);
+            with_shared(&mut o, c, &shared, true);
             o
         };
         let r = given(&call(Role::Reviewer, &reviewer, false, false));
@@ -6084,6 +6372,17 @@ mod tests {
         );
         assert!(tools_note(&["read".into()]).contains("The tools you may use: read."));
         assert!(tools_note(&[]).contains("The tools you may use: none."));
+        // A bridge that can't hold a call to some of its tools, such as
+        // Claude Code's, would refuse one: it keeps its own, with the facts
+        // and the key all the same.
+        let c = call(Role::Reviewer, &reviewer, false, false);
+        let mut kept = call_options(&c, false, None);
+        with_shared(&mut kept, &c, &shared, false);
+        assert_eq!(
+            (kept.tools, kept.allowed_tools),
+            (reviewer.tools.clone(), None)
+        );
+        assert!(kept.facts.is_some() && kept.cache_key.is_some());
     }
 
     #[test]
@@ -6128,7 +6427,7 @@ mod tests {
                 label: label.to_string(),
             };
             let mut o = call_options(&c, false, None);
-            with_shared(&mut o, &c, &shared(round));
+            with_shared(&mut o, &c, &shared(round), true);
             (
                 o.model,
                 o.effort,

@@ -9,6 +9,9 @@
     "version": {"const": 1},
     "human_gate": {"enum": ["in-the-loop", "per-round", "ends", "exception"], "description": "When a person is asked. in-the-loop, the default: at scope, every fold and the result. ends: at scope and the result. per-round: at every fold. exception: only for escalations."},
     "max_rounds": {"type": "integer", "minimum": 1},
+    "reattack": {"enum": ["blocked", "all"], "description": "Which lenses attack again after a fix. blocked: the lenses that had blockers, and any whose round didn't finish or the fixed change now triggers. all: every lens, after every fix. Left out, the review asks at its scope gate, or takes blocked if nobody is asked there."},
+    "spend_cap": {"type": "object", "additionalProperties": false, "properties": {"usd": {"type": "number", "exclusiveMinimum": 0}, "tokens": {"type": "integer", "minimum": 1}}, "description": "A review's spend cap, in dollars, tokens (fresh and cached), or both, whichever its finished calls reach first. Past it, no new call starts, calls at work finish, and the review asks a person to raise it, go on without it, or stop. It never cuts off a working call. Unset by default."},
+    "answers": {"enum": ["anyone", "person"], "description": "Who may answer the review's questions. anyone, the default: a terminal, Grayboard, or acr resume --answers. person: a terminal's prompt or a Grayboard reply from the owner's human handle only; --answers, and run flags that weaken the review, are refused unless confirmed at a terminal."},
     "review_scope": {"enum": ["whole-pr", "bottom-of-stack"]},
     "not_findings": {"type": "string", "description": "Path to the decided non-issues list"},
     "always_escalate": {"type": "array", "items": {"type": "string"}},
@@ -215,7 +218,7 @@
           "description": "A cheaper binding for the fix groups the rules call easy: every blocker in the group at or below max_severity, the group citing at most max_files files, each with its cause stated (file, line and detail), none a person's call or a defect a person reported missed, and none like one fixed in an earlier round. Every other group, and an easy group's restart after its fix failed, goes to the Orchestrator's binding, as do its other calls. Left out, the Orchestrator's binding fixes every group.",
           "properties": {
             "binding": {"type": "string", "description": "A binding in allowed_bindings that may write."},
-            "max_severity": {"enum": ["Critical", "High", "Medium", "Low"], "description": "The most severe a blocker in an easy group may be. Default Medium."},
+            "max_severity": {"enum": ["High", "Medium", "Low"], "description": "The most severe a blocker in an easy group may be. Default High. Never Critical: a Critical blocker always goes to the Orchestrator's binding."},
             "max_files": {"type": "integer", "minimum": 1, "description": "The most files an easy group's blockers may cite. Default 1."}
           }
         }

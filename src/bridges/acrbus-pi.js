@@ -35,10 +35,17 @@
 //   between pi's before_provider_request and the turn's end.
 // - ACRBUS_EFFORT: the thinking level the call asked for. pi rounds a level
 //   the model doesn't have to one it does, and stderr says so.
-// - ACRBUS_ALLOWED_TOOLS: the tools this call may use, comma-separated, when
-//   every role on the bridge is given the same tool definitions so their
-//   prompts share a cached prefix. A call to any other tool is refused, and
-//   says so. It fails closed: a list it can't read refuses every tool.
+// - ACRBUS_ALLOWED_TOOLS: the tools this review call may use, comma-separated:
+//   its binding's, or, when every role on the bridge is given the same tool
+//   definitions so their prompts share a cached prefix, its own of those. A
+//   name ending in * covers every tool it starts, such as an MCP server's
+//   mcp__name__*. A call to any other tool is refused, whatever its name,
+//   one a gateway added to the request or one the model made up included,
+//   and stderr says so, a line each. It fails closed: a list it can't read
+//   refuses every tool.
+// - ACRBUS_REQUEST_HEADERS: headers for every model request the call makes,
+//   one `name=value` a line, such as a gateway's own switch for not adding
+//   its tools to requests. A line it can't read is skipped, and said.
 // - ACRBUS_DROP_PI_DOCS=1: a review's system prompt leaves out pi's pointer
 //   to its own documentation, which says itself it's for questions about
 //   the harness, never a review's: one less block every turn sends again.
@@ -222,6 +229,27 @@ const OWN_TIMEOUT = /UND_ERR_(HEADERS|BODY)_TIMEOUT|timed? ?out|timeout/i;
 // An SSE line that's an event, not a comment or a blank keep-alive.
 const SSE_EVENT = /(^|[\r\n])(data|event):/;
 
+// The headers ACRBUS_REQUEST_HEADERS asks for: `name=value`, a line each.
+// A name must be a header's token, and a value one line; any other line is
+// skipped, and said.
+function requestHeaders(text) {
+  const out = [];
+  if (typeof text !== "string") return out;
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.length === 0) continue;
+    const at = t.indexOf("=");
+    const name = at > 0 ? t.slice(0, at).trim() : "";
+    const value = at > 0 ? t.slice(at + 1).trim() : "";
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name) || /[\r\n]/.test(value)) {
+      console.error(`acrbus headers: skipped a line of ACRBUS_REQUEST_HEADERS that isn't name=value`);
+      continue;
+    }
+    out.push([name, value]);
+  }
+  return out;
+}
+
 // The no-response guard, when ACRBUS_NO_RESPONSE_SECS is set: it wraps
 // fetch, which pi's providers call through, once per process.
 function guard(pi, turnNow) {
@@ -389,9 +417,11 @@ export default function acrbus(pi) {
   let lastCount = 0;
   let appliedSaid = false;
   let unsaidSaid = false;
-  if (key) {
+  const extra = requestHeaders(process.env.ACRBUS_REQUEST_HEADERS);
+  if (key || extra.length > 0) {
     pi.on("before_provider_headers", (event) => {
-      for (const name of KEY_HEADERS) event.headers[name] = key;
+      for (const [name, value] of extra) event.headers[name] = value;
+      if (key) for (const name of KEY_HEADERS) event.headers[name] = key;
     });
   }
   if (key || turns) {
@@ -520,15 +550,19 @@ export default function acrbus(pi) {
   }
   const listed = process.env.ACRBUS_ALLOWED_TOOLS;
   if (listed !== undefined) {
-    const allowed = /^[A-Za-z0-9_.,:-]*$/.test(listed)
-      ? new Set(listed.split(",").filter((t) => t.length > 0))
-      : new Set();
+    const allowed = /^[A-Za-z0-9_.,:*-]*$/.test(listed)
+      ? listed.split(",").filter((t) => t.length > 0)
+      : [];
+    const may = allowed.length > 0 ? allowed.join(", ") : "none";
+    const allows = (name) =>
+      allowed.some((t) => (t.endsWith("*") ? name.startsWith(t.slice(0, -1)) : t === name));
     pi.on("tool_call", async (event) => {
-      if (allowed.has(event.toolName)) return undefined;
-      const may = allowed.size > 0 ? [...allowed].join(", ") : "none";
+      const name = String(event?.toolName ?? "");
+      if (allows(name)) return undefined;
+      console.error(`acrbus tools: refused ${oneLine(name) || "?"}: not one of this call's tools`);
       return {
         block: true,
-        reason: `This role may not use ${event.toolName}. The tools it may use: ${may}.`,
+        reason: `Review calls can only use their binding's tools, and ${name} isn't one. The tools this call may use: ${may}.`,
       };
     });
   }

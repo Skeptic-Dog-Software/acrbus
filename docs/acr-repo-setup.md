@@ -251,6 +251,28 @@ Each reviewer gets its own lens's part. The `brief` stage covers any lens
 the builder left out. After a fix, the steelman briefs the next round,
 since by then it holds the change's context.
 
+## 5a2. Intensity, answers and a spend cap
+
+```yaml
+reattack: all          # after each fix: blocked (the default) or all
+answers: person        # answers only from a terminal or Grayboard
+spend_cap: {usd: 20}   # or {tokens: 30000000}, or both
+```
+
+- `reattack`: which lenses attack again after a fix. `blocked`, those
+  that had blockers (and any whose round didn't finish or the fix now
+  triggers); `all`, every lens, after every fix, which costs about a first
+  round each time. Unset, the scope gate asks. `--reattack` sets it for a
+  run.
+- `answers: person`: refuses `acr resume --answers` and its decision
+  flags, taking answers only from a terminal or a Grayboard reply from your
+  human handle, and needs run flags that weaken the review confirmed at a
+  terminal. Every review records where each gate's answers came from, and
+  what its flags weakened.
+- `spend_cap`: once the review's calls have spent it, no new call starts,
+  and you're asked to raise it, go on without it, or stop.
+  `--spend-cap-usd` sets one for a run.
+
 ## 5b. What acrbus does, so the config needn't
 
 - **Where commands run.** acrbus runs `tests.setup`, `tests.command`
@@ -407,7 +429,7 @@ savings:
   blast_radius: true         # off by default
   fixer:                     # off unless set
     binding: small           # a cheaper binding that may write
-    max_severity: Medium     # the default
+    max_severity: High       # the default; never Critical
     max_files: 1             # the default
 ```
 
@@ -468,7 +490,8 @@ savings:
   writing, and the rest) stay on its own binding. With `group_fixes`, each
   group is routed by its blockers' facts. A group is easy only if all of
   these hold for every blocker in it: its severity is at or below
-  `max_severity` (default Medium); the group's blockers cite at most
+  `max_severity` (default High; a Critical blocker always goes to the
+  Orchestrator's binding); the group's blockers cite at most
   `max_files` distinct files (default 1); the Judge stated its cause, with a
   file, a line and a detail; it isn't a person's call (a values call, a
   split, or a pre-existing Critical); it isn't a defect a person reported

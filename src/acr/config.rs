@@ -75,6 +75,22 @@ pub enum HumanGate {
 }
 
 impl HumanGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HumanGate::InTheLoop => "in-the-loop",
+            HumanGate::PerRound => "per-round",
+            HumanGate::Ends => "ends",
+            HumanGate::Exception => "exception",
+        }
+    }
+
+    /// Where a person is asked that `other` doesn't ask them.
+    fn asks_more_than(self, other: HumanGate) -> bool {
+        (self.asks_scope() && !other.asks_scope())
+            || (self.asks_fold() && !other.asks_fold())
+            || (self.asks_final() && !other.asks_final())
+    }
+
     /// They approve the scope before any reviewer runs.
     pub fn asks_scope(self) -> bool {
         matches!(self, HumanGate::InTheLoop | HumanGate::Ends)
@@ -288,6 +304,18 @@ pub struct Policy {
     pub human_gate: Option<HumanGate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// Which lenses attack again after a fix. Left out, the review asks at
+    /// its scope gate, or takes `blocked` if nobody is asked there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// Who may answer a review's questions: `person` takes answers only
+    /// from a terminal or Grayboard, never `acr resume --answers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Answers>,
+    /// A review's spend cap: past it, no new calls start, and a person is
+    /// asked to raise it, go on without it, or stop. Unset by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<SpendCap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_escalate: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,7 +568,8 @@ pub struct SavingsPolicy {
 pub struct FixerPolicy {
     /// A binding in `allowed_bindings` that may write.
     pub binding: String,
-    /// The most severe a blocker in an easy group may be. Default Medium.
+    /// The most severe a blocker in an easy group may be: High by default,
+    /// and never Critical, which always goes to the Orchestrator's binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<Severity>,
     /// The most files an easy group's blockers may cite. Default 1.
@@ -611,7 +640,7 @@ impl SavingsConfig {
                 .fixer
                 .map(|f| FixerConfig {
                     binding: f.binding,
-                    max_severity: f.max_severity.unwrap_or(Severity::Medium),
+                    max_severity: f.max_severity.unwrap_or(Severity::High),
                     max_files: f.max_files.unwrap_or(1),
                 })
                 .or(d.fixer),
@@ -872,6 +901,9 @@ impl Policy {
         self.not_findings = later.not_findings.or(self.not_findings);
         self.human_gate = later.human_gate.or(self.human_gate);
         self.max_rounds = later.max_rounds.or(self.max_rounds);
+        self.reattack = later.reattack.or(self.reattack);
+        self.answers = later.answers.or(self.answers);
+        self.spend_cap = later.spend_cap.or(self.spend_cap);
         self.always_escalate = later.always_escalate.or(self.always_escalate);
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
@@ -945,6 +977,11 @@ pub struct Binding {
     /// which lost the work done and cut off calls that were still working.
     #[serde(default, skip_serializing)]
     pub fallback: Option<String>,
+    /// The host's MCP servers its calls may use, by name, where its bridge
+    /// lets a request name them (pi's, given `options.mcp`). Left out, a
+    /// call gets none: a bridge whose agent can turn MCP off does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Vec<String>>,
 }
 
 /// A binding's `timeout` under this is said to be one, by `time_notes`.
@@ -954,6 +991,33 @@ const SHORT_CAP: u64 = 3600;
 const CHANGING_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
 
 impl Binding {
+    /// The tools a call on it may reach for: its own, and each MCP server's
+    /// it names, as `mcp__<server>__*`. None if it names no tools, when its
+    /// bridge's are all it has.
+    pub fn may_use(&self) -> Option<Vec<String>> {
+        let mut all = self.tools.clone()?;
+        for server in self.mcp.iter().flatten() {
+            all.push(format!("mcp__{server}__*"));
+        }
+        Some(all)
+    }
+
+    /// The tools a call used that it doesn't name: `used`'s names that
+    /// match none of `may_use`, a name ending in `*` covering every tool it
+    /// starts, in any case. Empty when it names no tools.
+    pub fn unnamed<'a>(&self, used: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+        let Some(may) = self.may_use() else {
+            return Vec::new();
+        };
+        let covered = |name: &str| {
+            may.iter().any(|t| match t.strip_suffix('*') {
+                Some(head) => name.to_lowercase().starts_with(&head.to_lowercase()),
+                None => t.eq_ignore_ascii_case(name),
+            })
+        };
+        used.into_iter().filter(|n| !covered(n)).cloned().collect()
+    }
+
     /// Whether it names a tool that can run or change files, in whatever
     /// case its agent spells it, `Bash` or `bash`. A reviewer that has one
     /// works in a copy of its own, to run and break things in, and never in
@@ -980,10 +1044,135 @@ pub struct UserConfig {
 }
 
 /// A run's flags, the last layer.
+/// Which lenses attack again after a fix: an intensity a review is asked
+/// for at its start when its config doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reattack {
+    /// The lenses that had blockers, and any whose round didn't finish or
+    /// the fixed change now triggers. A lens that passed isn't attacked
+    /// again, so a fix that breaks what it covers goes unseen until a
+    /// sweep, if the review has one.
+    Blocked,
+    /// Every lens, after every fix: a fix for one lens can break another.
+    /// Each round after a fix costs about as much as the first.
+    All,
+}
+
+impl Reattack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reattack::Blocked => "blocked",
+            Reattack::All => "all",
+        }
+    }
+}
+
+/// What a run's flags make weaker than `config`, the repository's config
+/// without them, each said: a gate that asks a person less, fewer rounds,
+/// another binding for a role, fewer lenses attacking after a fix, or less
+/// of the change in scope.
+pub fn weakened(config: &Config, run: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if config.human_gate.asks_more_than(run.human_gate) {
+        out.push(format!(
+            "--human-gate {}, where its config asks at more points ({})",
+            run.human_gate.as_str(),
+            config.human_gate.as_str()
+        ));
+    }
+    if run.max_rounds < config.max_rounds {
+        out.push(format!(
+            "--max-rounds {}, under its config's {}",
+            run.max_rounds, config.max_rounds
+        ));
+    }
+    for (role, name) in &run.bindings {
+        if config.bindings.get(role) != Some(name) {
+            out.push(format!(
+                "--binding {}={name}, in place of its config's {}",
+                role.as_str(),
+                config.bindings.get(role).map_or("default", String::as_str)
+            ));
+        }
+    }
+    if config.reattack == Some(Reattack::All) && run.reattack == Some(Reattack::Blocked) {
+        out.push(format!(
+            "--reattack {}, where its config re-attacks with every lens",
+            Reattack::Blocked.as_str()
+        ));
+    }
+    if config.review_scope == ReviewScope::WholePr && run.review_scope == ReviewScope::BottomOfStack
+    {
+        out.push(
+            "--review-scope bottom-of-stack, where its config reviews the whole pull request"
+                .into(),
+        );
+    }
+    out
+}
+
+/// A review's spend cap, in dollars, in tokens (fresh and cached), or both:
+/// whichever its finished calls reach first. Past it, no new call starts,
+/// calls at work finish, and the review asks a person to raise it, go on
+/// without it, or stop. It never cuts off a call that's working.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpendCap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+impl SpendCap {
+    /// Why it's reached, by spend so far: None while it isn't.
+    pub fn reached(&self, usd: f64, tokens: u64) -> Option<String> {
+        if let Some(cap) = self.usd
+            && usd >= cap
+        {
+            return Some(format!("${usd:.2} spent, at its spend cap of ${cap:.2}"));
+        }
+        if let Some(cap) = self.tokens
+            && tokens >= cap
+        {
+            return Some(format!("{tokens} tokens used, at its spend cap of {cap}"));
+        }
+        None
+    }
+
+    /// What it is, for a person.
+    pub fn line(&self) -> String {
+        match (self.usd, self.tokens) {
+            (Some(usd), Some(t)) => format!("${usd:.2} or {t} tokens, whichever comes first"),
+            (Some(usd), None) => format!("${usd:.2}"),
+            (None, Some(t)) => format!("{t} tokens"),
+            (None, None) => "none".into(),
+        }
+    }
+}
+
+/// Who may answer a review's questions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Answers {
+    /// A terminal, Grayboard, or `acr resume --answers`, such as an agent
+    /// relaying its user's answers: the default.
+    #[default]
+    Anyone,
+    /// A person only: a terminal's prompt, or a Grayboard reply from the
+    /// owner's human handle. `--answers` and run flags that weaken the
+    /// review are refused, unless confirmed at a terminal.
+    Person,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
     pub human_gate: Option<HumanGate>,
     pub max_rounds: Option<u32>,
+    pub reattack: Option<Reattack>,
+    /// `--spend-cap-usd`: a spend cap in dollars for this run.
+    pub spend_cap_usd: Option<f64>,
     pub review_scope: Option<ReviewScope>,
     pub bindings: BTreeMap<Role, String>,
 }
@@ -996,6 +1185,15 @@ pub struct Config {
     pub not_findings: Option<String>,
     pub human_gate: HumanGate,
     pub max_rounds: u32,
+    /// Which lenses attack again after a fix; None until someone chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reattack: Option<Reattack>,
+    /// Who may answer the review's questions.
+    #[serde(default)]
+    pub answers: Answers,
+    /// The review's spend cap, if one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<SpendCap>,
     pub always_escalate: Vec<String>,
     pub review_scope: ReviewScope,
     pub integrations: Integrations,
@@ -1124,6 +1322,11 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
     let flag_layer = Policy {
         human_gate: flags.human_gate,
         max_rounds: flags.max_rounds,
+        reattack: flags.reattack,
+        spend_cap: flags.spend_cap_usd.map(|usd| SpendCap {
+            usd: Some(usd),
+            tokens: None,
+        }),
         review_scope: flags.review_scope,
         bindings: flags.bindings.clone(),
         ..Policy::default()
@@ -1144,6 +1347,9 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         not_findings: merged.not_findings,
         human_gate: merged.human_gate.expect("set by the framework"),
         max_rounds: merged.max_rounds.expect("set by the framework"),
+        reattack: merged.reattack,
+        answers: merged.answers.unwrap_or_default(),
+        spend_cap: merged.spend_cap,
         always_escalate: merged.always_escalate.unwrap_or_default(),
         review_scope: merged.review_scope.expect("set by the framework"),
         integrations: merged.integrations.unwrap_or_default(),
@@ -1455,6 +1661,34 @@ impl Config {
     /// that a person can decide: a time budget, or a fallback from before.
     pub fn time_notes(&self) -> Vec<String> {
         let mut out = Vec::new();
+        // An easy group's blockers are at or below `max_severity`; if no
+        // lens blocks at any severity that low, no group can be easy.
+        if let Some(f) = &self.savings.fixer {
+            let can = self.lenses.iter().any(|l| {
+                [
+                    Severity::Critical,
+                    Severity::High,
+                    Severity::Medium,
+                    Severity::Low,
+                ]
+                .into_iter()
+                .filter(|s| *s >= f.max_severity)
+                .any(|s| {
+                    matches!(
+                        self.action(l, s),
+                        Action::Blocks | Action::BlocksUnlessWaived
+                    )
+                })
+            });
+            if !can {
+                out.push(format!(
+                    "savings.fixer routes no fix to {}: its max_severity, {:?}, is below every \
+                     severity that blocks here, so every group is hard. Raise max_severity, or \
+                     have a severity that low block in a lens",
+                    f.binding, f.max_severity
+                ));
+            }
+        }
         for (name, b) in self.chosen_bindings() {
             if b.fallback.is_some() {
                 out.push(format!(
@@ -1564,6 +1798,12 @@ impl Config {
         let Some(f) = self.savings.fixer.as_ref() else {
             return Ok(None);
         };
+        if f.max_severity == Severity::Critical {
+            bail!(
+                "savings.fixer: max_severity can't be Critical: a Critical blocker always goes to \
+                 the Orchestrator's binding"
+            );
+        }
         let name = &f.binding;
         let binding = self.allowed_bindings.get(name).with_context(|| {
             format!("savings.fixer: binding {name} isn't in your allowed_bindings")
@@ -1942,6 +2182,27 @@ mod tests {
         assert_eq!(rate("small", small), Some(9.0), "by its name first");
         let medium = &cfg.allowed_bindings["medium"];
         assert_eq!(rate("medium", medium), Some(2.0));
+        // A binding's tools and its MCP servers' are what a call may use;
+        // anything else its model reached for is said, in any case.
+        let held = Binding {
+            tools: Some(vec!["read".into(), "bash".into()]),
+            mcp: Some(vec!["docs".into()]),
+            ..large.clone()
+        };
+        let used: Vec<String> = [
+            "read",
+            "Bash",
+            "mcp__docs__search",
+            "sk_context-slack_query",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(held.unnamed(&used), ["sk_context-slack_query"]);
+        let open = Binding {
+            tools: None,
+            ..large.clone()
+        };
+        assert!(open.unnamed(&used).is_empty(), "no list, nothing to say");
         let mine = Binding {
             input_per_mtok: Some(2.0),
             output_per_mtok: Some(3.0),
@@ -2130,6 +2391,86 @@ mod tests {
     }
 
     #[test]
+    fn a_fixer_whose_max_severity_no_blocker_reaches_is_said_to_route_nothing() {
+        let mut user = parse_user(USER).unwrap();
+        user.allowed_bindings.get_mut("small").unwrap().writes = true;
+        let repo = |extra: &str| {
+            format!(
+                "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
+                 lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}{extra}}}]\n\
+                 savings: {{fixer: {{binding: small, max_severity: Medium}}}}\n"
+            )
+        };
+        let at_defaults =
+            resolve(&user, parse_repo(&repo("")).unwrap(), &Flags::default()).unwrap();
+        assert!(
+            at_defaults
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("savings.fixer routes no fix to small")),
+            "{:?}",
+            at_defaults.time_notes()
+        );
+        // At the default, High, every High blocker can be easy.
+        let high = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n\
+                    savings: {fixer: {binding: small}}\n";
+        let by_default = resolve(&user, parse_repo(high).unwrap(), &Flags::default()).unwrap();
+        assert!(
+            !by_default
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("routes no fix"))
+        );
+        let medium_blocks = resolve(
+            &user,
+            parse_repo(&repo(", severity: {Medium: blocks}")).unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        assert!(
+            !medium_blocks
+                .time_notes()
+                .iter()
+                .any(|n| n.contains("routes no fix"))
+        );
+    }
+
+    #[test]
+    fn what_a_runs_flags_make_weaker_than_its_config_is_said() {
+        let user = parse_user(USER).unwrap();
+        let repo = "version: 1\nhuman_gate: in-the-loop\nmax_rounds: 3\nreattack: all\n\
+                    tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let own = resolve(&user, parse_repo(repo).unwrap(), &Flags::default()).unwrap();
+        assert!(weakened(&own, &own).is_empty(), "no flags, nothing weaker");
+        let flags = Flags {
+            human_gate: Some(HumanGate::Exception),
+            max_rounds: Some(1),
+            reattack: Some(Reattack::Blocked),
+            bindings: BTreeMap::from([(Role::Judge, "small".to_string())]),
+            ..Flags::default()
+        };
+        let run = resolve(&user, parse_repo(repo).unwrap(), &flags).unwrap();
+        let said = weakened(&own, &run).join("; ");
+        for part in [
+            "--human-gate exception, where its config asks at more points (in-the-loop)",
+            "--max-rounds 1, under its config's 3",
+            "--reattack blocked, where its config re-attacks with every lens",
+            "--binding judge=small",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        // A gate that asks more, or more rounds, isn't weaker.
+        let more = Flags {
+            max_rounds: Some(5),
+            ..Flags::default()
+        };
+        let stronger = resolve(&user, parse_repo(repo).unwrap(), &more).unwrap();
+        assert!(weakened(&own, &stronger).is_empty());
+    }
+
+    #[test]
     fn the_published_schema_covers_every_key() {
         let schema: serde_json::Value = serde_json::from_str(SCHEMA).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -2147,6 +2488,9 @@ mod tests {
             not_findings: Some(String::new()),
             human_gate: Some(HumanGate::Ends),
             max_rounds: Some(1),
+            reattack: Some(Reattack::All),
+            answers: Some(Answers::Person),
+            spend_cap: Some(SpendCap::default()),
             always_escalate: Some(Vec::new()),
             review_scope: Some(ReviewScope::WholePr),
             integrations: Some(Integrations::default()),

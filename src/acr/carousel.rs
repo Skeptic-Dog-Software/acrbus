@@ -9,11 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::config::{Action, Config, Severity};
+use super::config::{Action, Config, Reattack, Severity};
 use super::configure::{Feedback, Kept, Verdict};
 use super::flow::{
     About, Finding, FindingState, Fixer, FlagState, Gate, Outcome, Reported, Run, Stage, Status,
@@ -45,6 +45,10 @@ const NOTHING: &str = "Nothing missed";
 const NOT_NOW: &str = "Not now";
 const NONE: &str = "None of them";
 const SESSION: &str = "This session";
+const ONLY_BLOCKED: &str = "Only lenses with blockers";
+const RAISE_CAP: &str = "Raise the cap";
+const NO_CAP: &str = "Go on without a cap";
+const EVERY_LENS: &str = "Every lens";
 const ORCHESTRATOR: &str = "The Orchestrator";
 const KEEP_THEM: &str = "Keep them";
 
@@ -72,6 +76,8 @@ enum Topic {
     Escalation(usize),
     Scope,
     Fixer,
+    /// Which lenses attack again after a fix, when nothing chose it.
+    Reattack,
     Blocker {
         lens: String,
         id: String,
@@ -89,7 +95,9 @@ impl Topic {
     /// should block is: an answer left out would keep them logged, and a
     /// review could end confirmed with a person's choice to block lost.
     fn required(&self) -> bool {
-        !matches!(self, Topic::Missed)
+        // Left unanswered, re-attack keeps its default, and the report says
+        // nobody chose.
+        !matches!(self, Topic::Missed | Topic::Reattack)
     }
 }
 
@@ -211,6 +219,60 @@ fn who(run: &Run) -> &'static str {
     }
 }
 
+/// A spend cap a person typed: dollars, such as `$20`, or tokens, such as
+/// `3000000 tokens`.
+fn new_cap(text: &str) -> Result<super::config::SpendCap> {
+    let t = text.trim().to_lowercase();
+    let number: String = t
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let n: f64 = number
+        .parse()
+        .ok()
+        .filter(|n: &f64| n.is_finite() && *n > 0.0)
+        .with_context(|| {
+            format!("{text:?} isn't a spend cap: say one such as $20 or 3000000 tokens")
+        })?;
+    Ok(if t.contains("token") {
+        super::config::SpendCap {
+            usd: None,
+            tokens: Some(n as u64),
+        }
+    } else {
+        super::config::SpendCap {
+            usd: Some(n),
+            tokens: None,
+        }
+    })
+}
+
+/// Which lenses attack again after each fix: an intensity, asked when the
+/// config and the run's flags leave it unsaid.
+fn reattack_question(run: &Run) -> Question {
+    let lenses = run.lenses.len();
+    question(
+        "Re-attack",
+        format!(
+            "After each fix, which of the {lenses} lens(es) attack the new version? Set \
+             `reattack` in the config to stop being asked."
+        ),
+        vec![
+            choice(
+                ONLY_BLOCKED,
+                "The default. A lens that passed isn't attacked again: later rounds cost less, \
+                 and a fix that breaks what a passed lens covers can go unseen",
+            ),
+            choice(
+                EVERY_LENS,
+                "Every lens attacks every fixed version, so a fix that breaks another lens is \
+                 caught; each round after a fix costs about as much as the first",
+            ),
+        ],
+        false,
+    )
+}
+
 /// Who folds in what a review upholds: the default first, and marked, so
 /// the answer most people give is the one at hand.
 fn fixer(run: &Run) -> Question {
@@ -274,6 +336,12 @@ fn asked(run: &Run, cfg: &Config) -> Vec<Asked> {
                 out.push(Asked {
                     topic: Topic::Fixer,
                     question: fixer(run),
+                });
+            }
+            if run.reattack.is_none() {
+                out.push(Asked {
+                    topic: Topic::Reattack,
+                    question: reattack_question(run),
                 });
             }
         }
@@ -465,6 +533,19 @@ fn escalation(run: &Run, reason: &str, about: Option<&About>) -> Question {
                     "Fold in its blockers and attack the fix once more",
                 ),
                 choice(STOP, "End here, with the blockers open"),
+            ],
+            false,
+        ),
+        Some(About::SpendCap) => question(
+            "Spend cap",
+            format!("{reason}. No new call starts until you say."),
+            vec![
+                choice(
+                    RAISE_CAP,
+                    "Say the new cap in your own words instead, such as $20 or 3000000 tokens",
+                ),
+                choice(NO_CAP, "The review goes on with no cap"),
+                choice(STOP, "End the review here"),
             ],
             false,
         ),
@@ -784,6 +865,15 @@ pub fn ask(run: &Run, cfg: &Config, app: &str) -> Ask {
         ),
         _ => format!("Review {id} isn't waiting for anyone."),
     };
+    // Every gate says it, so whoever answers knows what they answer for.
+    let summary = if run.weakened.is_empty() {
+        summary
+    } else {
+        format!(
+            "{summary} This review runs weaker than its config: {}.",
+            run.weakened.join("; ")
+        )
+    };
     Ask {
         run: id.clone(),
         gate: run.waiting.map(Gate::as_str),
@@ -953,10 +1043,13 @@ pub fn apply(
         );
     }
     // Free text only means something where a question says what it does.
+    let says_what = |topic: &Topic| {
+        matches!(topic, Topic::Blocker { .. } | Topic::Missed)
+            || matches!(topic, Topic::Escalation(n)
+                if run.escalations.get(*n).and_then(|e| e.about.as_ref()) == Some(&About::SpendCap))
+    };
     for (topic, q, pick) in &picks {
-        if let (Some(Picked::Other(text)), false) =
-            (pick, matches!(topic, Topic::Blocker { .. } | Topic::Missed))
-        {
+        if let (Some(Picked::Other(text)), false) = (pick, says_what(topic)) {
             let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
             bail!(
                 "\"{text}\" doesn't answer [{}] {}: choose one of {}",
@@ -1028,6 +1121,16 @@ pub fn apply(
                         Stage::Fix
                     };
                 }
+                Some(About::SpendCap) if chose(pick, NO_CAP) => run.spend_cap = None,
+                Some(About::SpendCap) if !stop => {
+                    let Some(Picked::Other(text)) = pick else {
+                        bail!(
+                            "say the new spend cap in your own words, such as $20 or 3000000 \
+                             tokens, or go on without one"
+                        );
+                    };
+                    run.spend_cap = Some(new_cap(text)?);
+                }
                 Some(About::Unfixed) if chose(pick, AGAIN) => run.stage = Stage::Fix,
                 Some(About::Unfixed) if chose(pick, SESSION) => {
                     run.fixer = Fixer::Session;
@@ -1047,6 +1150,8 @@ pub fn apply(
             }
             Topic::Fixer if chose(pick, SESSION) => run.fixer = Fixer::Session,
             Topic::Fixer if chose(pick, ORCHESTRATOR) => run.fixer = Fixer::Orchestrator,
+            Topic::Reattack if chose(pick, ONLY_BLOCKED) => run.reattack = Some(Reattack::Blocked),
+            Topic::Reattack if chose(pick, EVERY_LENS) => run.reattack = Some(Reattack::All),
             Topic::Blocker { id, .. } => {
                 let waivable =
                     finding(run, id).is_some_and(|(_, f)| f.action == Action::BlocksUnlessWaived);

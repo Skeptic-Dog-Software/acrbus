@@ -363,9 +363,43 @@ fn stem(path: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
+/// A test file, by where it is or what it's named, in the common
+/// languages' ways: a folder such as `tests/` or `__tests__/`, or a name
+/// such as `test_x.py`, `x_test.go`, `x.test.ts`, `x.spec.js` or
+/// `XTest.java`. Not any path with "test" in it: `latest.rs` isn't one.
 fn is_test_path(path: &str) -> bool {
-    let p = path.to_ascii_lowercase();
-    p.contains("test") || p.contains("spec")
+    let mut parts: Vec<&str> = path.split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    let in_tests = parts.iter().any(|d| {
+        let d = d.to_ascii_lowercase();
+        matches!(
+            d.as_str(),
+            "test"
+                | "tests"
+                | "spec"
+                | "specs"
+                | "__tests__"
+                | "testdata"
+                | "test_data"
+                | "testing"
+        ) || d.starts_with("test_")
+            || d.ends_with("_test")
+            || d.ends_with("_tests")
+    });
+    let stem = name.split('.').next().unwrap_or(name);
+    let lower = stem.to_ascii_lowercase();
+    let dotted = name.to_ascii_lowercase();
+    let named = matches!(lower.as_str(), "test" | "tests" | "spec" | "conftest")
+        || lower.starts_with("test_")
+        || lower.ends_with("_test")
+        || lower.ends_with("_tests")
+        || lower.ends_with("_spec")
+        || stem.ends_with("Test")
+        || stem.ends_with("Tests")
+        || stem.ends_with("Spec")
+        || dotted.contains(".test.")
+        || dotted.contains(".spec.");
+    in_tests || named
 }
 
 /// A Rust file's own test modules: each top-level `#[cfg(test)]` module
@@ -1842,6 +1876,32 @@ pub fn mutation_dir(copies: &Path, lens: &str, n: u32) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_test_file_is_known_by_its_folder_or_its_name_not_any_test_in_its_path() {
+        for path in [
+            "tests/flow.rs",
+            "src/__tests__/a.js",
+            "pkg/x_test.go",
+            "test_x.py",
+            "app/x.test.ts",
+            "app/x.spec.js",
+            "src/main/java/XTest.java",
+            "test/widget_test.dart",
+            "conftest.py",
+        ] {
+            assert!(super::is_test_path(path), "{path}");
+        }
+        for path in [
+            "src/latest.rs",
+            "inspector.go",
+            "contest/main.c",
+            "docs/specification.md",
+            "src/protest.py",
+        ] {
+            assert!(!super::is_test_path(path), "{path}");
+        }
+    }
+
     use super::*;
     use crate::acr::change::tests::{commit, repo_with};
 

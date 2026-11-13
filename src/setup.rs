@@ -847,6 +847,9 @@ fn acr_bridge(
 # Allow a repository with `{APP_NAME} acr add-repo <path>`.
 [bridges.{ACR_AGENT}]
 kind = "claude"
+# Only ACR review calls: a request outside a review would run Claude Code
+# with every tool and no ACR system prompt. "any" takes others too.
+accepts = "review"
 owner = {owner}
 command = {claude}
 working_directory = {home}

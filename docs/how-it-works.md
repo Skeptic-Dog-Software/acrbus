@@ -76,9 +76,16 @@ fixer binding can take the groups of blockers rules call easy: few files,
 not severe, their cause stated, no one's call, and not recurring. Then new
 reviewers attack again, until every lens's latest round has no blocker.
 
-A review to convergence goes further. A fix for one lens can break another,
-so after each fix every lens attacks again, and the review ends only when
-every lens agrees on the same version.
+Which lenses attack after a fix is an intensity you set with `reattack`:
+`blocked`, the lenses that had blockers, or `all`, every lens, since a fix
+for one lens can break another. Left unset, the review asks at its scope
+gate, and takes `blocked` if nobody is asked there; the report says which,
+and whose choice it was. `acrbus acr plan` shows what `all` would be
+expected to cost here.
+
+A review to convergence goes further: after each fix, a steelman folds in
+the blockers and writes tests, and the review ends only when every lens
+agrees on the same version.
 
 ## You're in the loop
 
@@ -95,6 +102,21 @@ place, and the fixer is told to fix it at each place.
 
 Your verdicts, and the defects you say were missed, become feedback for the
 calibration. The rules guide; you decide.
+
+The review records where each gate's answers came from: a terminal, a
+Grayboard reply and its sender, or `acr resume --answers`. A run's flags
+that make it weaker than its repository's config, such as a gate that asks
+you less or fewer rounds, are said at its start, at every gate and in the
+report. With `answers: person` in the config, `--answers` and the decision
+flags are refused, and weakening flags need confirming at a terminal: an
+agent that runs the review can't answer for you through them. It isn't a
+wall against an agent with a shell running as you, which could type at a
+terminal or write the files acrbus reads; it closes the channels that
+don't need one.
+
+A spend cap, `spend_cap`, pauses a review once what its calls spent reaches
+it: no new call starts, calls at work finish, and you're asked to raise the
+cap, go on without it, or stop. It never cuts off a working call.
 
 ## It's sized to the change
 
@@ -207,7 +229,12 @@ only what didn't.
 
 Reviewers are told to read the code under review, not your other files,
 and nothing they do is copied back to the repository. That's guidance and
-structure, not a sandbox: an agent with a shell runs as you. A fix keeps to the source, and
+structure, not a sandbox: an agent with a shell runs as you. A pi call is
+held to the tools its binding names: any other, one a gateway added to the
+request or one the model made up, is refused, and any call's model reaching
+for a tool its binding doesn't name is said, and listed in the report. The
+host's MCP servers reach a pi call only if its binding names them. A fix
+keeps to the source, and
 every file it changes is listed: a binary, or a file none of its blockers
 points at, is put to you, to keep or revert.
 

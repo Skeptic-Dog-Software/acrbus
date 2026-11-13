@@ -114,6 +114,10 @@ pub struct RunOptions {
     /// it has made an edit, or has grown twice that size without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_after_edit: Option<bool>,
+    /// The MCP servers the call may use, by name. Left out or empty, a
+    /// bridge whose agent can turn MCP off gives it none of the host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Vec<String>>,
 }
 
 /// A file held by its hash on each bus it reaches.
@@ -228,6 +232,11 @@ pub struct RunUsage {
     /// made, not that none were counted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub counts_tools: bool,
+    /// The tools the model calls asked for, by name, and how often: what
+    /// shows a call reaching for a tool its binding doesn't name, whether
+    /// or not it ran.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tools: std::collections::BTreeMap<String, u64>,
 }
 
 /// One model call's tokens, by the agent's own record.

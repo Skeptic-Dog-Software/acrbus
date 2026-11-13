@@ -600,6 +600,10 @@ pub enum Shape {
     Findings,
     /// A Judge's ratings of the findings it was given.
     Ratings,
+    /// A mutant proposer's small breaks of the change's code.
+    Mutants,
+    /// A scout's list of what it suspects.
+    Suspects,
 }
 
 /// For a reviewer or a Judge that answered in prose, or in JSON of another
@@ -607,6 +611,11 @@ pub enum Shape {
 /// that form, adding nothing and dropping nothing, told why it couldn't be
 /// read. An answer that can't be is still unreadable.
 pub fn reformat_prompt(report: &str, shape: Shape, error: &str) -> String {
+    let key = match shape {
+        Shape::Findings | Shape::Ratings => "findings",
+        Shape::Mutants => "mutants",
+        Shape::Suspects => "suspects",
+    };
     let (who, what, form) = match shape {
         Shape::Findings => (
             "A reviewer wrote this report on a change",
@@ -628,6 +637,23 @@ pub fn reformat_prompt(report: &str, shape: Shape, error: &str) -> String {
              \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"weak_pin_test\", \
              \"misleads\", \"misleading_claim\", \"equivalent_mutant\"}]}",
         ),
+        Shape::Mutants => (
+            "An agent proposed these small breaks of a change's code, its mutants",
+            "Each break it proposes is one mutant: the file, the exact text to find, what to \
+             replace it with, why a test should catch it, and the tests it names. Add nothing \
+             it doesn't propose, and leave out none it does.",
+            "{\"mutants\": [{\"file\": \"<path>\", \"find\": \"<exact text>\", \
+             \"replace\": \"<new text>\", \"why\": \"<what should catch it>\", \"tests\": \
+             [\"<test>\"]}]}",
+        ),
+        Shape::Suspects => (
+            "A scout listed what it suspects is wrong in a change",
+            "Each thing it suspects is one suspect: a title, the file and line, what it \
+             suspects, and how to check it. Add nothing it doesn't list, and leave out none it \
+             does. If it suspects nothing, answer with an empty list.",
+            "{\"suspects\": [{\"title\": \"<one line>\", \"file\": \"<path>\", \"line\": \
+             <number>, \"claim\": \"<what's suspected>\", \"check\": \"<how to check>\"}]}",
+        ),
     };
     format!(
         "{who}, where its answer should have been one JSON object in the form below. Put it in \
@@ -635,8 +661,8 @@ pub fn reformat_prompt(report: &str, shape: Shape, error: &str) -> String {
          give what it reports, not the example. If it's cut off, or isn't such an answer, \
          answer only: unreadable.\n\n\
          Reading it as asked failed with: {error}\n\
-         The answer is one JSON object whose \"findings\" key holds a list, even an empty one: \
-         a list under another key, or no \"findings\" key at all, can't be read.\n\n\
+         The answer is one JSON object whose \"{key}\" key holds a list, even an empty one: \
+         a list under another key, or no \"{key}\" key at all, can't be read.\n\n\
          The answer:\n<<<\n{}\n>>>\n\n\
          Answer with only JSON: {form}.",
         report.trim()
@@ -651,6 +677,10 @@ pub const FINDINGS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"fi
 /// A scout's, which lists suspicions instead.
 pub const SUSPECTS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"suspects\": \
     [...]}, with the \"suspects\" key even when the list is empty.";
+
+/// A mutant proposer's: its breaks of the change's code.
+pub const MUTANTS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"mutants\": \
+    [...]}, with the \"mutants\" key even when the list is empty.";
 
 /// A Judge's: a rating for each finding, under the same key.
 pub const RATINGS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"findings\": \

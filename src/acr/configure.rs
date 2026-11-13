@@ -297,15 +297,20 @@ pub fn apply(config: &Path, at: i64) -> Result<Option<Applied>> {
         .and_then(|t| t.trim().parse().ok());
     let mut text = fs::read_to_string(&p.config)?;
     if let Ok(added) = fs::read_to_string(&p.not_findings) {
-        let file = config.with_extension("not-findings.md");
+        // Into the file the proposal's config reads them from, beside it,
+        // or else a new one it's told to read.
+        let named = config::parse_repo(&text)?.not_findings;
+        let file = match &named {
+            Some(name) => config.parent().unwrap_or(Path::new(".")).join(name),
+            None => config.with_extension("not-findings.md"),
+        };
         let mut out = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&file)
             .with_context(|| format!("adding to {}", file.display()))?;
         writeln!(out, "{}", added.trim_end())?;
-        let named = config::parse_repo(&text)?.not_findings.is_some();
-        if !named {
+        if named.is_none() {
             let name = file.file_name().unwrap_or_default().to_string_lossy();
             text = format!("{}\nnot_findings: {name}\n", text.trim_end());
         }
@@ -811,6 +816,22 @@ mod tests {
         let fake = Fake::new(&[&good]);
         propose(&fake, &u, (&name, &b), Path::new("/clone"), "review it").unwrap();
         assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_proposals_non_issues_go_to_the_file_its_config_names() {
+        let dir = scratch();
+        let config = dir.join("shop.yaml");
+        let named = format!("{}\nnot_findings: decided.md\n", GOOD.trim_end());
+        let p = read_proposal(&answer(&named)).unwrap();
+        assert!(p.not_findings.is_some());
+        save(&config, &p, None).unwrap();
+        apply(&config, 1000).unwrap().unwrap();
+        let decided = fs::read_to_string(dir.join("decided.md")).unwrap();
+        assert!(decided.contains("logging the request id"), "{decided}");
+        assert!(!dir.join("shop.not-findings.md").exists());
+        let now = fs::read_to_string(&config).unwrap();
+        assert_eq!(now.matches("not_findings:").count(), 1, "{now}");
     }
 
     #[test]
