@@ -192,6 +192,9 @@ pub struct Plan {
     pub first_round: Vec<RoleCost>,
     /// One fix by the Orchestrator, made between rounds. None with one round.
     pub fix: Option<RoleCost>,
+    /// `savings.fixer`: where easy fix groups go instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixer: Option<super::config::FixerConfig>,
     /// With every lens done in one round.
     pub least: Estimate,
     /// With each lens taking the rounds it took before here, on average.
@@ -474,7 +477,9 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         cfg.binding_name(Role::Judge, None)?,
         &judge_each,
     );
-    // A fix is told the findings, not the whole change.
+    // A fix is told the findings, not the whole change. Priced on the
+    // Orchestrator's binding, the most a group's fix costs, even where
+    // `savings.fixer` sends easy groups to a cheaper one.
     let fix = (cfg.max_rounds > 1)
         .then(|| role_cost(Role::Orchestrator, None, 1, BRIEF_TOKENS))
         .transpose()?;
@@ -553,6 +558,7 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         files: change.files.len(),
         first_round,
         fix,
+        fixer: cfg.savings.fixer.clone(),
         least,
         expected,
         history_runs: history.runs,

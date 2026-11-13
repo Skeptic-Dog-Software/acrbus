@@ -593,24 +593,68 @@ pub fn reviewer_prompt(
     join(&parts)
 }
 
-/// For a reviewer that reported in prose where it should have answered in
-/// JSON: put its report in the form asked, adding nothing and dropping
-/// nothing. A report that can't be is still unreadable.
-pub fn reformat_prompt(report: &str) -> String {
+/// The form an answer is repaired into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A reviewer's findings.
+    Findings,
+    /// A Judge's ratings of the findings it was given.
+    Ratings,
+}
+
+/// For a reviewer or a Judge that answered in prose, or in JSON of another
+/// shape, where it should have answered in the JSON asked: put its answer in
+/// that form, adding nothing and dropping nothing, told why it couldn't be
+/// read. An answer that can't be is still unreadable.
+pub fn reformat_prompt(report: &str, shape: Shape, error: &str) -> String {
+    let (who, what, form) = match shape {
+        Shape::Findings => (
+            "A reviewer wrote this report on a change",
+            "Each defect it reports is a finding: its title, the evidence it gives as the \
+             detail, and the file and line if it names them. Add nothing it doesn't say, and \
+             leave out nothing it reports as wrong. If it reports nothing wrong, answer with an \
+             empty list.",
+            "{\"findings\": [{\"title\": \"<one line>\", \"detail\": \"<the evidence>\", \
+             \"file\": \"<path>\", \"line\": <number>}]}",
+        ),
+        Shape::Ratings => (
+            "A Judge wrote this ruling on a change's findings",
+            "Each finding it rules on is one rating: its title, file and line as it gives them, \
+             the severity it gives (Critical, High, Medium, Low or Rejected), and each fact it \
+             states, under the key for it below. Add nothing it doesn't say, and leave out \
+             nothing it rules on.",
+            "{\"findings\": [{\"title\", \"detail\", \"file\", \"line\", \"severity\", \
+             \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \"sides\", \
+             \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"weak_pin_test\", \
+             \"misleads\", \"misleading_claim\", \"equivalent_mutant\"}]}",
+        ),
+    };
     format!(
-        "A reviewer wrote this report on a change, where its answer should have been one JSON \
-         object. Put it in that form. Each defect it reports is a finding: its title, the \
-         evidence it gives as the detail, and the file and line if it names them. Add nothing \
-         it doesn't say, and leave out nothing it reports as wrong. If it reports nothing \
-         wrong, answer with an empty list. If it holds more than one list, such as an \
-         example before its own, give what it reports, not the example. If the report is cut \
-         off, or isn't a reviewer's report, answer only: unreadable.\n\n\
-         The report:\n<<<\n{}\n>>>\n\n\
-         Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
-         \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}.",
+        "{who}, where its answer should have been one JSON object in the form below. Put it in \
+         that form. {what} If it holds more than one list, such as an example before its own, \
+         give what it reports, not the example. If it's cut off, or isn't such an answer, \
+         answer only: unreadable.\n\n\
+         Reading it as asked failed with: {error}\n\
+         The answer is one JSON object whose \"findings\" key holds a list, even an empty one: \
+         a list under another key, or no \"findings\" key at all, can't be read.\n\n\
+         The answer:\n<<<\n{}\n>>>\n\n\
+         Answer with only JSON: {form}.",
         report.trim()
     )
 }
+
+/// The form of a reviewer's answer, said again at the very end of its
+/// prompt, after everything its calls share.
+pub const FINDINGS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"findings\": \
+    [...]}, with the \"findings\" key even when the list is empty.";
+
+/// A scout's, which lists suspicions instead.
+pub const SUSPECTS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"suspects\": \
+    [...]}, with the \"suspects\" key even when the list is empty.";
+
+/// A Judge's: a rating for each finding, under the same key.
+pub const RATINGS_REMINDER: &str = "\n\nYour answer: only the JSON object {\"findings\": \
+    [...]}, one rating with its \"severity\" for each finding you were given.";
 
 /// What marks a handoff's answer: acrbus's pi extension puts it first, on a
 /// line of its own, once a session runs out of room.

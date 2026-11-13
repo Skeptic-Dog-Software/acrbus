@@ -70,7 +70,9 @@ tests.
 
 After a round with blockers, the blockers you choose are fixed. Either the
 session that started the review fixes them, since it holds the change's
-context, or the Orchestrator does, if its binding may write. Then new
+context, or the Orchestrator does, if its binding may write. A cheaper
+fixer binding can take the groups of blockers rules call easy: few files,
+not severe, their cause stated, no one's call, and not recurring. Then new
 reviewers attack again, until every lens's latest round has no blocker.
 
 A review to convergence goes further. A fix for one lens can break another,
@@ -112,8 +114,9 @@ That order is what makes it cheap. The provider's prompt cache serves the
 shared part to every call after the first, and each round after the first
 keeps the previous round's file sections where they were, with what a fix
 changed after them, so it shares the previous round's map through every
-file. A role's first call warms the cache before the rest start, and a
-keep-alive refreshes a prefix still in use before it could be evicted, never
+file. A role's first call warms the cache before the rest start, which then
+start a few seconds apart, so a burst of new sessions isn't spread over
+replicas that don't hold the prefix, and a keep-alive refreshes a prefix still in use before it could be evicted, never
 sending another while the last is still going. A fix goes in groups, each a
 fresh session from the same opening with only its own blockers, rather than
 one session that grows with every blocker.
@@ -184,12 +187,20 @@ tried again. Stopping a review stops its calls, and its usage still counts
 every call that finished, in a round marked as unfinished. A failed reviewer or Judge is never taken for a
 clean pass, and a lens with nothing for its Judge says so.
 
-A reviewer that answers in prose instead of the form asked has its report
-put in form by a quick call, adding and dropping nothing. If even that
-can't be read, the reviewer gave no answer, so it's asked again once, in a
-fresh session; for a scouted lens, that's the one check that gave none. A
-second that's no better fails the lens, which is asked about at the gate.
-Whatever a failed session used is counted with its round.
+A reviewer or Judge that answers in another form than asked has its
+answer put in form by a quick call, told why it couldn't be read, adding
+and dropping nothing. Every unit of work that still comes back unusable,
+whose run failed or lost its requests, or that did no work, is restarted
+once, in a fresh session with the same inputs: a reviewer, a prober in a
+fresh copy, a scout or one of its checks, a Judge, a first pass, a fix. A
+restart that fails too is asked about at the gate, with both reasons.
+Whatever a failed session used is counted with its round, and restarts
+apart from the rest.
+
+When the calls in flight can't reach their model together, an outage, the
+round pauses instead of restarting each: what its units finished is kept
+as they finish, the review is saved, and `acrbus acr resume` goes on with
+only what didn't.
 
 ## Reviewers stay in their lane
 

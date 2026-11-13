@@ -189,6 +189,7 @@ code says how it ended:
 | 1 | It ended with lenses open. | Its last line says why. Fix the blockers and review again. |
 | 3 | It's waiting for you at a scope, fold, fix or final gate. | `acrbus acr ask <id>`, then answer: below. |
 | 4 | It's waiting for a person on an escalation. | Read it, then go on or stop. |
+| 5 | An outage paused it: its calls couldn't reach their model. It's saved, with what its round finished. | Once the model is reachable, `acrbus acr resume <id>`: it goes on, running only what didn't finish. |
 
 **Answering a review.** A review that waits for you asks questions.
 `acrbus acr ask <id>` prints them as question carousels, in the JSON shape
@@ -416,7 +417,8 @@ Things that matter for an agent other than Claude Code:
 | the doctor: the bridge's crate cache lacks the crates | Run the `cargo fetch` it gives, once, with the network. |
 | exit 3 or 4 | The review is waiting for you: `acrbus acr ask <id>` says what it asks; see the gates in step 8. |
 | exit 1 | Its last line says what's left: fix it and review again. |
-| a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
+| exit 5, "gateway unreachable: saved" | Its calls couldn't reach their model. When they can, `acrbus acr resume <id>` goes on from where the round paused. |
+| a role's answer "didn't work either" | Its model answered in a form even a second call couldn't read, so it was restarted fresh once, and "came back unusable twice" says that failed too. If its agent can't read the attached change, set `attachments = "inline"` in its bridge; otherwise try a stronger binding. |
 | a review must stop now | `acrbus acr stop <id>`: it stops the process running it, cancels its calls, ends it and lists what it left. |
 | was the cache warm? | Progress says, as each call answers, what its first turn read from the cache, such as `first turn 36.8k of 37.0k from cache`, and `acrbus acr usage <id>` lists every call's first turn. A pi call's log (`acrbus bridge log <agent> <id> --stderr`) has an `acrbus cache:` line per turn. A cache-write column that reads 0 everywhere says nothing: some providers don't report writes. Each turn's line also counts its tool calls, by name. |
 | did the provider's cache let us down? | Where a turn was billed fresh for what the turn before had just sent, or a call after its fan-out's first found the opening uncached, `acrbus acr usage <id>` adds a cache-adjusted cost beside the billed one: the tokens the provider should have read from its cache, repriced at its cached rate. It's derived, not billed, and it lets two runs at different times be compared despite the provider's luck. |
