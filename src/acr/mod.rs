@@ -1637,11 +1637,13 @@ impl Caller for BridgeCaller {
         if answered {
             return Some(true);
         }
-        // Its agent records a turn's tokens once the turn is done: by then,
-        // the provider has cached what it read.
+        // Its agent records a turn's tokens once the turn is done, and acrbus's
+        // pi extension logs it as it ends: by then, the provider has cached
+        // what it read.
         Some(matches!(
             crate::bridge::standing(&self.paths, &bridge, &id),
-            crate::bridge::Standing::Running { tokens: Some(t), .. } if t.input + t.cache_read + t.cache_write > 0
+            crate::bridge::Standing::Running { tokens: Some(t), .. }
+                if t.turns > 0 || t.input + t.cache_read + t.cache_write > 0
         ))
     }
 
@@ -2283,6 +2285,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     let summary = report::report(run, cfg);
     for line in summary.by_role.iter().map(report::RoleUsage::line) {
         eprintln!("{APP_NAME}: {line}");
+    }
+    if summary.by_role.iter().any(|r| r.shortfall > 0) {
+        eprintln!("{APP_NAME}: ({})", report::ADJUSTED_IS);
     }
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
@@ -2956,15 +2961,45 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let firsts = report::first_turns(&run.usage);
             let unreported = report::writes_unreported(&run.usage);
             let sessions = report::sessions(&run.usage);
+            let adj = report::adjusted(&run.usage);
+            let shortfall: u64 = adj.iter().map(|a| a.shortfall).sum();
+            let billed: f64 = run.usage.iter().filter_map(|u| u.usd).sum();
+            let cost_adjusted: Option<f64> = adj
+                .iter()
+                .zip(&run.usage)
+                .map(|(a, u)| {
+                    if a.shortfall == 0 {
+                        Some(u.usd.unwrap_or(0.0))
+                    } else {
+                        a.usd
+                    }
+                })
+                .sum();
             if json {
                 // Each session of a call broken up, as its own call.
                 let parts: Vec<&flow::Usage> =
                     run.usage.iter().filter(|u| u.part.is_some()).collect();
+                let calls: Vec<serde_json::Value> = run
+                    .usage
+                    .iter()
+                    .zip(&adj)
+                    .map(|(u, a)| {
+                        serde_json::json!({
+                            "round": u.round, "role": u.role, "call": u.label,
+                            "cost": u.usd, "cost_adjusted": a.usd,
+                            "cache_shortfall_tokens": a.shortfall,
+                            "turns": u.turns, "tool_calls": u.tool_calls,
+                        })
+                    })
+                    .collect();
                 let out = serde_json::json!({
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
                     "sessions": sessions, "session_calls": parts,
+                    "calls": calls, "cost": billed, "cost_adjusted": cost_adjusted,
+                    "cache_shortfall_tokens": shortfall,
+                    "cost_adjusted_is": report::ADJUSTED_IS,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -2988,6 +3023,17 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 for line in report::session_lines(&run.usage) {
                     println!("{line}");
+                }
+                if shortfall > 0 {
+                    println!(
+                        "in all: ${billed:.3} billed; {}; {shortfall} tokens billed fresh that \
+                         the provider should have read cached",
+                        cost_adjusted.map_or_else(
+                            || "no cache-adjusted figure (no cached price to go by)".to_string(),
+                            |d| format!("${d:.3} cache-adjusted")
+                        )
+                    );
+                    println!("({})", report::ADJUSTED_IS);
                 }
                 if run.usage.iter().any(|u| u.label.is_none()) {
                     println!(

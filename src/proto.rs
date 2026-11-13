@@ -203,6 +203,22 @@ pub struct RunUsage {
     /// from a prompt cache, which says whether a warm-up worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_turn: Option<TurnUsage>,
+    /// Tokens a turn was billed fresh though the turn before it had just
+    /// sent them: what the provider's cache should have served, and didn't.
+    /// Counted within a session, from its second turn on.
+    #[serde(default)]
+    pub cache_shortfall_tokens: u64,
+    /// What the agent says the fresh input and the input read from a cache
+    /// cost, in US dollars, when it splits its cost: what gives the rates
+    /// a shortfall is repriced at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_cache_read: Option<f64>,
+    /// The tool calls the model calls made: with `calls`, how many each
+    /// turn asked for at once.
+    #[serde(default)]
+    pub tool_calls: u64,
 }
 
 /// One model call's tokens, by the agent's own record.

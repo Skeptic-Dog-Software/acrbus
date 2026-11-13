@@ -274,6 +274,20 @@ export default function acrbus(pi) {
       if (turns) {
         const how = [];
         if (message.stopReason) how.push(`stop ${plain(message.stopReason) ?? "?"}`);
+        // The tool calls it asked for at once, by name: what shows batching.
+        const calls = Array.isArray(message.content)
+          ? message.content.filter((c) => c?.type === "toolCall")
+          : [];
+        const byName = new Map();
+        for (const c of calls) {
+          const name = plain(c.name) ?? "?";
+          byName.set(name, (byName.get(name) ?? 0) + 1);
+        }
+        how.push(
+          calls.length === 0
+            ? "tools 0"
+            : `tools ${calls.length} (${[...byName].map(([n, k]) => `${n} ${k}`).join(", ")})`,
+        );
         if (requestAt !== null) how.push(`${((Date.now() - requestAt) / 1000).toFixed(1)}s`);
         if (message.errorMessage) how.push(`error: ${oneLine(message.errorMessage)}`);
         unanswered = f.prompt === 0 && f.out === 0;

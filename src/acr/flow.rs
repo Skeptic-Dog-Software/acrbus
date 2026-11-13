@@ -449,6 +449,30 @@ pub struct Usage {
     /// "scout", or "verify 3".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+    /// Tokens a turn was billed fresh though its session's turn before had
+    /// just sent them, from its second turn on: what the provider should
+    /// have served from its cache. Its first turn's share is the report's.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_shortfall: u64,
+    /// What its agent says the fresh input and the cached input cost, when
+    /// it splits its cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_cache_read: Option<f64>,
+    /// The config's price, as dollars a token for fresh input and for input
+    /// read from a cache, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_rates: Option<[f64; 2]>,
+    /// Its model calls, and the tool calls they made.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub turns: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tool_calls: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Whose answer a repair put in form: its role, binding and model.
@@ -937,10 +961,27 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         call: None,
         first_turn: None,
         part: None,
+        cache_shortfall: 0,
+        usd_input: None,
+        usd_cache_read: None,
+        price_rates: None,
+        turns: 0,
+        tool_calls: 0,
     };
     match &answer.usage {
         Some(counted) => {
             usage.first_turn = counted.first_turn;
+            usage.cache_shortfall = counted.cache_shortfall_tokens;
+            usage.usd_input = counted.usd_input;
+            usage.usd_cache_read = counted.usd_cache_read;
+            usage.turns = counted.calls;
+            usage.tool_calls = counted.tool_calls;
+            usage.price_rates = cfg.price(call.binding_name, call.binding).map(|p| {
+                [
+                    p.input_per_mtok / 1e6,
+                    p.cached_input_per_mtok.unwrap_or(p.input_per_mtok) / 1e6,
+                ]
+            });
             usage.tokens_in = counted.input_tokens;
             usage.cache_read = counted.cache_read_tokens;
             usage.cache_write = counted.cache_write_tokens;
@@ -10592,6 +10633,7 @@ lenses:
         let opening = fixes[0].find("# The blockers").unwrap();
         assert_eq!(fixes[0][..opening], fixes[1][..opening]);
         assert!(fixes[0][..opening].contains(roles::FIX_SCOPE));
+        assert!(fixes[0][..opening].contains(roles::FIX_TESTS));
         drop(calls);
         let told = fake.told.lock().unwrap();
         assert!(told.contains(&"call: the Orchestrator, fixing group 1 of 2: 2 blocker(s)".into()));
