@@ -70,22 +70,39 @@ Code: src/acr/config.rs::Binding; src/acr/config.rs::Config | Config: allowed_bi
 
 ## Compared with other approaches
 
-### How is this different from a single-pass review skill?
+### How is this different from a review skill scoped to each change?
 
-A single-pass skill is one agent with a scoped prompt. In one context, the
-same model finds a problem, judges it, decides when it's done, and reports
-whether it ran the tests. acrbus holds each of those apart in code:
+A scoped skill decides, for this change, what to review, how deeply and in
+what steps. It can run several agents, a judging step and the tests. That
+fit is its strength: nothing is spent on what the change doesn't need, a
+review can take a shape no fixed method would, and for most changes it's
+enough. It needs nothing installed.
 
-- a fresh session for each lens's reviewers, sharing nothing;
-- a separate Judge, whose facts fixed rules turn into a ruling;
-- new reviewers attacking again after a fix, round by round;
-- the change's tests, coverage and mutants run by acrbus itself, where its
-  stages are on.
+acrbus fits the review in other places: the repository's calibrated config
+sets the lenses and what blocks in each, the tier sizes the review to the
+change, and the builder's brief points each lens at what matters in it.
+What differs is what code enforces, where a skill can only ask:
 
-A skill is cheaper, needs nothing installed and adapts to each change. ACR
-is for changes where a miss costs more than the review.
+- **What blocks.** A separate Judge states facts about each finding, and
+  fixed rules in code turn them into a ruling. In a skill, the ruling is a
+  model's judgment, however its steps are arranged.
+- **When it's done.** acrbus attacks again after each fix until no lens has
+  a blocker, up to the round cap. In a skill, the session decides when it
+  has done enough.
+- **The tests.** With its stages on, acrbus runs the change's tests,
+  coverage and mutants itself. In a skill, which tests run is the model's
+  choice, and its report is what you see.
+- **Comparability.** acrbus's method is the same on every change, so
+  `acrbus acr trial` can measure a change to a lens, a model or acrbus
+  itself. A review designed for each change differs each time, which is its
+  point, and which makes two reviews harder to compare.
+- **Models.** A skill runs in its harness, with the models that harness
+  calls. acrbus binds each role to any harness on its bus, so one review can
+  mix model families (see [Why does acrbus need a bus?](#why-does-acrbus-need-a-bus)).
 
-Code: src/bridge.rs::SessionMode; src/acr/flow.rs::rate; src/acr/flow.rs::ruling; src/acr/stages.rs::run_gate | Config: stages | Tests: fresh_sessions_share_nothing, rules_decide_what_blocks_from_the_judges_facts, the_changes_tests_are_run_other_ways_and_a_failure_is_a_finding
+ACR is for changes where a miss costs more than the review.
+
+Code: src/acr/flow.rs::ruling; src/acr/flow.rs::rate; src/acr/flow.rs::settle; src/acr/stages.rs::run_gate; src/acr/flow.rs::choose_tier; src/acr/config.rs::Binding | Config: lenses, tiers, max_rounds, stages | CLI: acrbus acr trial | Tests: rules_decide_what_blocks_from_the_judges_facts, only_lenses_with_blockers_are_attacked_again_by_new_reviewers, the_changes_tests_are_run_other_ways_and_a_failure_is_a_finding, a_lens_can_have_its_own_binding
 
 ### acrbus ships an ACR skill. How does it relate?
 
@@ -117,6 +134,10 @@ can read the questions with `acr ask`, answer with `acr resume --answers`,
 and read the report as JSON. With `--human-gate exception`, only
 escalations stop it.
 
+Whether it should is the designer's call. A fixed step gives up some of the
+freedom a workflow designed for each change is for, in exchange for rulings
+made the same way on every change.
+
 Code: src/acr/mod.rs::WAITING; src/acr/mod.rs::ESCALATED; src/acr/mod.rs::OUTAGE; src/acr/config.rs::HumanGate; src/acr/report.rs::Report | CLI: acrbus acr run --human-gate, acrbus acr ask --text, acrbus acr resume --answers, acrbus acr usage --json, acrbus acr plan --json | Tests: the_report_can_be_read_by_a_machine, always_escalate_reaches_a_person_whatever_the_gate
 
 ### Isn't a fixed method rigid?
@@ -135,6 +156,27 @@ what makes two reviews comparable.
 Code: src/acr/flow.rs::choose_tier; src/acr/flow.rs::choose_lenses; src/acr/flow.rs::ruling | Config: tiers, lenses, max_rounds | Tests: lenses_come_from_their_triggers, a_tier_can_require_a_lens, only_lenses_with_blockers_are_attacked_again_by_new_reviewers
 
 ## The bus, the daemon, bridges and doors
+
+### Why does acrbus need a bus?
+
+So that every role can be a different agent. A review's calls don't go to
+one model's API: each goes as a request to the agent its binding names,
+`name@machine`, and a bridge runs that agent's CLI headless and replies.
+Claude Code, pi and omp each have a bridge kind, and any other agent CLI
+works with a table of its own. So one review can put its reviewers on one
+model family, a lens on another and its Judge on a third, each in the
+harness it runs best in. Adding a model or a harness is a bridge and a
+binding, with no change to acrbus.
+
+It's a harness, not a bare API call, because reviewers need tools: they
+read the code, search it and run it. The bus also gives each call what a
+review relies on: a fresh session in an environment of its own, a limit on
+how many run at once, a stalled run ended and tried again, calls cancelled
+when a review stops, the usage each call reports, and a kept record of each
+run. Doors let an agent in another OS account take part, and a program built
+on acrbus can carry the same bus between machines.
+
+Code: src/acr/mod.rs::BridgeCaller; src/acr/mod.rs::stops_calls; src/acr/config.rs::Binding; src/bridge.rs::Kind; src/bridges/claude.toml; src/bridges/pi.toml; src/bridges/omp.toml; src/bridge.rs::Settings; src/proto.rs::RunUsage; src/door.rs::serve | Config: allowed_bindings, lenses.binding, kind, max_concurrent | CLI: acrbus bridge install | Tests: a_lens_can_have_its_own_binding, sends_stdout_as_the_reply_from_an_environment_of_its_own, keeps_to_the_limit_on_runs_at_once, an_abandoned_run_is_tried_again_and_can_still_answer, each_run_is_logged_under_its_id
 
 ### What is the bus?
 
