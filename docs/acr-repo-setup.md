@@ -490,18 +490,25 @@ what they already found, not to be reported again. It may hand off in turn.
 The call's answer is every session's findings, each once.
 
 The Orchestrator's fix relays the same way, each group of a fix in groups
-on its own: the fixer stops and says what it changed so far and what's left,
-and a fresh session gets the fix's own brief, then what the earlier sessions
-changed, which is in the checkout already, and what's left to fix. The fix's
-answer is every session's, in order. A steelman relays too.
+on its own, with two differences. Its size is what the session's prompt grew
+since its own first turn, not the prompt itself, whose opening was there
+before it did anything; and it hands off only once the session has made an
+edit, or has grown twice that size without one. The fixer stops and says
+what it changed so far, what it read, the edits it was about to make and
+what's left, and a fresh session gets the fix's own brief, then what the
+earlier sessions changed, which is in the checkout already, what they read,
+not to read again, the edits planned, to make now, and what's left to fix.
+The fix's answer is every session's, in order. A steelman relays too.
 
 - Only an agent acrbus can steer mid-call relays: pi, through acrbus's
   extension. A call on any other agent runs whole, and progress says so once
   for that agent.
 - A handoff that can't be read is never taken for a finished call, and
-  neither is a run of handoffs that find nothing new, or a fixer's that do
-  nothing more, with the same left to check. Either fails the call, which
-  escalates as any failed reviewer, Judge or fix does.
+  neither is one that did no work: a fixer's that leaves the checkout as its
+  session found it, whatever its answer says, or a reader's that finds
+  nothing new, checks nothing more and has the same left as the last one,
+  however it words them. Either fails the call, which escalates as any
+  failed reviewer, Judge or fix does, and progress says "did no work".
 - The least it can be set to is 32000 tokens: a session needs room to work
   past the shared opening.
 

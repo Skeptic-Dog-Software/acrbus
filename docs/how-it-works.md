@@ -147,6 +147,27 @@ call rather than passing it. [Long calls in shorter
 sessions](acr-repo-setup.md#5d-long-calls-in-shorter-sessions) has the
 settings and how to measure them.
 
+## A step that did no work fails
+
+A step is judged by what it must do, never by what it found: a reviewer that
+read the change and found nothing did its work. One observed doing none
+fails, as any failed step does, to be tried again or escalated, and never
+passes; progress says "did no work" and why.
+
+- A fix, or one session of it, that leaves the checkout as it found it,
+  unless it declines each of its blockers with a reason.
+- A handoff that adds nothing: no change, nothing new found or checked, and
+  the same left.
+- A reviewer, scout or prober whose call made no tool call, when its bridge
+  counts them; and a prober that wrote no probe in its copy.
+- A Judge that rated none of the findings it was given. A first pass that
+  rated none settles nothing: the Judge rules.
+- A test gate run, coverage, mutants' baseline or another way, that passed
+  but says it ran no tests.
+
+The Sizer's first look, which has no tools, keep-alives and merging
+duplicates aren't steps of this kind.
+
 ## It survives its agents, and says what they're doing
 
 Each headless run gets an environment of its own, and a watch for going

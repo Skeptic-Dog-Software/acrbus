@@ -124,6 +124,41 @@ mod lenient {
         }
     }
 
+    /// Words, however a model wrote them: a string, or a list or object of
+    /// them, as lines. An object puts its file first: "a.rs: what changes".
+    pub fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        Ok(words(&Value::deserialize(d)?))
+    }
+
+    fn words(v: &Value) -> String {
+        match v {
+            Value::Null => String::new(),
+            Value::String(s) => s.clone(),
+            Value::Array(items) => items
+                .iter()
+                .map(words)
+                .filter(|w| !w.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Value::Object(map) => {
+                let first = ["file", "path"];
+                first
+                    .iter()
+                    .filter_map(|k| map.get(*k))
+                    .chain(
+                        map.iter()
+                            .filter(|(k, _)| !first.contains(&k.as_str()))
+                            .map(|(_, v)| v),
+                    )
+                    .map(words)
+                    .filter(|w| !w.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(": ")
+            }
+            other => other.to_string(),
+        }
+    }
+
     /// A list of strings, or one string.
     pub fn strings<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
         Ok(match Value::deserialize(d)? {
@@ -581,12 +616,19 @@ pub fn reformat_prompt(report: &str) -> String {
 /// line of its own, once a session runs out of room.
 pub const HANDOFF_MARK: &str = "ACRBUS-HANDOFF";
 
-/// What a session that ran out of room says it has done and has left.
+/// What a session that ran out of room says it has done and has left: and
+/// a fixer's, what it read and the edits it was about to make, so the next
+/// session makes them instead of reading again. Each in words, however the
+/// model wrote them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::text")]
     pub checked: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::text")]
+    pub read: String,
+    #[serde(default, deserialize_with = "lenient::text")]
+    pub planned: String,
+    #[serde(default, deserialize_with = "lenient::text")]
     pub left: String,
 }
 
@@ -1154,15 +1196,49 @@ pub fn fix_prompt(blockers: &str) -> String {
     format!(
         "Fix these blockers in the working directory: the ones listed at the end of this brief. \
          Change only what fixing them needs, and don't commit.\n\n{FIX_SCOPE}\n\n{FIX_TESTS}\n\n\
-         Answer with only JSON: {{\"done\": \"<what you changed, in a line or two>\"}}.\n\n\
+         Answer with only JSON: {{\"done\": \"<what you changed, in a line or two>\"}}. A \
+         blocker that needs no change, because the code already does what it asks or it's wrong, \
+         goes in the same JSON as \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \
+         \"<why, specifically>\"}}], never left out: a fix that changes nothing and declines \
+         nothing has done no work.\n\n\
+         If you're told this session is out of room and to hand off, the handoff also holds \
+         \"read\": the files and facts you learned that the next session needs, and \
+         \"planned\": each edit you were about to make, by its file and the change, so the next \
+         session makes them rather than reading it all again.\n\n\
          # The blockers\n\n{blockers}"
     )
 }
 
 /// What a fixer's fresh session is told, after the fix's own brief, so it
 /// shares that brief's cached prefix: what the earlier sessions changed,
-/// which is in the checkout already, and what's left.
-pub fn fix_continuation(done: &[String], left: &str, session: u32) -> String {
+/// which is in the checkout already, what they read, the edits the last one
+/// planned, and what's left.
+pub fn fix_continuation(
+    done: &[String],
+    read: &[String],
+    planned: &str,
+    left: &str,
+    session: u32,
+) -> String {
+    let lines = |text: &str| -> String {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("- {}\n", l.trim_start_matches("- ")))
+            .collect()
+    };
+    let read: String = read.iter().map(|r| lines(r)).collect();
+    let read = if read.is_empty() {
+        String::new()
+    } else {
+        format!("What the earlier sessions read, not to read again unless you must:\n{read}\n")
+    };
+    let planned = lines(planned);
+    let planned = if planned.is_empty() {
+        String::new()
+    } else {
+        format!("The edits the last one planned, to make now:\n{planned}\n")
+    };
     let done: String = done
         .iter()
         .enumerate()
@@ -1181,6 +1257,7 @@ pub fn fix_continuation(done: &[String], left: &str, session: u32) -> String {
          {session}. What it changed is in the working directory already: build on it, and don't \
          undo or redo it. Answer with only what you change from here, in the same JSON.\n\n\
          What the earlier sessions changed:\n{done}\n\
+         {read}{planned}\
          What's left to fix, and where the last one was going next: {left}",
         left = left.trim(),
     )
@@ -1270,6 +1347,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_handoff_reads_its_reading_and_plans_in_whatever_shape_they_come() {
+        let (_, h) = handoff_of(
+            r#"ACRBUS-HANDOFF
+{"done": "x", "handoff": {"checked": ["a.src", "b.src"], "read": "a.src: parse()",
+ "planned": [{"file": "a.src", "change": "return it"}, "b.src: retry once"], "left": "the rest"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(h.checked, "a.src\nb.src");
+        assert_eq!(h.read, "a.src: parse()");
+        assert_eq!(h.planned, "a.src: return it\nb.src: retry once");
+        assert_eq!(h.left, "the rest");
+        // An older handoff, without them, reads as it did.
+        let (_, h) = handoff_of(r#"{"handoff": {"checked": "a", "left": "b"}}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!((h.read.as_str(), h.planned.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn a_fixers_next_session_gets_the_reading_done_and_the_edits_planned() {
+        let next = fix_continuation(
+            &["fixed first".into()],
+            &["a.src: parse() drops the error".into(), String::new()],
+            "a.src: return the error",
+            "the third",
+            2,
+        );
+        assert!(next.contains("- Session 1: fixed first"), "{next}");
+        assert!(next.contains("not to read again"), "{next}");
+        assert!(next.contains("- a.src: parse() drops the error"), "{next}");
+        assert!(next.contains("to make now"), "{next}");
+        assert!(next.contains("a.src: return the error"), "{next}");
+        assert!(next.contains("the third"), "{next}");
+        // Nothing read or planned: no empty sections.
+        let bare = fix_continuation(&["x".into()], &[], "", "y", 2);
+        assert!(!bare.contains("not to read again") && !bare.contains("to make now"));
+    }
+
+    #[test]
+    fn a_fixer_is_told_what_its_handoff_holds_and_how_to_decline() {
+        let p = fix_prompt("- a-r1-1 (a.src): a defect");
+        assert!(p.contains(r#""read""#) && p.contains(r#""planned""#), "{p}");
+        assert!(p.contains(r#""declined""#), "{p}");
+        // Stable text: every group's opening is the same.
+        let q = fix_prompt("- b-r1-1 (b.src): another");
+        let at = p.find("# The blockers").unwrap();
+        assert_eq!(p[..at], q[..at]);
+    }
+
+    #[test]
     fn a_fixer_is_told_to_run_only_the_tests_that_cover_its_change() {
         let one = fix_prompt("- first blocker");
         let two = fix_prompt("- second blocker");
@@ -1287,7 +1415,10 @@ mod tests {
         // Guidance, not a limit: nothing is taken away.
         assert!(guidance.contains("nothing stops you"), "{one}");
         // A session that carries on is still under the same brief.
-        let carried = format!("{one}{}", fix_continuation(&["a".into()], "the rest", 2));
+        let carried = format!(
+            "{one}{}",
+            fix_continuation(&["a".into()], &[], "", "the rest", 2)
+        );
         assert!(carried.contains("run only the tests that cover what you changed"));
     }
 

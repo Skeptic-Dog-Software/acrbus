@@ -1143,11 +1143,65 @@ pub struct Legs {
     pub last: String,
     /// The last session's label.
     pub label: String,
+    /// The tool calls its sessions made, when every one's bridge counts
+    /// them: 0 is a call that never read the code.
+    pub tools: Option<u64>,
+}
+
+/// A step observed doing no work: said, and an error, so it fails as any
+/// step does, to be tried again or escalated, and never passes.
+pub(super) fn no_work(caller: &dyn Caller, label: &str, what: &str) -> anyhow::Error {
+    let line = format!("{label}: did no work: {what}");
+    caller.say(&line);
+    anyhow!(line)
+}
+
+/// A stage's error, said when it's one that did no work, as a step's is.
+fn idle_said(caller: &dyn Caller, label: &str, e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if text.starts_with("did no work: ") {
+        caller.say(&format!("{label}: {text}"));
+    }
+    e
+}
+
+/// Text as its words, to tell what's new from what's said again in other
+/// case, spacing or punctuation.
+fn words(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The items a handoff says it checked, each as its words.
+fn items(text: &str) -> Vec<String> {
+    text.split(['\n', ';', ','])
+        .map(words)
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// A reader's call that ended without calling a tool: it never read the
+/// code beyond what it was given.
+fn read_something(caller: &dyn Caller, label: &str, legs: &Legs) -> Result<()> {
+    if legs.tools == Some(0) {
+        return Err(no_work(
+            caller,
+            label,
+            "it ended without calling a tool, so it never read the change beyond what it was \
+             given",
+        ));
+    }
+    Ok(())
 }
 
 /// Runs `call`, relayed if it asks to be. A handoff that can't be read, or
-/// two in a row with nothing new and the same left to do, is an error,
-/// never a finished call: what's left would go unchecked.
+/// one that did no work, is an error, never a finished call: what's left
+/// would go unchecked. A fixer's handoff did no work when the checkout is as
+/// its session found it; a reader's, when it found nothing new, checked
+/// nothing more, and has the same left as the last.
 pub fn relayed(
     caller: &dyn Caller,
     call: &Call,
@@ -1158,9 +1212,20 @@ pub fn relayed(
     let mut checked: Vec<String> = Vec::new();
     let mut earlier: Vec<roles::Earlier> = Vec::new();
     let mut last_left: Option<String> = None;
+    // What the sessions said they checked, as words, to tell a handoff
+    // that checked more.
+    let mut seen: Vec<String> = Vec::new();
     // A fixer's sessions: what each said it changed, which is in the
-    // checkout for the next.
+    // checkout for the next, and what each read.
     let mut changed: Vec<String> = Vec::new();
+    let mut read: Vec<String> = Vec::new();
+    // A fixer's checkout as its session starts, to see whether it changed.
+    let mut tree = if call.writes {
+        caller.snapshot(call.repo)
+    } else {
+        None
+    };
+    let mut tools = Some(0);
     let mut prompt = call.prompt.to_string();
     let mut session: u32 = 1;
     loop {
@@ -1182,6 +1247,10 @@ pub fn relayed(
             label: label.clone(),
         };
         let answer = caller.call(&this)?;
+        tools = match (tools, answer.usage.as_ref().filter(|u| u.counts_tools)) {
+            (Some(n), Some(u)) => Some(n + u.tool_calls),
+            _ => None,
+        };
         let mut u = used(&this, &answer);
         u.part = Some(format!("leg {session}"));
         usage.push(u);
@@ -1199,6 +1268,7 @@ pub fn relayed(
                 handed,
                 last: answer.text,
                 label,
+                tools,
             });
         };
         let (body, h) = handoff.with_context(|| label.clone())?;
@@ -1207,35 +1277,71 @@ pub fn relayed(
             let done = roles::read_fixed(&body)
                 .map(|f| f.done.trim().to_string())
                 .unwrap_or_default();
-            let more = !done.is_empty() && changed.last() != Some(&done);
-            if !more && last_left.as_deref() == Some(left.as_str()) {
-                bail!(
-                    "{label}: handed off again with nothing more done and the same left to fix, \
-                     so its relay stopped there and what's left went unfixed"
-                );
+            // By the checkout, which says what the session did whatever its
+            // answer says; by its words only when there's no checkout to
+            // read, and then in any case, spacing or punctuation.
+            let now = tree.as_ref().and_then(|_| caller.snapshot(call.repo));
+            match (&tree, &now) {
+                (Some(before), Some(after)) if before == after => {
+                    return Err(no_work(
+                        caller,
+                        &label,
+                        "handed off with no change to the working tree while its blockers are \
+                         open, so its relay stopped there and what's left went unfixed",
+                    ));
+                }
+                (Some(_), Some(_)) => {}
+                _ => {
+                    let more = !words(&done).is_empty()
+                        && changed.last().is_none_or(|c| words(c) != words(&done));
+                    if !more
+                        && last_left
+                            .as_deref()
+                            .is_some_and(|l| words(l) == words(&left))
+                    {
+                        return Err(no_work(
+                            caller,
+                            &label,
+                            "handed off again with nothing more done and the same left to fix, \
+                             so its relay stopped there and what's left went unfixed",
+                        ));
+                    }
+                }
             }
+            tree = now;
             last_left = Some(left.clone());
             caller.say(&format!(
                 "{label}: out of room, so it handed off what it changed to session {}",
                 session + 1
             ));
             changed.push(done);
+            read.push(h.read.clone());
             handed.push(body);
             session += 1;
             prompt = format!(
                 "{}{}",
                 call.prompt,
-                roles::fix_continuation(&changed, &left, session)
+                roles::fix_continuation(&changed, &read, &h.planned, &left, session)
             );
             continue;
         }
         let new = roles::earlier_of(&body);
-        if new.is_empty() && last_left.as_deref() == Some(left.as_str()) {
-            bail!(
-                "{label}: handed off again with nothing new found and the same left to check, \
-                 so its relay stopped there and what's left went unchecked"
-            );
+        let said = items(&h.checked);
+        let more = said.iter().any(|c| !seen.contains(c));
+        if new.is_empty()
+            && !more
+            && last_left
+                .as_deref()
+                .is_some_and(|l| words(l) == words(&left))
+        {
+            return Err(no_work(
+                caller,
+                &label,
+                "handed off again with nothing new found, nothing more checked and the same left \
+                 to check, so its relay stopped there and what's left went unchecked",
+            ));
         }
+        seen.extend(said);
         last_left = Some(left.clone());
         caller.say(&format!(
             "{label}: out of room, so it handed off what it found ({} so far) to session {}",
@@ -2203,6 +2309,7 @@ fn attack(
             label: call.label.clone(),
         };
         let legs = relayed(caller, &scout, used)?;
+        read_something(caller, &call.label, &legs)?;
         let mut lists = Vec::new();
         for text in &legs.handed {
             lists.push(roles::read_suspects(text)?);
@@ -2251,6 +2358,7 @@ fn attack(
                             label: format!("{}: verify {n}", call.label),
                         };
                         let legs = relayed(caller, &check, used)?;
+                        read_something(caller, &check.label, &legs)?;
                         let found = gathered(&legs, &check)?;
                         let usage = legs
                             .usage
@@ -2352,19 +2460,32 @@ fn attack(
                     parallel,
                     limit,
                 };
-                let (found, summary) = stages::run_mutants(&runner, &mutants)?;
+                let (found, summary) = stages::run_mutants(&runner, &mutants)
+                    .map_err(|e| idle_said(caller, label, e))?;
                 Ok((legs.usage, found, Some(summary)))
             }
             Brief::Probe { kept, before, .. } => {
                 // Kept before its answer is read, so a prober
                 // that answers badly still leaves its probes.
-                let note = before
-                    .as_deref()
-                    .and_then(|before| stages::keep_probes(repo, before, kept));
+                let (wrote, note) = match before.as_deref() {
+                    Some(before) => stages::keep_probes(repo, before, kept),
+                    None => (None, None),
+                };
+                // A prober writes its probes in its copy and runs them: a
+                // copy as it was given is one that probed nothing.
+                if wrote == Some(false) {
+                    return Err(no_work(
+                        caller,
+                        label,
+                        "it wrote no probe in its copy, so it ran none",
+                    ));
+                }
+                read_something(caller, label, &legs)?;
                 let found = gathered(&legs, &call)?;
                 Ok((legs.usage, found, note))
             }
             _ => {
+                read_something(caller, label, &legs)?;
                 let found = gathered(&legs, &call)?;
                 Ok((legs.usage, found, None))
             }
@@ -2442,7 +2563,8 @@ fn attack(
     let judge_fully = |lens: &Lens,
                        prompt: &str,
                        artifact: &Path,
-                       label: String|
+                       label: String,
+                       findings: usize|
      -> Result<(Vec<Usage>, Vec<roles::Rating>)> {
         let mut usages = Vec::new();
         if let Some((name, binding)) = first_pass {
@@ -2470,6 +2592,16 @@ fn attack(
                 Ok(legs) => {
                     usages.extend(legs.usage.iter().cloned());
                     match ratings_of(&legs) {
+                        Ok(ratings) if ratings.is_empty() => {
+                            let _ = no_work(
+                                caller,
+                                &format!("{label}, first pass"),
+                                &format!(
+                                    "it returned no ratings for the {findings} finding(s) it was \
+                                     given, so the Judge rules"
+                                ),
+                            );
+                        }
                         Ok(mut ratings)
                             if !ratings
                                 .iter()
@@ -2498,7 +2630,14 @@ fn attack(
                 )),
             }
         }
-        let (mut spent, mut ratings) = judge_call(prompt, artifact, label)?;
+        let (mut spent, mut ratings) = judge_call(prompt, artifact, label.clone())?;
+        if ratings.is_empty() {
+            return Err(no_work(
+                caller,
+                &label,
+                &format!("it returned no ratings for the {findings} finding(s) it was given"),
+            ));
+        }
         usages.append(&mut spent);
         if first_pass.is_some() {
             for r in &mut ratings {
@@ -2575,7 +2714,14 @@ fn attack(
                         .map(|h| roles::judge_hunks(&h))
                         .unwrap_or_default();
                     let prompt = roles::judge_prompt(lens, &lists, &s.not_findings)? + &hunks;
-                    judge_fully(lens, &prompt, diff, format!("{}: the Judge", lens.id))
+                    let findings = lists.iter().map(Vec::len).sum();
+                    judge_fully(
+                        lens,
+                        &prompt,
+                        diff,
+                        format!("{}: the Judge", lens.id),
+                        findings,
+                    )
                 }
                 JudgeMode::PerFinding => {
                     let all: Vec<&Raw> = lists.iter().flatten().collect();
@@ -2599,6 +2745,7 @@ fn attack(
                                             &prompt,
                                             diff,
                                             format!("{}: the Judge, finding {}", lens.id, i + 1),
+                                            1,
                                         )
                                     })
                                 })
@@ -3251,6 +3398,7 @@ fn gate_round(
             gaps
         }
         Err(e) => {
+            let e = idle_said(caller, &format!("{id}: the test gate"), e);
             round.failures.push(format!("{e:#}"));
             Vec::new()
         }
@@ -4827,7 +4975,8 @@ fn fix(
             .collect();
         let prompt = roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses);
         let label = format!("the steelman, folding in {} finding(s)", folded.len());
-        fix_call(run, s, caller, &prompt, label, None)
+        let ids: Vec<String> = folded.iter().map(|(_, f)| f.id.clone()).collect();
+        fix_call(run, s, caller, &prompt, label, None, &ids)
     } else {
         fix_in_groups(run, s, caller, &folded, &reported, before_fix.as_deref())
     };
@@ -5051,7 +5200,7 @@ fn fix_in_groups(
                 None,
             )
         };
-        match fix_call(run, s, caller, &prompt, label, part) {
+        match fix_call(run, s, caller, &prompt, label, part, &ids) {
             Ok(fixed) => {
                 for (id, _) in &group.findings {
                     if let Some(lens) = run.lenses.get_mut(id)
@@ -5088,7 +5237,8 @@ fn fix_in_groups(
 
 /// One fixer's call on the Orchestrator's binding, relayed when its calls
 /// relay, each session on the record, marked with `part` when it's one of
-/// several groups.
+/// several groups. One that leaves the checkout as it found it did no work,
+/// unless it declined each of its `blockers` with a reason.
 fn fix_call(
     run: &mut Run,
     s: &Setting,
@@ -5096,6 +5246,7 @@ fn fix_call(
     prompt: &str,
     label: String,
     part: Option<String>,
+    blockers: &[String],
 ) -> Result<roles::Fixed> {
     let cfg = s.cfg;
     let repo = run.repo.clone();
@@ -5112,6 +5263,7 @@ fn fix_call(
         label,
     };
     let used = |c: &Call, a: &Answer| usage(cfg, c, c.prompt.len(), a);
+    let before = caller.snapshot(&repo);
     let legs = relayed(caller, &call, &used)?;
     for mut u in legs.usage.iter().cloned() {
         u.round = run.round;
@@ -5122,7 +5274,50 @@ fn fix_call(
         };
         run.usage.push(u);
     }
-    fixed_of(&legs)
+    let fixed = fixed_of(&legs)?;
+    let Some(before) = before else {
+        return Ok(fixed);
+    };
+    if caller.snapshot(&repo).as_deref() != Some(before.as_str()) {
+        return Ok(fixed);
+    }
+    let declined: Vec<&roles::Declined> = fixed
+        .declined
+        .iter()
+        .filter(|d| !d.reason.trim().is_empty())
+        .collect();
+    let each = !blockers.is_empty()
+        && blockers
+            .iter()
+            .all(|b| declined.iter().any(|d| d.finding.trim() == b));
+    if !each {
+        let how = if declined.is_empty() {
+            "declined none of its blockers with a reason".to_string()
+        } else {
+            format!(
+                "declined only {} of its {} blockers with a reason",
+                declined.len(),
+                blockers.len()
+            )
+        };
+        return Err(no_work(
+            caller,
+            &call.label,
+            &format!(
+                "it finished with no change to the working tree and {how}, so they went unfixed"
+            ),
+        ));
+    }
+    caller.say(&format!(
+        "{}: changed nothing, and declined each of its blockers: {}",
+        call.label,
+        declined
+            .iter()
+            .map(|d| format!("{}: {}", d.finding.trim(), d.reason.trim()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ));
+    Ok(fixed)
 }
 
 /// After a fix, every file it changed, said, and the ones a person should
@@ -6033,6 +6228,9 @@ lenses:
         reverted: Mutex<Vec<(String, String, bool)>>,
         /// Reverting fails.
         stuck: bool,
+        /// The checkout never changes, as its snapshots would say: a fixer
+        /// that did nothing.
+        still: bool,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -6057,6 +6255,7 @@ lenses:
                 changed: None,
                 reverted: Mutex::new(Vec::new()),
                 stuck: false,
+                still: false,
             }
         }
 
@@ -6133,6 +6332,9 @@ lenses:
         }
 
         fn snapshot(&self, _repo: &Path) -> Option<String> {
+            if self.still {
+                return Some("the same tree".into());
+            }
             (self.fixes.is_some() || self.changed.is_some()).then(new_id)
         }
 
@@ -6687,6 +6889,38 @@ lenses:
                 .3
                 .contains("Earlier rounds' probes are in your copy already, in `probe_test.sh`")
         );
+    }
+
+    #[test]
+    fn a_prober_that_writes_no_probe_did_no_work() {
+        use super::super::change::tests::repo_with;
+        let top = "stages: [probes]\ntests: {command: 'sh {tests}'}";
+        let mut cfg = config("exception", 3, 1, "", top);
+        let name = cfg.bindings[&Role::Reviewer].clone();
+        cfg.allowed_bindings.get_mut(&name).unwrap().tools =
+            Some(vec!["Read".into(), "Bash".into()]);
+        for wrote in [false, true] {
+            let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+            let root = std::env::temp_dir().join(format!("tb-acr-noprobe-{}", new_id()));
+            let mut s = setting(&cfg);
+            s.copies = Some(root.clone());
+            let mut fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
+            if wrote {
+                fake.probe_file = Some("probe_test.sh");
+            }
+            let c = change(&["a.src"]);
+            let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+            drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&s.work_dir);
+            let told = said(&fake);
+            assert_eq!(
+                told.contains("did no work: it wrote no probe in its copy"),
+                !wrote,
+                "{told}"
+            );
+            assert_eq!(run.status == Status::Confirmed, wrote, "{told}");
+        }
     }
 
     #[test]
@@ -10964,6 +11198,54 @@ lenses:
     }
 
     #[test]
+    fn a_reviewers_handoff_that_checked_more_carries_on_and_one_in_new_words_only_stops() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "sessions: {relay_tokens: {reviewer: 40000}}",
+        );
+        let first = "ACRBUS-HANDOFF\n{\"findings\": [], \"handoff\": {\"checked\": \"a.src\", \"left\": \"the rest\"}}";
+        // The same, in new words: cased, spaced and stopped again.
+        let reworded = "ACRBUS-HANDOFF\n{\"findings\": [], \"handoff\": {\"checked\": \"A.src \", \"left\": \"The  rest.\"}}";
+        // Nothing found, but more checked: its work.
+        let more = "ACRBUS-HANDOFF\n{\"findings\": [], \"handoff\": {\"checked\": \"b.src\", \"left\": \"the rest\"}}";
+        for (second, sessions, stops) in [(reworded, 2, true), (more, 3, false)] {
+            let fake = Fake::new(move |role, prompt: &str| {
+                Ok(match role {
+                    Role::Reviewer
+                        if prompt.contains("alpha") && prompt.contains("you are session 3") =>
+                    {
+                        CLEAN.into()
+                    }
+                    Role::Reviewer
+                        if prompt.contains("alpha") && prompt.contains("you are session 2") =>
+                    {
+                        second.into()
+                    }
+                    Role::Reviewer if prompt.contains("alpha") => first.into(),
+                    Role::Reviewer => CLEAN.into(),
+                    _ => NOTHING.into(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert_eq!(
+                prompts(&fake, Role::Reviewer, "alpha").len(),
+                sessions,
+                "{second}"
+            );
+            let told = said(&fake);
+            assert_eq!(
+                told.contains("did no work: handed off again with nothing new"),
+                stops,
+                "{told}"
+            );
+            assert_eq!(run.status == Status::Confirmed, !stops, "{second}");
+        }
+    }
+
+    #[test]
     fn without_a_relay_a_call_runs_in_one_session_as_before() {
         let cfg = plain("exception", 3, 1);
         assert_eq!(
@@ -11440,6 +11722,241 @@ lenses:
         let reason = &run.escalations.last().unwrap().reason;
         assert!(reason.contains("nothing more done"), "{reason}");
         assert!(reason.contains("went unfixed"), "{reason}");
+    }
+
+    /// What a fixer's calls said, by its progress.
+    fn said(fake: &Fake<impl Fn(Role, &str) -> Result<String> + Sync>) -> String {
+        fake.told.lock().unwrap().join("\n")
+    }
+
+    #[test]
+    fn a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work() {
+        // Run G's shape: a session that read, changed nothing, and wrote a
+        // handoff whose words were new each time.
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "savings: {group_fixes: false}\nsessions: {relay_tokens: {orchestrator: 60000}}",
+        );
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator {
+                let n = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(format!(
+                    "ACRBUS-HANDOFF\n{{\"done\": \"read the parser, pass {n}\", \"handoff\": {{\"checked\": \"a.src\", \"left\": \"all three, step {n}\"}}}}"
+                ));
+            }
+            inner(role, prompt)
+        });
+        fake.still = true;
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(fake.count(Role::Orchestrator), 1, "it fails at its first");
+        let reason = &run.escalations.last().unwrap().reason;
+        assert!(reason.contains("did no work"), "{reason}");
+        assert!(reason.contains("no change to the working tree"), "{reason}");
+        assert!(
+            said(&fake).contains("say: the Orchestrator, fixing 3 blocker(s): did no work:"),
+            "{}",
+            said(&fake)
+        );
+        assert_eq!(run.stage, Stage::Done);
+    }
+
+    #[test]
+    fn a_fix_group_that_changes_nothing_did_no_work_unless_it_declines_each_blocker() {
+        let cfg = plain("exception", 3, 1);
+        let fixed = Mutex::new(false);
+        let mut fake = Fake::new(three_blockers(&fixed));
+        fake.still = true;
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(fake.count(Role::Orchestrator), 1, "its first group fails");
+        let reason = &run.escalations.last().unwrap().reason;
+        assert!(reason.contains("did no work"), "{reason}");
+        assert!(reason.contains("declined none"), "{reason}");
+        assert!(said(&fake).contains(": did no work: "), "{}", said(&fake));
+
+        // One that declines each of its blockers, with a reason, did its
+        // work: deciding no change is needed.
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            let answer = inner(role, prompt)?;
+            if role != Role::Orchestrator || !prompt.contains("Fix these") {
+                return Ok(answer);
+            }
+            let blockers = &prompt[prompt.find("# The blockers").unwrap()..];
+            let declined: Vec<String> = blockers
+                .lines()
+                .filter_map(|l| l.strip_prefix("- "))
+                .filter_map(|l| l.split_whitespace().next())
+                .map(|id| format!(r#"{{"finding": "{id}", "reason": "the code already does it"}}"#))
+                .collect();
+            Ok(format!(
+                r#"{{"done": "nothing needed changing", "declined": [{}]}}"#,
+                declined.join(", ")
+            ))
+        });
+        fake.still = true;
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(fake.count(Role::Orchestrator), 2, "both groups ran");
+        assert!(!said(&fake).contains("did no work"), "{}", said(&fake));
+        assert!(
+            run.escalations
+                .iter()
+                .all(|e| !e.reason.contains("did no work")),
+            "{:?}",
+            run.escalations
+        );
+    }
+
+    #[test]
+    fn a_fixers_handoff_carries_its_reading_and_planned_edits_to_the_next_session() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "savings: {group_fixes: false}\nsessions: {relay_tokens: {orchestrator: 60000}}",
+        );
+        let fixed = Mutex::new(false);
+        let inner = three_blockers(&fixed);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            if role == Role::Orchestrator && !prompt.contains("# Carrying on") {
+                return Ok(r#"ACRBUS-HANDOFF
+{"done": "fixed first", "handoff": {"checked": "first",
+ "read": ["a.src: parse() drops the error at line 4", "b.src: the caller retries"],
+ "planned": [{"file": "a.src", "change": "return the error from parse()"}],
+ "left": "second and third"}}"#
+                    .into());
+            }
+            inner(role, prompt)
+        });
+        fake.fixes = Some(vec!["a.src".into()]);
+        let (run, _) = go(&cfg, &["a.src", "b.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let fixes: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Orchestrator)
+            .map(|c| &c.3)
+            .collect();
+        assert_eq!(fixes.len(), 2);
+        // Every fixer is told what a handoff of its holds.
+        assert!(fixes[0].contains(r#""read""#) && fixes[0].contains(r#""planned""#));
+        assert!(fixes[0].contains(r#""declined""#));
+        let next = fixes[1];
+        assert!(next.contains("not to read again"), "{next}");
+        assert!(
+            next.contains("a.src: parse() drops the error at line 4"),
+            "{next}"
+        );
+        assert!(next.contains("b.src: the caller retries"), "{next}");
+        assert!(next.contains("to make now"), "{next}");
+        assert!(
+            next.contains("a.src: return the error from parse()"),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_calls_no_tool_did_no_work() {
+        let cfg = plain("exception", 1, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.usage = Some(RunUsage {
+            calls: 3,
+            tool_calls: 0,
+            counts_tools: true,
+            ..RunUsage::default()
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let told = said(&fake);
+        assert!(
+            told.contains("did no work: it ended without calling a tool"),
+            "{told}"
+        );
+        assert_ne!(run.status, Status::Confirmed, "never a pass");
+        assert_eq!(fake.count(Role::Judge), 0, "nothing of it to rule on");
+
+        // One whose bridge doesn't count tool calls isn't taken for idle.
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.usage = Some(RunUsage {
+            calls: 3,
+            ..RunUsage::default()
+        });
+        go(&cfg, &["a.src"], &fake);
+        assert!(!said(&fake).contains("did no work"), "{}", said(&fake));
+
+        // One that read: its work.
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.usage = Some(RunUsage {
+            calls: 3,
+            tool_calls: 4,
+            counts_tools: true,
+            ..RunUsage::default()
+        });
+        go(&cfg, &["a.src"], &fake);
+        assert!(!said(&fake).contains("did no work"), "{}", said(&fake));
+    }
+
+    #[test]
+    fn a_judge_that_rates_none_of_its_findings_did_no_work() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let told = said(&fake);
+        assert!(
+            told.contains("alpha: the Judge: did no work: it returned no ratings for the 1 finding(s) it was given"),
+            "{told}"
+        );
+        assert_ne!(
+            run.status,
+            Status::Confirmed,
+            "its findings never pass unruled"
+        );
+    }
+
+    #[test]
+    fn a_first_pass_that_rates_nothing_settles_nothing() {
+        let cfg = config("exception", 1, 1, "", "savings: {first_pass_judge: small}");
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge if prompt.contains(roles::FIRST_PASS_NOTE) => CLEAN.to_string(),
+                Role::Judge => {
+                    r#"{"findings": [{"title": "a defect", "file": "a.src", "severity": "Low"}]}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let calls = fake.calls.lock().unwrap();
+        let on = |name: &str| {
+            calls
+                .iter()
+                .filter(|c| c.0 == Role::Judge && c.1 == name)
+                .count()
+        };
+        // Each lens's first pass rated nothing, so each lens's Judge rules.
+        assert_eq!((on("small"), on("large")), (2, 2));
+        drop(calls);
+        assert!(
+            said(&fake).contains("alpha: the Judge, first pass: did no work: it returned no ratings for the 1 finding(s) it was given, so the Judge rules"),
+            "{}",
+            said(&fake)
+        );
+        let f = &run.lenses["alpha"].rounds[0].findings[0];
+        assert_eq!(f.ruled_by.as_deref(), Some("large"));
     }
 
     #[test]

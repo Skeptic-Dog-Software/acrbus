@@ -51,6 +51,12 @@
 //   starts a fresh session from the handoff instead of taking it for a
 //   finished review. A turn that calls no tools is the answer itself, and
 //   never hands off.
+// - ACRBUS_RELAY_GROWTH=1: with ACRBUS_RELAY_TOKENS, a fixer's relay. Its
+//   size is what the prompt grew since the session's own first turn, not
+//   the prompt itself, whose opening was there before it did anything; and
+//   it hands off only once the session has made an edit, or has grown twice
+//   its size without one. A handoff with nothing changed hands the next
+//   session only more to read, so it waits for the work a fixer is for.
 
 import { createHash } from "node:crypto";
 
@@ -168,7 +174,8 @@ const HANDOFF =
   "Answer now with only the JSON your instructions describe, holding everything your answer " +
   "would hold so far, in full, exactly as you'd report it, and one more field: " +
   '"handoff": {"checked": "<what you have checked, specifically: the files, functions, paths ' +
-  'and claims>", "left": "<what is left to check, and where you were going next>"}.';
+  'and claims>", "left": "<what is left to check, and where you were going next>"}, ' +
+  "and anything else your instructions say a handoff holds.";
 
 // One model call's figures, from pi's own usage: what the turn log says,
 // and the size a relay checks, read once.
@@ -526,18 +533,33 @@ export default function acrbus(pi) {
     });
   }
   if (relays) {
+    const growth = process.env.ACRBUS_RELAY_GROWTH === "1";
     let relaying = false;
+    // The session's first turn's prompt, which a fixer's growth counts
+    // from, and the edits it has asked for.
+    let firstPrompt = null;
+    let edits = 0;
     pi.on("turn_end", (event) => {
       if (relaying) return undefined;
-      // A turn that called no tools is the answer: nothing to hand off.
-      if (!Array.isArray(event?.toolResults) || event.toolResults.length === 0) return undefined;
       // The turn's own model call, as the turn log read it.
       const read = lastPrompt;
-      if (read < relayAt) return undefined;
+      // A turn with no response read nothing: the first that did is first.
+      if (firstPrompt === null && read > 0) firstPrompt = read;
+      // A turn that called no tools is the answer: nothing to hand off.
+      if (!Array.isArray(event?.toolResults) || event.toolResults.length === 0) return undefined;
+      let why;
+      if (growth) {
+        const grew = read - (firstPrompt ?? read);
+        if (grew < relayAt || (edits === 0 && grew < 2 * relayAt)) return undefined;
+        why =
+          `grew ${grew} prompt tokens since its first turn's ${firstPrompt}, ` +
+          (edits > 0 ? `past ${relayAt}, after an edit` : `past twice ${relayAt}, with no edit`);
+      } else {
+        if (read < relayAt) return undefined;
+        why = `read ${read} prompt tokens, past ${relayAt}`;
+      }
       relaying = true;
-      console.error(
-        `acrbus relay: turn ${event.turnIndex ?? "?"} read ${read} prompt tokens, past ${relayAt}: handing off`,
-      );
+      console.error(`acrbus relay: turn ${event.turnIndex ?? "?"} ${why}: handing off`);
       return {
         entries: [
           ...(Array.isArray(event.entries) ? event.entries : []),
@@ -546,8 +568,11 @@ export default function acrbus(pi) {
         continue: true,
       };
     });
-    pi.on("tool_call", async () => {
-      if (!relaying) return undefined;
+    pi.on("tool_call", async (event) => {
+      if (!relaying) {
+        if (event?.toolName === "edit" || event?.toolName === "write") edits += 1;
+        return undefined;
+      }
       return {
         block: true,
         reason: "This session is out of room: write your handoff now, as the last message asks.",
