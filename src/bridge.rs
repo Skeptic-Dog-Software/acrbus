@@ -80,6 +80,8 @@ const CACHE_KEY_ENV: &str = "ACRBUS_CACHE_KEY";
 /// What a review's call is told it may use, when every role gets the same
 /// tools.
 const ALLOWED_TOOLS_ENV: &str = "ACRBUS_ALLOWED_TOOLS";
+/// What a pi fix may change: its scope, as JSON. See `RunOptions::allowed_paths`.
+const ALLOWED_PATHS_ENV: &str = "ACRBUS_ALLOWED_PATHS";
 /// What a review's call to pi is told its thinking level was asked as, so
 /// the extension can say when pi rounds it to one the model has.
 const EFFORT_ENV: &str = "ACRBUS_EFFORT";
@@ -318,6 +320,8 @@ struct Plan {
     cache_key: Option<String>,
     /// With every role given the same tools: the ones this call may use.
     allowed_tools: Option<Vec<String>>,
+    /// A fix's scope, as JSON, for an agent acrbus can hold to it.
+    allowed_paths: Option<String>,
     /// Where the call hands off, when its agent can be steered mid-call.
     relay_tokens: Option<u64>,
     /// Its relay is a fixer's: by what it grew, after its first edit.
@@ -727,6 +731,7 @@ impl Settings {
             facts: None,
             cache_key: None,
             allowed_tools: None,
+            allowed_paths: None,
             relay_tokens: None,
             relay_after_edit: false,
             mcp: Vec::new(),
@@ -824,6 +829,14 @@ impl Settings {
                 return Err(format!("allowed tool {bad:?} isn't one the call is given"));
             }
             plan.allowed_tools = Some(allowed.clone());
+        }
+        if let Some(scope) = &options.allowed_paths {
+            // A scope that can't be read is refused, never taken as none:
+            // its writes would go unheld.
+            if !serde_json::from_str::<serde_json::Value>(scope).is_ok_and(|v| v.is_object()) {
+                return Err("a fix's allowed paths must be a JSON object".into());
+            }
+            plan.allowed_paths = Some(scope.clone());
         }
         if let Some(session) = &options.session {
             let mode = [SessionMode::Fresh, SessionMode::PerSender]
@@ -3321,6 +3334,15 @@ impl Bridge {
         if let Some(effort) = plan.effort.as_ref().filter(|_| kind == Some(Kind::Pi)) {
             command.env(EFFORT_ENV, effort);
         }
+        // A pi fix is held to its scope in the session; every kind is
+        // checked after the call by the review.
+        if let Some(scope) = plan
+            .allowed_paths
+            .as_ref()
+            .filter(|_| kind == Some(Kind::Pi))
+        {
+            command.env(ALLOWED_PATHS_ENV, scope);
+        }
         if kind == Some(Kind::Pi) {
             command.env(TURNS_ENV, "1");
             if let Some(tokens) = plan.relay_tokens {
@@ -4745,6 +4767,111 @@ mod tests {
             .timeout,
             5
         );
+    }
+
+    #[test]
+    fn a_fixs_allowed_paths_must_be_a_json_object_and_reach_only_a_pi_agent_as_env() {
+        let rig = Rig::new();
+        let cfg = generous(&rig, "echo hi");
+        let with = |scope: &str| RunOptions {
+            allowed_paths: Some(scope.to_string()),
+            ..RunOptions::default()
+        };
+        for bad in ["", "not json", "[\"a.go\"]", "\"a.go\""] {
+            let e = cfg.plan(Some(&with(bad))).unwrap_err();
+            assert!(e.contains("must be a JSON object"), "{bad}: {e}");
+        }
+        let plan = cfg
+            .plan(Some(&with(
+                r#"{"paths": ["a.go"], "test_dirs": [""], "locked": [], "open": false}"#,
+            )))
+            .unwrap();
+        assert_eq!(
+            plan.allowed_paths.as_deref(),
+            Some(r#"{"paths": ["a.go"], "test_dirs": [""], "locked": [], "open": false}"#)
+        );
+    }
+
+    #[test]
+    fn the_pi_extension_holds_a_fix_to_its_files() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-scope-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const handlers = [];
+acrbus({ on: (name, f) => { if (name === "tool_call") handlers.push(f); } });
+const call = async (toolName, input) => {
+  for (const h of handlers) {
+    const r = await h({ toolName, input });
+    if (r && r.block) return r.reason;
+  }
+  return null;
+};
+console.log(JSON.stringify({
+  own: await call("edit", { path: "pkg/a.go" }),
+  absolute: await call("write", { path: process.cwd() + "/pkg/a.go" }),
+  test: await call("write", { path: "pkg/a_test.go" }),
+  doc: await call("edit", { path: "README.md" }),
+  other: await call("write", { path: "pkg/b.go" }),
+  locked: await call("edit", { path: "pkg/old_test.go" }),
+  elsewhereTest: await call("write", { path: "other/x_test.go" }),
+  read: await call("read", { path: "README.md" }),
+}));
+"#,
+        )
+        .unwrap();
+        let run = |scope: Option<&str>| -> (serde_json::Value, String) {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .current_dir(&dir)
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove(ALLOWED_PATHS_ENV)
+                .env_remove("ACRBUS_RELAY_TOKENS");
+            if let Some(scope) = scope {
+                c.env(ALLOWED_PATHS_ENV, scope);
+            }
+            let out = c.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            (serde_json::from_slice(&out.stdout).unwrap(), stderr)
+        };
+        let (got, said) = run(Some(
+            r#"{"paths": ["pkg/a.go"], "test_dirs": ["pkg"], "locked": ["pkg/old_test.go"], "open": false}"#,
+        ));
+        let null = serde_json::Value::Null;
+        assert_eq!(got["own"], null);
+        assert_eq!(
+            got["absolute"], null,
+            "a path from the working directory is the same file"
+        );
+        assert_eq!(got["test"], null, "a test beside it pins the fix");
+        assert_eq!(got["read"], null, "reading isn't held");
+        for refused in ["doc", "other", "locked", "elsewhereTest"] {
+            let why = got[refused].as_str().unwrap_or_default();
+            assert!(
+                why.contains("may change only its own files") && why.contains("\"needs\""),
+                "{refused}: {why}"
+            );
+        }
+        assert!(
+            said.contains("acrbus scope: refused edit README.md: not one of this fix's files"),
+            "{said}"
+        );
+        // A scope it can't read refuses every write; none at all holds none.
+        let (closed, _) = run(Some("{not json"));
+        assert!(closed["own"].is_string() && closed["read"].is_null());
+        let (none, _) = run(None);
+        assert!(none["other"].is_null() && none["doc"].is_null());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

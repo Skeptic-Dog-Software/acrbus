@@ -103,6 +103,12 @@ pub struct RunOptions {
     /// they're called. Only an agent that can hold a call to them takes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Part of a review's fix: what the call may change, as JSON: `paths`,
+    /// `test_dirs` beside them, `locked` and `open`. An agent its bridge can
+    /// hold to it refuses a write elsewhere; every kind is checked after the
+    /// call by the review itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_paths: Option<String>,
     /// Part of a review: the prompt tokens of one turn past which the call
     /// hands off, writing what it has found, checked and left, so a fresh
     /// session can carry on. Only an agent its bridge can steer mid-call

@@ -76,6 +76,20 @@ mod lenient {
 
     use super::Severity;
 
+    /// What can be read of a list: an entry that can't be is skipped, and
+    /// anything but a list is none.
+    pub fn list<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(
+        d: D,
+    ) -> Result<Vec<T>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
     /// A line, or the first number in text such as "169-171" or "L42".
     pub fn line<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
         Ok(match Value::deserialize(d)? {
@@ -1242,14 +1256,22 @@ pub fn read_blast(text: &str) -> Result<Vec<Blast>> {
 }
 
 /// What every fixer is told about the reach of its fix: the same for every
-/// fix, so a group's session shares it with the rest.
-pub const FIX_SCOPE: &str = "Change code, tests and docs, not what's built from them. Don't \
-     rebuild, regenerate or reformat build artifacts, binaries or generated files the repository \
-     tracks, and don't run a command that rewrites tracked files beyond what the fix needs: a \
-     formatter over the whole tree, a build or release step that rewrites what's checked in, a \
-     lockfile update. If the fix needs one of those, say so in your answer instead of running \
-     it. Every file you change is listed after you're done, and a person is asked about each \
-     binary, and each file the blockers don't point at.";
+/// fix, so a group's session shares it with the rest. The files it may
+/// change come after its blockers, and acrbus holds it to them: what it
+/// changes anywhere else is put back when the session ends.
+pub const FIX_SCOPE: &str = "Change only the files this fix may change, listed after the \
+     blockers: the files they point at, and test files beside those for tests that pin the fix. \
+     A write anywhere else is refused or put back as soon as your session ends, so it's wasted \
+     work, and so is a change no blocker asks for. If a fix truly needs a change to another file, \
+     such as a caller of a signature you changed, don't make it: list it in your answer's \
+     \"needs\", with the file and why, and a person decides. Docs are in scope only when a \
+     blocker points at them: if your fix leaves a doc saying something no longer true, don't \
+     edit it, note it in \"stale\", with its file, line and what it now says wrongly. Don't \
+     rebuild, regenerate or reformat build artifacts, binaries or generated files the \
+     repository tracks, and don't run a command that rewrites tracked files: a formatter over \
+     the whole tree, a build or release step that rewrites what's checked in, a lockfile \
+     update. To compile, build into $TMPDIR (such as `go build -o $TMPDIR/x ./...`) or just run \
+     the tests.";
 
 /// What every fixer is told about running tests: the same for every fix, so
 /// it's part of the opening a group's session reads from the cache. A test
@@ -1274,7 +1296,11 @@ pub fn fix_prompt(blockers: &str) -> String {
          blocker that needs no change, because the code already does what it asks or it's wrong, \
          goes in the same JSON as \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \
          \"<why, specifically>\"}}], never left out: a fix that changes nothing and declines \
-         nothing has done no work.\n\n\
+         nothing has done no work. Add \"needs\": [{{\"path\": \"<file>\", \"why\": \"<the \
+         change it needs, and why>\"}}] for each file outside this fix's files that it truly \
+         needs changed, and \"stale\": [{{\"file\": \"<doc>\", \"line\": <n>, \"says\": \
+         \"<what it now says that isn't true>\"}}] for each doc your fix left wrong. Leave both \
+         out when there are none.\n\n\
          If you're told this session is out of room and to hand off, the handoff also holds \
          \"read\": the files and facts you learned that the next session needs, and \
          \"planned\": each edit you were about to make, by its file and the change, so the next \
@@ -1292,6 +1318,7 @@ pub fn fix_continuation(
     read: &[String],
     planned: &str,
     left: &str,
+    noted: &[String],
     session: u32,
 ) -> String {
     let lines = |text: &str| -> String {
@@ -1313,6 +1340,15 @@ pub fn fix_continuation(
     } else {
         format!("The edits the last one planned, to make now:\n{planned}\n")
     };
+    let noted: String = noted.iter().map(|n| format!("- {}\n", n.trim())).collect();
+    let noted = if noted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "What the earlier sessions noted, in \"needs\" or \"stale\", for a person: keep \
+             each in your answer, and don't make those changes:\n{noted}\n"
+        )
+    };
     let done: String = done
         .iter()
         .enumerate()
@@ -1331,7 +1367,7 @@ pub fn fix_continuation(
          {session}. What it changed is in the working directory already: build on it, and don't \
          undo or redo it. Answer with only what you change from here, in the same JSON.\n\n\
          What the earlier sessions changed:\n{done}\n\
-         {read}{planned}\
+         {read}{planned}{noted}\
          What's left to fix, and where the last one was going next: {left}",
         left = left.trim(),
     )
@@ -1394,6 +1430,24 @@ pub fn steelman_prompt(
     )
 }
 
+/// A change a fix needs outside the files it may change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Need {
+    pub path: String,
+    #[serde(default)]
+    pub why: String,
+}
+
+/// A doc a fix left saying something no longer true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stale {
+    pub file: String,
+    #[serde(default, deserialize_with = "lenient::line")]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub says: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Declined {
     pub finding: String,
@@ -1404,6 +1458,13 @@ pub struct Declined {
 #[derive(Debug, Deserialize)]
 pub struct Fixed {
     pub done: String,
+    /// Files outside the fix's own that it says it needs changed, and why:
+    /// put to a person, never changed by the fixer.
+    #[serde(default, deserialize_with = "lenient::list")]
+    pub needs: Vec<Need>,
+    /// Docs the fix left saying something no longer true: put to a person.
+    #[serde(default, deserialize_with = "lenient::list")]
+    pub stale: Vec<Stale>,
     /// A steelman's: what it left out, and why.
     #[serde(default)]
     pub declined: Vec<Declined>,
@@ -1447,17 +1508,51 @@ mod tests {
             &["a.src: parse() drops the error".into(), String::new()],
             "a.src: return the error",
             "the third",
+            &["needs b.src: its caller passes the old argument".into()],
             2,
         );
         assert!(next.contains("- Session 1: fixed first"), "{next}");
+        // What the earlier sessions noted for a person, carried, so the next
+        // keeps it and doesn't make the change.
+        assert!(
+            next.contains("- needs b.src: its caller passes the old argument")
+                && next.contains("don't make those changes"),
+            "{next}"
+        );
         assert!(next.contains("not to read again"), "{next}");
         assert!(next.contains("- a.src: parse() drops the error"), "{next}");
         assert!(next.contains("to make now"), "{next}");
         assert!(next.contains("a.src: return the error"), "{next}");
         assert!(next.contains("the third"), "{next}");
         // Nothing read or planned: no empty sections.
-        let bare = fix_continuation(&["x".into()], &[], "", "y", 2);
+        let bare = fix_continuation(&["x".into()], &[], "", "y", &[], 2);
         assert!(!bare.contains("not to read again") && !bare.contains("to make now"));
+    }
+
+    #[test]
+    fn a_fixers_answer_carries_what_it_needs_elsewhere_and_the_docs_it_left_stale() {
+        let f = read_fixed(
+            r#"{"done": "x", "needs": [{"path": "b.go", "why": "its caller"}, "nonsense"],
+                "stale": [{"file": "README.md", "line": "L12", "says": "the old timeout"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.needs,
+            vec![Need {
+                path: "b.go".into(),
+                why: "its caller".into()
+            }]
+        );
+        assert_eq!(
+            (f.stale[0].file.as_str(), f.stale[0].line),
+            ("README.md", Some(12))
+        );
+        // Not a list: none, and the answer still reads.
+        let g = read_fixed(r#"{"done": "x", "needs": "b.go"}"#).unwrap();
+        assert!(g.needs.is_empty() && g.stale.is_empty());
+        let p = fix_prompt("- a-r1-1 (a.src): a defect");
+        assert!(p.contains(r#""needs""#) && p.contains(r#""stale""#), "{p}");
+        assert!(p.contains("$TMPDIR"), "{p}");
     }
 
     #[test]
@@ -1491,7 +1586,7 @@ mod tests {
         // A session that carries on is still under the same brief.
         let carried = format!(
             "{one}{}",
-            fix_continuation(&["a".into()], &[], "", "the rest", 2)
+            fix_continuation(&["a".into()], &[], "", "the rest", &[], 2)
         );
         assert!(carried.contains("run only the tests that cover what you changed"));
     }

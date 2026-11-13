@@ -160,6 +160,11 @@ pub trait Caller: Sync {
     /// replica than the one that didn't answer.
     fn rekey(&self, _label: &str) {}
 
+    /// What the fix sessions from now on may change, for an agent its
+    /// bridge can hold to it; None when no fix is running. Every kind is
+    /// checked after each session too, whatever this does.
+    fn fix_scope(&self, _scope: Option<&FixScope>) {}
+
     /// Why no new call may start, if the review's spend cap is reached by
     /// what its calls have spent so far.
     fn over_cap(&self) -> Option<String> {
@@ -386,6 +391,15 @@ pub struct Reported {
     pub round: u32,
     pub text: String,
     pub fixed: bool,
+    /// The file it's about, when it's one: a fix's own scope request a
+    /// person allowed, whose follow-up may change that file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A follow-up to a fix, for a change it needed outside its own files,
+    /// that a person allowed: fixed before the next round's reviewers, and
+    /// not a missed defect, so it doesn't send every lens back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follow_up: bool,
 }
 
 /// A session's fixes under way: the checkout from before them.
@@ -668,6 +682,18 @@ pub struct Run {
     /// blockers held.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<FixRoute>,
+    /// Files no fix may change for the rest of the run unless a later
+    /// blocker points at one: each put back after a fix, by a person or by
+    /// acrbus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<Locked>,
+    /// What each fix session may change, and what acrbus put back after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guarded: Vec<Guarded>,
+    /// What fixes said they needed outside their files, and the docs they
+    /// left stale: each a person's to fix now, ticket, or leave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fix_notes: Vec<FixNote>,
 }
 
 /// A round paused by an outage.
@@ -710,6 +736,160 @@ pub struct Flag {
     pub command: String,
     #[serde(default)]
     pub state: FlagState,
+}
+
+/// A file no fix may change for the rest of a run, unless a later blocker
+/// points at it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Locked {
+    pub path: String,
+    /// The round whose fix it was put back after.
+    pub round: u32,
+    /// Who put it back: "you", or "acrbus" for a change outside the fix's
+    /// files.
+    pub by: String,
+}
+
+/// One fix session's scope, and what acrbus put back after it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Guarded {
+    pub round: u32,
+    /// The fix it was: "group N" when it was one of several, or "fix".
+    pub fix: String,
+    /// The files it could change: those its blockers point at, and any a
+    /// person allowed. Test files beside them could change too.
+    pub paths: Vec<String>,
+    /// Each file it changed outside them, put back, with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverted: Vec<(String, String)>,
+    /// What its sessions cost, where known, to weigh against what was put
+    /// back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+}
+
+/// What a fix said for a person: a change it needed outside its files, or a
+/// doc it left stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixNote {
+    pub round: u32,
+    /// "needs" or "stale".
+    pub kind: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    /// Why it's needed, or what the doc now says wrongly.
+    pub text: String,
+    #[serde(default)]
+    pub state: NoteState,
+}
+
+impl FixNote {
+    /// One line, for a question or the report.
+    pub fn line(&self) -> String {
+        let at = match self.line {
+            Some(n) => format!("{}:{n}", self.path),
+            None => self.path.clone(),
+        };
+        if self.kind == "stale" {
+            format!("{at} is stale: {}", self.text.trim())
+        } else {
+            format!("{at} needs a change: {}", self.text.trim())
+        }
+    }
+}
+
+/// A person's answer to a fix's note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoteState {
+    /// Not answered yet.
+    #[default]
+    Open,
+    /// Fixed now, by a follow-up fix allowed that file.
+    FixNow,
+    /// Left for a ticket.
+    Ticket,
+    /// Left as it is.
+    Left,
+}
+
+/// What a fix session may change: the files its blockers point at, test
+/// files beside them for tests that pin the fix, and files a person allowed.
+/// Anything else it changes is refused where its agent can be held, and put
+/// back after the session where it can't. `open` is a fix whose blockers
+/// point at no file: it may change any file but a locked one, a doc or a
+/// binary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixScope {
+    pub paths: Vec<String>,
+    /// Directories a test file may be changed or added in.
+    pub test_dirs: Vec<String>,
+    /// Files put back earlier, not to be changed again.
+    pub locked: Vec<String>,
+    pub open: bool,
+}
+
+fn norm_path(p: &str) -> String {
+    p.trim()
+        .trim_matches('`')
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn parent_dir(p: &str) -> &str {
+    p.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+impl FixScope {
+    /// Whether the fix may change `path`, relative to the repository.
+    pub fn allows(&self, path: &str) -> bool {
+        let p = norm_path(path);
+        if self.paths.contains(&p) {
+            return true;
+        }
+        if self.locked.contains(&p) {
+            return false;
+        }
+        if super::stages::is_test_path(&p) && self.test_dirs.iter().any(|d| d == parent_dir(&p)) {
+            return true;
+        }
+        self.open && !super::stages::is_doc(&p)
+    }
+
+    /// What the fixer is told of it, after its blockers.
+    pub fn told(&self) -> String {
+        let mut out = String::from("\n# The files this fix may change\n\n");
+        if self.open {
+            out.push_str(
+                "Its blockers point at no file, so it may change the code and tests that fixing \
+                 them needs, but no doc and no binary",
+            );
+        } else {
+            out.push_str(&format!(
+                "{}, and test files in the same directories, for tests that pin the fix",
+                self.paths
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.locked.is_empty() {
+            out.push_str(". Anything else goes in \"needs\" or \"stale\", never changed.\n");
+        } else {
+            out.push_str(&format!(
+                ". Never {}: a person, or acrbus, put each back after an earlier fix. Anything \
+                 else goes in \"needs\" or \"stale\", never changed.\n",
+                self.locked
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        out
+    }
 }
 
 impl Flag {
@@ -1865,6 +2045,20 @@ pub fn relayed(
     call: &Call,
     used: &dyn Fn(&Call, &Answer) -> Usage,
 ) -> Result<Legs> {
+    relayed_with(caller, call, used, None)
+}
+
+/// `relayed`, with `guard` run on the checkout after each session of a call
+/// that writes hands off, before anything reads what it changed: a fix's
+/// scope, putting back what it changed outside its files, so a handoff that
+/// changed nothing else did no work, and the next session starts from the
+/// checkout as its scope allows.
+pub fn relayed_with(
+    caller: &dyn Caller,
+    call: &Call,
+    used: &dyn Fn(&Call, &Answer) -> Usage,
+    guard: Option<&dyn Fn()>,
+) -> Result<Legs> {
     let mut usage = Vec::new();
     let mut handed = Vec::new();
     let mut checked: Vec<String> = Vec::new();
@@ -1877,6 +2071,9 @@ pub fn relayed(
     // checkout for the next, and what each read.
     let mut changed: Vec<String> = Vec::new();
     let mut read: Vec<String> = Vec::new();
+    // What its sessions noted for a person, outside their files: carried
+    // to each next session, to keep in its answer.
+    let mut noted: Vec<String> = Vec::new();
     // A fixer's checkout as its session starts, to see whether it changed.
     let mut tree = if call.writes {
         caller.snapshot(call.repo)
@@ -1932,9 +2129,27 @@ pub fn relayed(
         let (body, h) = handoff.map_err(unreadable).with_context(|| label.clone())?;
         let left = h.left.trim().to_string();
         if call.writes {
-            let done = roles::read_fixed(&body)
+            let said = roles::read_fixed(&body).ok();
+            let done = said
+                .as_ref()
                 .map(|f| f.done.trim().to_string())
                 .unwrap_or_default();
+            if let Some(f) = &said {
+                for n in &f.needs {
+                    noted.push(format!("needs {}: {}", n.path.trim(), n.why.trim()));
+                }
+                for d in &f.stale {
+                    noted.push(format!(
+                        "stale {}{}: {}",
+                        d.file.trim(),
+                        d.line.map(|l| format!(":{l}")).unwrap_or_default(),
+                        d.says.trim()
+                    ));
+                }
+            }
+            if let Some(guard) = guard {
+                guard();
+            }
             // By the checkout, which says what the session did whatever its
             // answer says; by its words only when there's no checkout to
             // read, and then in any case, spacing or punctuation.
@@ -1979,7 +2194,7 @@ pub fn relayed(
             prompt = format!(
                 "{}{}",
                 call.prompt,
-                roles::fix_continuation(&changed, &read, &h.planned, &left, session)
+                roles::fix_continuation(&changed, &read, &h.planned, &left, &noted, session)
             );
             continue;
         }
@@ -2059,6 +2274,8 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
         .collect();
     let mut declined: Vec<roles::Declined> = Vec::new();
     let mut briefs = BTreeMap::new();
+    let mut needs: Vec<roles::Need> = Vec::new();
+    let mut stale: Vec<roles::Stale> = Vec::new();
     for f in earlier.into_iter().chain(std::iter::once(last)) {
         for d in f.declined {
             if !declined.iter().any(|e| e.finding == d.finding) {
@@ -2066,11 +2283,23 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
             }
         }
         briefs.extend(f.briefs);
+        for n in f.needs {
+            if !needs.iter().any(|e| e.path == n.path) {
+                needs.push(n);
+            }
+        }
+        for d in f.stale {
+            if !stale.iter().any(|e| e.file == d.file && e.line == d.line) {
+                stale.push(d);
+            }
+        }
     }
     Ok(roles::Fixed {
         done: done.join("\n"),
         declined,
         briefs,
+        needs,
+        stale,
     })
 }
 
@@ -2558,6 +2787,9 @@ pub fn start(
         flags: Vec::new(),
         outage: None,
         routes: Vec::new(),
+        locked: Vec::new(),
+        guarded: Vec::new(),
+        fix_notes: Vec::new(),
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -6210,10 +6442,16 @@ fn fix(
             .filter_map(|id| s.cfg.lenses.iter().find(|l| &l.id == id))
             .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
             .collect();
-        let prompt = roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses);
+        let scope = fix_scope(run, &folded, &reported);
+        let prompt = format!(
+            "{}\n{}{}",
+            roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses),
+            scope.told(),
+            fix_files(&run.repo, &scope, &folded)
+        );
         let label = format!("the steelman, folding in {} finding(s)", folded.len());
         let ids: Vec<String> = folded.iter().map(|(_, f)| f.id.clone()).collect();
-        fix_call(run, s, caller, &prompt, label, None, &ids, false)
+        fix_call(run, s, caller, &prompt, label, None, &ids, false, &scope)
     } else {
         fix_in_groups(run, s, caller, &folded, &reported, before_fix.as_deref())
     };
@@ -6222,6 +6460,7 @@ fn fix(
     flag_fix(run, caller, before_fix.as_deref(), &folded, &reported);
     match fixed {
         Ok(fixed) => {
+            keep_notes(run, s, caller, &fixed);
             // A fix in groups told each group's lenses what it did.
             if run.converge {
                 for (id, _) in &folded {
@@ -6234,7 +6473,7 @@ fn fix(
             for r in run.reported.iter_mut() {
                 r.fixed = true;
             }
-            if !run.converge && !reported.is_empty() {
+            if !run.converge && reported.iter().any(|r| !r.follow_up) {
                 reopen_all(run);
             }
             if run.converge {
@@ -6462,6 +6701,211 @@ fn fix_route(run: &Run, fixer: &super::config::FixerConfig, group: &FixGroup) ->
     }
 }
 
+/// Each word in `texts` that names a file in `repo`, as a blocker might:
+/// "a.src", "lib/a.src:12" or `a.src`.
+fn named_files(repo: &Path, texts: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in texts {
+        for w in t.split(|c: char| c.is_whitespace() || "()[]{}<>,;\"'`".contains(c)) {
+            let w = w.trim_end_matches(['.', ':']);
+            let p = norm_path(w.split(':').next().unwrap_or(w));
+            if (p.contains('.') || p.contains('/'))
+                && !p.starts_with('/')
+                && !p.contains("..")
+                && !out.contains(&p)
+                && repo.join(&p).is_file()
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// A fix's scope: the files its blockers point at, or name, and those a
+/// person allowed it; test files beside them; and, closed to it, the files
+/// put back after an earlier fix that none of its blockers points at.
+fn fix_scope(run: &Run, findings: &[(String, Finding)], reported: &[Reported]) -> FixScope {
+    let mut paths: Vec<String> = Vec::new();
+    let mut add = |p: String| {
+        if !p.is_empty() && !paths.contains(&p) {
+            paths.push(p);
+        }
+    };
+    for (_, f) in findings {
+        if let Some(p) = f.file.as_deref() {
+            add(norm_path(p));
+        }
+    }
+    for r in reported {
+        if let Some(p) = r.path.as_deref() {
+            add(norm_path(p));
+        }
+    }
+    let texts: Vec<&str> = findings
+        .iter()
+        .flat_map(|(_, f)| [f.title.as_str(), f.detail.as_str(), f.note.as_str()])
+        .chain(reported.iter().map(|r| r.text.as_str()))
+        .collect();
+    for p in named_files(&run.repo, &texts) {
+        add(p);
+    }
+    let mut test_dirs: Vec<String> = Vec::new();
+    for p in &paths {
+        let d = parent_dir(p).to_string();
+        if !test_dirs.contains(&d) {
+            test_dirs.push(d);
+        }
+    }
+    let locked: Vec<String> = run
+        .locked
+        .iter()
+        .map(|l| l.path.clone())
+        .filter(|p| !paths.contains(p))
+        .collect();
+    let open = paths.is_empty();
+    FixScope {
+        paths,
+        test_dirs,
+        locked,
+        open,
+    }
+}
+
+/// The most of a file a fix's brief carries whole.
+const FIX_FILE_WHOLE: usize = 16 * 1024;
+/// The most a fix's brief carries of its files in all.
+const FIX_FILES_MOST: usize = 64 * 1024;
+/// Lines either side of where a blocker points, in a file too big to carry
+/// whole.
+const FIX_FILE_AROUND: usize = 60;
+
+/// The files a fix's blockers point at, as they are now, for its sessions to
+/// start from rather than read again: each whole when it's small, or else
+/// the lines around where its blockers point. After its blockers and scope,
+/// since they differ from fix to fix.
+fn fix_files(repo: &Path, scope: &FixScope, findings: &[(String, Finding)]) -> String {
+    let mut out = String::new();
+    let mut left: Vec<&str> = Vec::new();
+    for p in &scope.paths {
+        let Ok(bytes) = fs::read(repo.join(p)) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let body = if bytes.len() <= FIX_FILE_WHOLE {
+            format!("## {p}\n\n```\n{}\n```\n\n", text.trim_end())
+        } else {
+            let lines: Vec<&str> = text.lines().collect();
+            let at: Vec<usize> = findings
+                .iter()
+                .filter(|(_, f)| f.file.as_deref().map(norm_path).as_deref() == Some(p.as_str()))
+                .filter_map(|(_, f)| f.line.map(|l| l as usize))
+                .collect();
+            if at.is_empty() {
+                left.push(p);
+                continue;
+            }
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for l in at {
+                let from = l.saturating_sub(FIX_FILE_AROUND).max(1);
+                let to = (l + FIX_FILE_AROUND).min(lines.len());
+                match spans.last_mut() {
+                    Some(last) if from <= last.1 + 1 => last.1 = last.1.max(to),
+                    _ => spans.push((from, to)),
+                }
+            }
+            spans.sort();
+            let mut b =
+                format!("## {p} (lines around the blockers; read the rest if you need it)\n\n");
+            for (from, to) in spans {
+                b.push_str(&format!(
+                    "Lines {from}-{to}:\n```\n{}\n```\n\n",
+                    lines[from - 1..to].join("\n")
+                ));
+            }
+            b
+        };
+        if out.len() + body.len() > FIX_FILES_MOST {
+            left.push(p);
+            continue;
+        }
+        out.push_str(&body);
+    }
+    if out.is_empty() && left.is_empty() {
+        return String::new();
+    }
+    let mut head = String::from(
+        "\n# The files as they are now\n\nHere so you needn't read them again; what you change \
+         is in the working directory, so read a file again only after changing it.\n\n",
+    );
+    head.push_str(&out);
+    if !left.is_empty() {
+        head.push_str(&format!(
+            "Not carried here, too big: {}.\n",
+            left.join(", ")
+        ));
+    }
+    head
+}
+
+/// Puts back what a fix session changed outside its scope, from the
+/// checkout as the fix found it: each file it may not change, and each
+/// binary no blocker points at. At once, so none of it reaches a reviewer,
+/// each said, with why.
+fn put_back(
+    caller: &dyn Caller,
+    repo: &Path,
+    from: &str,
+    scope: &FixScope,
+    label: &str,
+) -> Vec<(String, String)> {
+    let Some(now) = caller.snapshot(repo) else {
+        return Vec::new();
+    };
+    if now == from {
+        return Vec::new();
+    }
+    let Some(changed) = caller.changed(repo, from, &now) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in changed {
+        let why = if c.binary && !scope.paths.contains(&c.path) {
+            "a binary no blocker points at"
+        } else if scope.locked.contains(&c.path) {
+            "put back after an earlier fix"
+        } else if scope.allows(&c.path) {
+            continue;
+        } else if super::stages::is_doc(&c.path) {
+            "a doc no blocker points at"
+        } else {
+            "outside the files this fix may change"
+        };
+        match caller.revert(repo, from, &c.path, c.existed) {
+            Ok(()) => out.push((c.path, why.to_string())),
+            Err(e) => caller.say(&format!(
+                "{label}: couldn't put back {} ({why}): {e:#}",
+                c.path
+            )),
+        }
+    }
+    if !out.is_empty() {
+        caller.say(&format!(
+            "{label}: put back {} file(s) it changed outside its scope, before anything reads \
+             them: {}",
+            out.len(),
+            out.iter()
+                .map(|(p, why)| format!("{p} ({why})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
 /// A fix outside a review to convergence: in groups when
 /// `savings.group_fixes` is on, each a fresh session from the same opening
 /// with only its own blockers, one after another in the checkout, so each
@@ -6495,13 +6939,21 @@ fn fix_in_groups(
             groups: Vec::new(),
         });
     let mut done = Vec::new();
+    let mut needs: Vec<roles::Need> = Vec::new();
+    let mut stale: Vec<roles::Stale> = Vec::new();
     for (i, group) in groups.iter().enumerate() {
         let ids = group.ids();
         if let Some(g) = partial.groups.iter().find(|g| g.ids == ids) {
             done.push(g.done.clone());
             continue;
         }
-        let prompt = roles::fix_prompt(&fix_list(&group.findings, &group.reported));
+        let scope = fix_scope(run, &group.findings, &group.reported);
+        let prompt = roles::fix_prompt(&format!(
+            "{}{}{}",
+            fix_list(&group.findings, &group.reported),
+            scope.told(),
+            fix_files(&run.repo, &scope, &group.findings)
+        ));
         let (label, part) = if n > 1 {
             (
                 format!(
@@ -6539,8 +6991,10 @@ fn fix_in_groups(
             }
             None => false,
         };
-        match fix_call(run, s, caller, &prompt, label, part, &ids, easy) {
+        match fix_call(run, s, caller, &prompt, label, part, &ids, easy, &scope) {
             Ok(fixed) => {
+                needs.extend(fixed.needs.iter().cloned());
+                stale.extend(fixed.stale.iter().cloned());
                 for (id, _) in &group.findings {
                     if let Some(lens) = run.lenses.get_mut(id)
                         && !lens.done.contains(&fixed.done)
@@ -6571,6 +7025,8 @@ fn fix_in_groups(
         done: done.join("\n"),
         declined: Vec::new(),
         briefs: BTreeMap::new(),
+        needs,
+        stale,
     })
 }
 
@@ -6592,6 +7048,7 @@ fn fix_call(
     part: Option<String>,
     blockers: &[String],
     easy: bool,
+    scope: &FixScope,
 ) -> Result<roles::Fixed> {
     let cfg = s.cfg;
     let orchestrator = (
@@ -6624,6 +7081,7 @@ fn fix_call(
         fixer.unwrap_or(orchestrator),
         route,
         baseline.clone(),
+        scope,
     );
     let fixed = restarter.once(&label, first, |again| {
         if fixer.is_some() {
@@ -6661,6 +7119,7 @@ fn fix_call(
             orchestrator,
             route.map(|_| "hard"),
             baseline,
+            scope,
         )
     });
     restarter.mark(&mut run.usage[start..]);
@@ -6680,6 +7139,7 @@ fn fix_once(
     on: (&str, &Binding),
     route: Option<&str>,
     baseline: Option<String>,
+    scope: &FixScope,
 ) -> Result<roles::Fixed> {
     let cfg = s.cfg;
     let repo = run.repo.clone();
@@ -6700,7 +7160,47 @@ fn fix_once(
     // did: a restart's own changes and its predecessor's both count.
     let before = baseline.or_else(|| caller.snapshot(&repo));
     let what = call.label.clone();
-    let legs = watched(run, s, caller, &what, |_| relayed(caller, &call, &used))?;
+    // Held to its scope where its agent can be, and checked after each of
+    // its sessions on every kind: what it changed outside its files is put
+    // back before anything reads it.
+    let put: std::sync::Mutex<Vec<(String, String)>> = Default::default();
+    let guard = || {
+        if let Some(from) = &before {
+            let back = put_back(caller, &repo, from, scope, &what);
+            lock_vec(&put).extend(back);
+        }
+    };
+    caller.fix_scope(Some(scope));
+    let legs = watched(run, s, caller, &what, |_| {
+        relayed_with(caller, &call, &used, Some(&guard))
+    });
+    // Its last session, which handed nothing off.
+    guard();
+    caller.fix_scope(None);
+    let reverted = std::mem::take(&mut *lock_vec(&put));
+    for (path, _) in &reverted {
+        if !run.locked.iter().any(|l| &l.path == path) {
+            run.locked.push(Locked {
+                path: path.clone(),
+                round: run.round,
+                by: "acrbus".into(),
+            });
+        }
+    }
+    let usd: Option<f64> = legs.as_ref().ok().and_then(|l| {
+        l.usage
+            .iter()
+            .map(|u| u.usd)
+            .try_fold(0.0, |sum, d| d.map(|d| sum + d))
+    });
+    run.guarded.push(Guarded {
+        round: run.round,
+        fix: part.clone().unwrap_or_else(|| "fix".into()),
+        paths: scope.paths.clone(),
+        reverted,
+        usd,
+    });
+    let legs = legs?;
     for mut u in legs.usage.iter().cloned() {
         u.round = run.round;
         u.route = route.map(str::to_string);
@@ -6783,19 +7283,22 @@ fn flag_fix(
         caller.say(&format!("round {round}'s fix changed no file"));
         return;
     }
-    let norm = |p: &str| p.trim().trim_start_matches("./").to_string();
-    let files: Vec<String> = folded
-        .iter()
-        .filter_map(|(_, f)| f.file.as_deref())
-        .map(norm)
-        .collect();
+    // The fix's scope, a test file beside a file its blockers point at
+    // included; and, as before, any file a blocker names.
+    let scope = FixScope {
+        locked: Vec::new(),
+        ..fix_scope(run, folded, reported)
+    };
     let texts: Vec<&str> = folded
         .iter()
         .flat_map(|(_, f)| [f.title.as_str(), f.detail.as_str(), f.note.as_str()])
         .chain(reported.iter().map(|r| r.text.as_str()))
         .collect();
-    let named =
-        |path: &str| files.iter().any(|f| f == path) || texts.iter().any(|t| t.contains(path));
+    let named = |path: &str| {
+        (!scope.open && scope.allows(path))
+            || scope.paths.iter().any(|f| f == path)
+            || texts.iter().any(|t| t.contains(path))
+    };
     let mut flagged = Vec::new();
     for c in &changed {
         let outside = !named(&c.path);
@@ -6846,6 +7349,7 @@ fn flag_fix(
 fn revert_flagged(run: &mut Run, caller: &dyn Caller) {
     let repo = run.repo.clone();
     let mut failed = Vec::new();
+    let mut locks: Vec<(String, u32)> = Vec::new();
     for f in run
         .flags
         .iter_mut()
@@ -6855,9 +7359,11 @@ fn revert_flagged(run: &mut Run, caller: &dyn Caller) {
             Ok(()) => {
                 f.state = FlagState::Reverted;
                 caller.say(&format!(
-                    "reverted {}, as you chose: it's as it was before round {}'s fix",
+                    "reverted {}, as you chose: it's as it was before round {}'s fix, and no \
+                     fix may change it again unless a blocker points at it",
                     f.path, f.round
                 ));
+                locks.push((f.path.clone(), f.round));
             }
             Err(e) => {
                 f.state = FlagState::Open;
@@ -6868,9 +7374,152 @@ fn revert_flagged(run: &mut Run, caller: &dyn Caller) {
             }
         }
     }
+    for (path, round) in locks {
+        if !run.locked.iter().any(|l| l.path == path) {
+            run.locked.push(Locked {
+                path,
+                round,
+                by: "you".into(),
+            });
+        }
+    }
     for reason in failed {
         escalate(run, reason);
     }
+}
+
+/// What a fix said for a person, kept: each change it needs outside its
+/// files, and each doc it left stale. A gate that asks at rounds puts them
+/// to a person before the next round's reviewers; one that doesn't leaves
+/// them as tickets, in the report.
+fn keep_notes(run: &mut Run, s: &Setting, caller: &dyn Caller, fixed: &roles::Fixed) {
+    let state = if s.cfg.human_gate.asks_fold() {
+        NoteState::Open
+    } else {
+        NoteState::Ticket
+    };
+    let round = run.round;
+    let mut said = Vec::new();
+    for n in &fixed.needs {
+        let path = norm_path(&n.path);
+        if path.is_empty()
+            || run
+                .fix_notes
+                .iter()
+                .any(|f| f.round == round && f.kind == "needs" && f.path == path)
+        {
+            continue;
+        }
+        let note = FixNote {
+            round,
+            kind: "needs".into(),
+            path,
+            line: None,
+            text: n.why.trim().to_string(),
+            state,
+        };
+        said.push(note.line());
+        run.fix_notes.push(note);
+    }
+    for d in &fixed.stale {
+        let path = norm_path(&d.file);
+        if path.is_empty() {
+            continue;
+        }
+        let note = FixNote {
+            round,
+            kind: "stale".into(),
+            path,
+            line: d.line,
+            text: d.says.trim().to_string(),
+            state,
+        };
+        said.push(note.line());
+        run.fix_notes.push(note);
+    }
+    if !said.is_empty() {
+        caller.say(&format!(
+            "round {round}'s fix noted {} change(s) outside its files, made by no one yet{}: {}",
+            said.len(),
+            if state == NoteState::Open {
+                ", for you to fix now, ticket or leave before the next round"
+            } else {
+                ", left as tickets"
+            },
+            said.join("; ")
+        ));
+    }
+}
+
+/// Whether a person must answer what a fix left before the next round's
+/// reviewers start, so nothing that will be reverted is reviewed: a file
+/// it changed that's flagged, or a note. Only under a gate that asks at
+/// rounds. Under `ends`, they're asked at the result, as before; under
+/// `exception`, flagged files a fix's blockers don't point at are reverted,
+/// and notes are already tickets.
+fn waits_on_fix(run: &mut Run, s: &Setting) -> bool {
+    let open_flags = run.flags.iter().any(|f| f.state == FlagState::Open);
+    if s.cfg.human_gate == super::config::HumanGate::Ends {
+        // Asked at the result, as the person chose to be.
+        return false;
+    }
+    if !s.cfg.human_gate.asks_fold() {
+        for f in run.flags.iter_mut().filter(|f| f.state == FlagState::Open) {
+            f.state = if f.outside || f.binary {
+                FlagState::Reverting
+            } else {
+                FlagState::Kept
+            };
+        }
+        return false;
+    }
+    open_flags || run.fix_notes.iter().any(|n| n.state == NoteState::Open)
+}
+
+/// Fixes each change a person allowed a fix that it needed outside its
+/// files, before the next round's reviewers: one session each, its scope
+/// that file and the tests beside it.
+fn follow_ups(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
+    let due: Vec<Reported> = run
+        .reported
+        .iter()
+        .filter(|r| r.follow_up && !r.fixed)
+        .cloned()
+        .collect();
+    if due.is_empty() || run.fixer == Fixer::Session {
+        return Ok(());
+    }
+    let from = caller.snapshot(&run.repo);
+    for r in &due {
+        let group = [r.clone()];
+        let scope = fix_scope(run, &[], &group);
+        let prompt = roles::fix_prompt(&format!(
+            "{}{}{}",
+            fix_list(&[], &group),
+            scope.told(),
+            fix_files(&run.repo, &scope, &[])
+        ));
+        let label = format!(
+            "the Orchestrator, following up a fix in {}",
+            r.path.as_deref().unwrap_or("its file")
+        );
+        fix_call(
+            run,
+            s,
+            caller,
+            &prompt,
+            label,
+            Some(format!("follow-up {}", r.id)),
+            std::slice::from_ref(&r.id),
+            false,
+            &scope,
+        )?;
+        if let Some(x) = run.reported.iter_mut().find(|x| x.id == r.id) {
+            x.fixed = true;
+        }
+    }
+    flag_fix(run, caller, from.as_deref(), &[], &due);
+    Ok(())
 }
 
 /// What's to be fixed, as the fixer reads it: each finding with what a
@@ -7406,6 +8055,18 @@ fn step(
             return Ok(false);
         }
         Stage::Review => {
+            // What the last fix left for a person is answered before any
+            // reviewer reads it, and what they allowed is fixed first.
+            if waits_on_fix(run, s) {
+                pause(run, Gate::Escalation);
+                return Ok(false);
+            }
+            revert_flagged(run, caller);
+            follow_ups(run, s, caller)?;
+            if waits_on_fix(run, s) {
+                pause(run, Gate::Escalation);
+                return Ok(false);
+            }
             let fixed = run.lenses.values().any(|l| !l.done.is_empty());
             let open: Vec<&str> = run
                 .lenses
@@ -7887,7 +8548,13 @@ lenses:
             _from: &str,
             _to: &str,
         ) -> Option<Vec<super::super::change::Changed>> {
-            self.changed.clone()
+            // What was put back is as it was, so it changed no more.
+            let reverted = self.reverted.lock().unwrap();
+            self.changed.clone().map(|all| {
+                all.into_iter()
+                    .filter(|c| !reverted.iter().any(|(p, _, _)| p == &c.path))
+                    .collect()
+            })
         }
 
         fn revert(&self, _repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
@@ -10033,6 +10700,8 @@ lenses:
                     round: 1,
                     text: "it misses a case".into(),
                     fixed: false,
+                    path: None,
+                    follow_up: false,
                 }],
             },
             "a defect a person reported missed",
@@ -14014,6 +14683,8 @@ lenses:
             round: 1,
             text: "the dates are off".into(),
             fixed: false,
+            path: None,
+            follow_up: false,
         }];
         let groups = fix_groups(&findings, &reported);
         let ids: Vec<Vec<String>> = groups.iter().map(FixGroup::ids).collect();
@@ -14714,8 +15385,7 @@ lenses:
     }
 
     #[test]
-    fn a_fix_that_changes_a_binary_or_a_file_no_blocker_names_is_flagged_and_asked_at_the_next_gate()
-     {
+    fn a_fix_that_changes_a_binary_or_a_file_outside_its_scope_has_it_put_back_at_once() {
         let cfg = plain("ends", 3, 1);
         let mut fake = Fake::new(defect_in("alpha", 1));
         fake.changed = rebuilt();
@@ -14734,68 +15404,208 @@ lenses:
         );
         super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
-        // The fix ran, and the next gate is the result's.
+        // The fix ran, and the next gate is the result's, with nothing
+        // flagged: what it changed outside a.src was put back as its
+        // session ended, before any reviewer read it.
         assert_eq!(run.waiting, Some(Gate::Final));
         let told = fake.told.lock().unwrap().join("\n");
         assert!(
             told.contains(
-                "say: round 1's fix changed 3 file(s): a.src, build/tool.bin, notes.md; flagged \
-                 for you to keep or revert at the next gate, and the report: build/tool.bin (a \
-                 binary, and no blocker points at it), notes.md (no blocker points at it)"
+                "put back 2 file(s) it changed outside its scope, before anything reads them: \
+                 build/tool.bin (a binary no blocker points at), notes.md (a doc no blocker \
+                 points at)"
             ),
             "{told}"
         );
-        let flagged: Vec<(&str, bool, bool, FlagState)> = run
-            .flags
+        assert!(
+            told.contains("say: round 1's fix changed 1 file(s): a.src"),
+            "{told}"
+        );
+        assert!(run.flags.is_empty(), "{:?}", run.flags);
+        let reverted = fake.reverted.lock().unwrap();
+        let paths: Vec<&str> = reverted.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(paths, ["build/tool.bin", "notes.md"]);
+        // notes.md wasn't there before: put back means removed.
+        assert!(reverted[0].2 && !reverted[1].2);
+        // Locked for the rest of the run, and on the record with the fix.
+        let locked: Vec<(&str, &str)> = run
+            .locked
             .iter()
-            .map(|f| (f.path.as_str(), f.binary, f.outside, f.state))
+            .map(|l| (l.path.as_str(), l.by.as_str()))
             .collect();
         assert_eq!(
-            flagged,
-            [
-                ("build/tool.bin", true, true, FlagState::Open),
-                ("notes.md", false, true, FlagState::Open),
-            ]
+            locked,
+            [("build/tool.bin", "acrbus"), ("notes.md", "acrbus")]
         );
-        assert_eq!(headers(&run, &cfg), ["Flagged", "Result", "Missed"]);
-        let ask = super::super::carousel::ask(&run, &cfg, "acrbus");
-        let q = &ask.carousels[0].questions[0];
-        assert!(q.multi_select);
-        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, ["build/tool.bin", "notes.md", "Keep them"]);
-        // Each with the exact command that reverts it.
-        assert!(q.options[0].description.contains(&run.flags[0].command));
-        assert!(q.options[1].description.contains(&run.flags[1].command));
-        assert!(run.flags[1].command.starts_with("rm -f -- "));
-        // In the report too.
-        assert_eq!(report::report(&run, &cfg).flags.len(), 2);
-        // Nothing is reverted until a person says.
-        assert!(fake.reverted.lock().unwrap().is_empty());
+        assert_eq!(run.guarded.len(), 1);
+        assert_eq!(run.guarded[0].paths, ["a.src"]);
+        assert_eq!(run.guarded[0].reverted.len(), 2);
+        assert!(report::report(&run, &cfg).guarded.len() == 1);
+        // The fixer was told its files, and a later fix is told what's locked.
+        let fixes = prompts(&fake, Role::Orchestrator, "Fix these");
+        assert!(
+            fixes[0].contains("# The files this fix may change"),
+            "{}",
+            fixes[0]
+        );
+        assert!(fixes[0].contains("`a.src`"), "{}", fixes[0]);
+        let scope = fix_scope(&run, &[], &[]);
+        assert!(scope.locked.contains(&"notes.md".to_string()));
+        assert!(!scope.allows("notes.md"));
+    }
+
+    #[test]
+    fn a_fix_scope_allows_its_files_tests_beside_them_and_nothing_locked() {
+        let scope = FixScope {
+            paths: vec!["pkg/a.go".into()],
+            test_dirs: vec!["pkg".into()],
+            locked: vec!["pkg/old_test.go".into()],
+            open: false,
+        };
+        assert!(scope.allows("pkg/a.go") && scope.allows("./pkg/a.go"));
+        // A test beside it, to pin the fix, new or not.
+        assert!(scope.allows("pkg/a_test.go"));
+        // Not one elsewhere, not a doc or other code, and not one locked.
+        assert!(!scope.allows("other/a_test.go"));
+        assert!(!scope.allows("pkg/README.md") && !scope.allows("pkg/b.go"));
+        assert!(!scope.allows("pkg/old_test.go"));
+        // A fix whose blockers point at no file: code, but no doc.
+        let open = FixScope {
+            open: true,
+            ..FixScope::default()
+        };
+        assert!(open.allows("x/y.go") && !open.allows("CHANGELOG.md"));
+        // What the fixer reads of it.
+        let told = scope.told();
+        assert!(
+            told.contains("`pkg/a.go`") && told.contains("Never `pkg/old_test.go`"),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn a_fixers_brief_carries_its_files_whole_or_around_where_its_blockers_point() {
+        let dir = std::env::temp_dir().join(format!("tb-fixfiles-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("small.src"), "one\ntwo\n").unwrap();
+        let big: String = (1..=2000).map(|n| format!("line {n}\n")).collect();
+        fs::write(dir.join("big.src"), &big).unwrap();
+        let scope = FixScope {
+            paths: vec!["small.src".into(), "big.src".into()],
+            ..FixScope::default()
+        };
+        let at_line = |file: &str, line: u64| {
+            (
+                "alpha".to_string(),
+                Finding {
+                    file: Some(file.into()),
+                    line: Some(line),
+                    ..serde_json::from_str::<Finding>(
+                        r#"{"id": "x", "title": "t", "detail": "d", "file": null, "line": null, "severity": "High", "action": "blocks", "reason": "", "state": "open"}"#,
+                    )
+                    .unwrap()
+                },
+            )
+        };
+        let text = fix_files(&dir, &scope, &[at_line("big.src", 1000)]);
+        assert!(
+            text.contains("## small.src\n\n```\none\ntwo\n```"),
+            "{text}"
+        );
+        assert!(text.contains("Lines 940-1060:"), "{text}");
+        assert!(
+            text.contains("line 1000\n") && !text.contains("line 10\n"),
+            "{text}"
+        );
+        // A big file with no line to start from isn't carried, and says so.
+        let none = fix_files(&dir, &scope, &[]);
+        assert!(
+            none.contains("Not carried here, too big: big.src."),
+            "{none}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_a_fix_notes_is_asked_before_the_next_round_and_allowed_ones_are_followed_up() {
+        let cfg = plain("in-the-loop", 3, 1);
+        let fixed = Mutex::new(0);
+        let fake = Fake::new(move |role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && *fixed.lock().unwrap() == 0 => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator
+                    if prompt.contains("following up") || prompt.contains("follow-up") =>
+                {
+                    r#"{"done": "changed the caller"}"#.to_string()
+                }
+                Role::Orchestrator if prompt.contains("Fix these") => {
+                    *fixed.lock().unwrap() += 1;
+                    r#"{"done": "fixed it", "needs": [{"path": "b.src", "why": "its caller passes the old argument"}],
+                        "stale": [{"file": "README.md", "line": 3, "says": "the old default"}]}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let reload = |_| Ok(c.clone());
+        drive(&mut run, &s, &fake, &reload).unwrap();
         let a = answered(
             &run,
             &cfg,
             &[
-                ("Flagged", serde_json::json!(["build/tool.bin"])),
-                ("Result", "Approve".into()),
-                ("Missed", "Not now".into()),
+                ("Scope", "Approve".into()),
+                ("Fixer", "The Orchestrator".into()),
             ],
         );
         super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
-        assert_eq!(run.status, Status::Confirmed);
-        let reverted = fake.reverted.lock().unwrap();
-        assert_eq!(reverted.len(), 1);
-        assert_eq!(reverted[0].0, "build/tool.bin");
-        assert_eq!(reverted[0].1, run.flags[0].from);
-        assert!(reverted[0].2);
-        assert_eq!(
-            run.flags.iter().map(|f| f.state).collect::<Vec<_>>(),
-            [FlagState::Reverted, FlagState::Kept]
-        );
+        assert_eq!(run.waiting, Some(Gate::Fold));
+        let a = answered(&run, &cfg, &[("Blocker 1", "Fix it".into())]);
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        let reviews_before = fake.count(Role::Reviewer);
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // Stopped after the fix, before the next round's reviewers.
+        assert_eq!(fake.count(Role::Reviewer), reviews_before);
+        assert_eq!(run.stage, Stage::Review);
+        assert_eq!(run.fix_notes.len(), 2);
+        let h = headers(&run, &cfg);
         assert!(
-            report::flag_line(&run.flags[1])
-                .contains("round 1's fix changed notes.md (no blocker points at it): kept")
+            h.contains(&"Noted 1".to_string()) && h.contains(&"Noted 2".to_string()),
+            "{h:?}"
         );
+        let a = answered(
+            &run,
+            &cfg,
+            &[
+                ("Noted 1", "Fix it now".into()),
+                ("Noted 2", "A ticket".into()),
+            ],
+        );
+        super::super::carousel::apply(&mut run, &cfg, &a, 1).unwrap();
+        drive(&mut run, &s, &fake, &reload).unwrap();
+        // The allowed one was fixed in a session of its own, scoped to b.src,
+        // and didn't send every lens back; the stale doc is a ticket.
+        let follow = prompts(&fake, Role::Orchestrator, "b.src");
+        assert!(
+            follow
+                .iter()
+                .any(|p| p.contains("`b.src`") && p.contains("its caller passes")),
+            "{follow:?}"
+        );
+        assert!(run.reported.iter().all(|r| r.fixed && r.follow_up));
+        assert!(
+            report::tickets(&run)
+                .iter()
+                .any(|t| t.title == "Stale doc: README.md")
+        );
+        assert!(fake.count(Role::Reviewer) > reviews_before);
     }
 
     #[test]
