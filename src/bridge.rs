@@ -87,6 +87,11 @@ const EFFORT_ENV: &str = "ACRBUS_EFFORT";
 /// model calls, what the prompt cache served, from pi's own usage, and the
 /// effort the provider says it applied.
 const TURNS_ENV: &str = "ACRBUS_TURNS";
+/// What a review's call to pi is told about handing off: the prompt tokens
+/// of one turn past which it writes its handoff, for a fresh session to
+/// carry on from. The extension reads each turn's size from the same usage
+/// it logs for `ACRBUS_TURNS`.
+const RELAY_ENV: &str = "ACRBUS_RELAY_TOKENS";
 /// acrbus's extension for pi, which sends the cache key where a gateway
 /// passes it on, says what the cache served, and holds a call to its tools.
 const PI_EXTENSION: &str = include_str!("bridges/acrbus-pi.js");
@@ -283,6 +288,8 @@ struct Plan {
     cache_key: Option<String>,
     /// With every role given the same tools: the ones this call may use.
     allowed_tools: Option<Vec<String>>,
+    /// Where the call hands off, when its agent can be steered mid-call.
+    relay_tokens: Option<u64>,
 }
 
 impl Plan {
@@ -294,6 +301,7 @@ impl Plan {
             workdir: self.workdir.display().to_string(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            relay_tokens: self.relay_tokens,
         }
     }
 }
@@ -663,6 +671,7 @@ impl Settings {
             facts: None,
             cache_key: None,
             allowed_tools: None,
+            relay_tokens: None,
         };
         let Some(options) = options else {
             return Ok(plan);
@@ -671,9 +680,23 @@ impl Settings {
         if !plan.review
             && (options.facts.is_some()
                 || options.cache_key.is_some()
-                || options.allowed_tools.is_some())
+                || options.allowed_tools.is_some()
+                || options.relay_tokens.is_some())
         {
-            return Err("facts, a cache key and allowed tools are only for a review".into());
+            return Err(
+                "facts, a cache key, allowed tools and a relay are only for a review".into(),
+            );
+        }
+        // Only an agent acrbus can steer mid-call hands off. Any other runs
+        // the call whole, and the reply's applied says so, rather than the
+        // review failing for it.
+        if let Some(tokens) = options.relay_tokens {
+            if tokens == 0 {
+                return Err("a relay needs a size to hand off at".into());
+            }
+            if self.agent_kind() == Some(Kind::Pi) {
+                plan.relay_tokens = Some(tokens);
+            }
         }
         if let Some(facts) = &options.facts {
             let path = PathBuf::from(facts);
@@ -3077,7 +3100,7 @@ impl Bridge {
             }
             // Every role's call, so each says what its turns read from the
             // cache and what effort it ran at, not only those that share a
-            // prefix or are held to their tools.
+            // prefix, are held to their tools, or relay.
             if kind == Kind::Pi {
                 args.push("-e".into());
                 args.push(self.extension()?.display().to_string());
@@ -3110,6 +3133,9 @@ impl Bridge {
         }
         if kind == Some(Kind::Pi) {
             command.env(TURNS_ENV, "1");
+            if let Some(tokens) = plan.relay_tokens {
+                command.env(RELAY_ENV, tokens.to_string());
+            }
         }
         // Anthropic's longer-lived prompt cache, which Claude Code takes by
         // this, for a review's calls, whose prefix outlives five minutes.
@@ -6172,5 +6198,169 @@ console.log(JSON.stringify(out));
         assert!(said.contains("the daemon isn't answering"), "{said}");
         assert!(started_since(&paths, "api", now_ms() - 60_000));
         assert!(!started_since(&paths, "api", now_ms() + 60_000));
+    }
+
+    #[test]
+    fn a_relay_is_only_for_a_review_and_only_an_agent_that_can_be_steered_takes_it() {
+        let rig = Rig::new();
+        let plain = generous(&rig, "echo hi");
+        let pi = rig.settings("echo hi", PI_TOOLS);
+        let ask = |relay: u64, review: bool| RunOptions {
+            review: Some(review),
+            relay_tokens: Some(relay),
+            ..RunOptions::default()
+        };
+        assert!(
+            pi.plan(Some(&ask(90_000, false)))
+                .unwrap_err()
+                .contains("only for a review")
+        );
+        assert!(pi.plan(Some(&ask(0, true))).unwrap_err().contains("a size"));
+        let steered = pi.plan(Some(&ask(90_000, true))).unwrap();
+        assert_eq!(steered.relay_tokens, Some(90_000));
+        assert_eq!(steered.applied().relay_tokens, Some(90_000));
+        // Any other agent runs the call whole, and the reply says so.
+        let whole = plain.plan(Some(&ask(90_000, true))).unwrap();
+        assert_eq!(whole.relay_tokens, None);
+        assert_eq!(whole.applied().relay_tokens, None);
+    }
+
+    #[test]
+    fn a_relays_size_reaches_pi_and_loads_acrbus_extension() {
+        let rig = Rig::new();
+        let script = r#"shift 2; for a in "$@"; do printf '[%s]\n' "$a"; done; printf 'relay=%s\n' "$ACRBUS_RELAY_TOKENS""#;
+        let bridge = rig.start(rig.settings(script, PI_TOOLS));
+        let relayed = rig.reply_to(&rig.ask_with(with(RunOptions {
+            review: Some(true),
+            relay_tokens: Some(90_000),
+            ..RunOptions::default()
+        })));
+        let whole = rig.reply_to(&rig.ask_with(with(RunOptions {
+            review: Some(true),
+            ..RunOptions::default()
+        })));
+        bridge.stop().unwrap();
+        assert!(relayed.contains("relay=90000"), "{relayed}");
+        assert!(relayed.contains("[-e]\n["), "acrbus's extension: {relayed}");
+        // Without a size, the extension still loads, for its turn figures,
+        // but nothing tells it to hand off.
+        assert!(whole.trim_end().ends_with("relay="), "{whole}");
+        assert!(whole.contains("[-e]\n["), "{whole}");
+    }
+
+    #[test]
+    fn the_pi_extension_hands_off_past_its_size_and_marks_the_answer() {
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            eprintln!("no node here: the extension's own test is skipped");
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let dir = env::temp_dir().join(format!("tb-relay-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acrbus-pi.mjs"), PI_EXTENSION).unwrap();
+        fs::write(
+            dir.join("check.mjs"),
+            r#"import acrbus from "./acrbus-pi.mjs";
+const handlers = {};
+acrbus({ on: (name, f) => { (handlers[name] ??= []).push(f); } });
+const fire = async (name, event) => {
+  let out;
+  for (const f of handlers[name] ?? []) out = (await f(event, {})) ?? out;
+  return out ?? null;
+};
+// A turn as pi gives it: its model call's message first, whose usage the
+// extension reads once, then the turn's end.
+const turn = async (input, cacheRead, tools) => {
+  const message = { role: "assistant", usage: { input, cacheRead, cacheWrite: 0, output: 10 } };
+  await fire("message_end", { message });
+  return fire("turn_end", { turnIndex: 1, message, toolResults: tools ? [{}] : [], entries: [] });
+};
+const out = {};
+out.wired = Object.keys(handlers).sort();
+out.under = await turn(1000, 30000, true);
+out.toolBefore = await fire("tool_call", { toolName: "read" });
+// The answer itself, past the size but calling no tools: not handed off.
+out.answer = await turn(5000, 60000, false);
+out.past = await turn(5000, 60000, true);
+out.again = await turn(5000, 70000, true);
+out.toolAfter = await fire("tool_call", { toolName: "read" });
+out.user = await fire("message_end", { message: { role: "user", content: [{ type: "text", text: "hi" }] } });
+out.marked = await fire("message_end", { message: { role: "assistant", content: [{ type: "thinking" }, { type: "text", text: "{\"findings\": []}" }] } });
+out.bare = await fire("message_end", { message: { role: "assistant", content: [] } });
+console.log(JSON.stringify(out));
+"#,
+        )
+        .unwrap();
+        let run = |relay: Option<&str>| -> (serde_json::Value, String) {
+            let mut c = Command::new("node");
+            c.arg(dir.join("check.mjs"))
+                .env_remove("ACRBUS_CACHE_KEY")
+                .env_remove("ACRBUS_ALLOWED_TOOLS")
+                .env_remove("ACRBUS_EFFORT")
+                .env_remove("ACRBUS_TURNS")
+                .env_remove("ACRBUS_RELAY_TOKENS");
+            if let Some(r) = relay {
+                c.env("ACRBUS_RELAY_TOKENS", r);
+            }
+            let out = c.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            (serde_json::from_slice(&out.stdout).unwrap(), stderr)
+        };
+        let (on, said) = run(Some("40000"));
+        assert_eq!(on["under"], serde_json::Value::Null);
+        assert_eq!(on["toolBefore"], serde_json::Value::Null);
+        assert_eq!(
+            on["answer"],
+            serde_json::Value::Null,
+            "the answer itself never hands off"
+        );
+        assert_eq!(on["past"]["continue"], true);
+        let entry = &on["past"]["entries"][0];
+        assert_eq!(entry["type"], "custom_message");
+        assert_eq!(entry["customType"], "acrbus-relay");
+        assert!(entry["content"].as_str().unwrap().contains("\"handoff\""));
+        assert_eq!(on["again"], serde_json::Value::Null, "told once");
+        assert_eq!(on["toolAfter"]["block"], true);
+        assert_eq!(on["user"], serde_json::Value::Null);
+        let text = on["marked"]["message"]["content"][1]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, "ACRBUS-HANDOFF\n{\"findings\": []}");
+        assert_eq!(
+            on["bare"]["message"]["content"][0]["text"],
+            "ACRBUS-HANDOFF\n"
+        );
+        assert!(
+            said.contains("acrbus relay: turn 1 read 65000 prompt tokens, past 40000: handing off"),
+            "{said}"
+        );
+        // Its size is the turn log's own reading, so the two agree.
+        let mut both = Command::new("node");
+        both.arg(dir.join("check.mjs"))
+            .env_remove("ACRBUS_CACHE_KEY")
+            .env_remove("ACRBUS_ALLOWED_TOOLS")
+            .env_remove("ACRBUS_EFFORT")
+            .env("ACRBUS_TURNS", "1")
+            .env("ACRBUS_RELAY_TOKENS", "40000");
+        let both = both.output().unwrap();
+        assert!(both.status.success());
+        let logged = String::from_utf8_lossy(&both.stderr);
+        let both: serde_json::Value = serde_json::from_slice(&both.stdout).unwrap();
+        assert_eq!(both["past"]["continue"], true);
+        assert!(
+            logged.contains("acrbus cache: turn 3: 60000 of 65000 prompt tokens"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("read 65000 prompt tokens, past 40000"),
+            "{logged}"
+        );
+        // Without a size, nothing of it is wired.
+        let (off, _) = run(None);
+        assert_eq!(off["wired"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

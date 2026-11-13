@@ -202,6 +202,7 @@ pub fn propose(
             // its own clone, which goes when it's done.
             writes: false,
             no_tools: false,
+            relay_tokens: None,
             repo: clone,
             label: "the configurer".to_string(),
         })

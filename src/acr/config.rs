@@ -326,6 +326,69 @@ pub struct Policy {
     /// anything a role may read or use. See `SavingsPolicy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub savings: Option<SavingsPolicy>,
+    /// How long calls are broken up, so a call's context doesn't grow every
+    /// turn without end. See `SessionsPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<SessionsPolicy>,
+}
+
+/// How a role's long calls are broken into shorter sessions, each starting
+/// from the shared opening the prompt cache holds, instead of one session
+/// that rereads everything it has read on every turn. Off unless set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionsPolicy {
+    /// By role, `reviewer` or `judge`: the prompt tokens of one turn past
+    /// which a call hands off to a fresh session. It writes its findings so
+    /// far, what it has checked and what's left, and a fresh session on the
+    /// same binding carries on from that. Only agents acrbus can steer
+    /// mid-call relay; others run whole.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relay_tokens: BTreeMap<Role, u64>,
+    /// Lenses whose reviewers scout first: one session lists what it
+    /// suspects, without verifying, and each suspicion is then confirmed or
+    /// dropped in a short session of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scout: Option<Vec<String>>,
+}
+
+impl SessionsPolicy {
+    fn over(mut self, later: SessionsPolicy) -> SessionsPolicy {
+        self.relay_tokens.extend(later.relay_tokens);
+        self.scout = later.scout.or(self.scout);
+        self
+    }
+}
+
+/// The least a relay may be set to: well past any shared opening, so a
+/// session has room to work before it hands off.
+pub const RELAY_MIN_TOKENS: u64 = 32_000;
+
+/// The sessions settings, resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsConfig {
+    pub relay_tokens: BTreeMap<Role, u64>,
+    pub scout: Vec<String>,
+}
+
+impl SessionsConfig {
+    fn of(p: Option<SessionsPolicy>) -> SessionsConfig {
+        let p = p.unwrap_or_default();
+        SessionsConfig {
+            relay_tokens: p.relay_tokens,
+            scout: p.scout.unwrap_or_default(),
+        }
+    }
+
+    /// Where `role`'s calls hand off, if they do.
+    pub fn relay(&self, role: Role) -> Option<u64> {
+        self.relay_tokens.get(&role).copied()
+    }
+
+    /// Whether `lens`'s reviewers scout, then verify.
+    pub fn scouts(&self, lens: &str) -> bool {
+        self.scout.iter().any(|l| l == lens)
+    }
 }
 
 /// How a round shares the change map and diff with its roles, ahead of
@@ -718,6 +781,10 @@ impl Policy {
             (Some(savings), Some(later)) => Some(savings.over(later)),
             (savings, later) => later.or(savings),
         };
+        self.sessions = match (self.sessions, later.sessions) {
+            (Some(sessions), Some(later)) => Some(sessions.over(later)),
+            (sessions, later) => later.or(sessions),
+        };
         self
     }
 }
@@ -851,6 +918,10 @@ pub struct Config {
     /// stored configs have none, and get the defaults.
     #[serde(default)]
     pub savings: SavingsConfig,
+    /// How long calls are broken into sessions. Older runs' stored configs
+    /// have none, and get the defaults: off.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
@@ -976,11 +1047,14 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         allowed_models: merged.allowed_models.unwrap_or_default(),
         facts: FactsConfig::of(merged.facts),
         savings: SavingsConfig::of(merged.savings),
+        sessions: SessionsConfig::of(merged.sessions),
     };
     config.check()?;
     config.check_models()?;
     config.first_pass_judge()?;
-    with_stage_lenses(with_universal_lenses(default_probes(config, chosen)))
+    let config = with_stage_lenses(with_universal_lenses(default_probes(config, chosen)))?;
+    config.check_sessions()?;
+    Ok(config)
 }
 
 /// Probes by default need reviewers that can run things: without that,
@@ -1167,6 +1241,33 @@ impl Config {
         }
         if !self.allowed_bindings.is_empty() {
             self.check_bindings()?;
+        }
+        Ok(())
+    }
+
+    /// Relays only for the roles that read at length, past a size that
+    /// leaves a session room to work; scouting only for lenses that exist,
+    /// the framework's own included.
+    fn check_sessions(&self) -> Result<()> {
+        for (role, tokens) in &self.sessions.relay_tokens {
+            if !matches!(role, Role::Reviewer | Role::Judge) {
+                bail!(
+                    "sessions.relay_tokens.{}: only reviewers' and Judges' calls relay",
+                    role.as_str()
+                );
+            }
+            if *tokens < RELAY_MIN_TOKENS {
+                bail!(
+                    "sessions.relay_tokens.{}: {tokens} is too few to work in; it must be at \
+                     least {RELAY_MIN_TOKENS}",
+                    role.as_str()
+                );
+            }
+        }
+        for id in &self.sessions.scout {
+            if !self.lenses.iter().any(|l| &l.id == id) {
+                bail!("sessions.scout names lens {id}, which doesn't exist");
+            }
         }
         Ok(())
     }
@@ -1914,6 +2015,7 @@ mod tests {
             allowed_models: Some(Vec::new()),
             facts: Some(FactsPolicy::default()),
             savings: Some(SavingsPolicy::default()),
+            sessions: Some(SessionsPolicy::default()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();
@@ -1922,5 +2024,66 @@ mod tests {
         published.sort();
         assert_eq!(ours, published);
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn sessions_are_off_unless_set_and_checked_when_they_are() {
+        let user = parse_user(MODELS_USER).unwrap();
+        let load = |extra: &str| {
+            resolve(
+                &user,
+                parse_repo(&format!("{SMALL}{extra}"))?,
+                &Flags::default(),
+            )
+        };
+        // Off by default: no relay for any role, and no lens scouts.
+        let off = load("").unwrap();
+        assert_eq!(off.sessions, SessionsConfig::default());
+        assert_eq!(off.sessions.relay(Role::Reviewer), None);
+        assert!(!off.sessions.scouts("l"));
+        let on = load("sessions: {relay_tokens: {reviewer: 120000, judge: 90000}, scout: [l]}\n")
+            .unwrap();
+        assert_eq!(on.sessions.relay(Role::Reviewer), Some(120_000));
+        assert_eq!(on.sessions.relay(Role::Judge), Some(90_000));
+        assert!(on.sessions.scouts("l"));
+        // The framework's own lenses can scout too.
+        assert!(
+            load(&format!("sessions: {{scout: [{ELEGANCE}]}}\n"))
+                .unwrap()
+                .sessions
+                .scouts(ELEGANCE)
+        );
+        for (extra, says) in [
+            (
+                "sessions: {relay_tokens: {orchestrator: 90000}}\n",
+                "only reviewers' and Judges'",
+            ),
+            ("sessions: {relay_tokens: {reviewer: 1000}}\n", "too few"),
+            ("sessions: {scout: [nope]}\n", "doesn't exist"),
+        ] {
+            let err = format!("{:#}", load(extra).unwrap_err());
+            assert!(err.contains(says), "{extra}: {err}");
+        }
+        assert!(parse_repo(&format!("{SMALL}sessions: {{relay: 1}}\n")).is_err());
+        // The user's defaults and the repository's merge, the later winning.
+        let mut both = parse_user(MODELS_USER).unwrap();
+        let mut defaults = both.defaults.take().unwrap_or_default();
+        defaults.sessions = Some(SessionsPolicy {
+            relay_tokens: BTreeMap::from([(Role::Reviewer, 100_000), (Role::Judge, 80_000)]),
+            scout: None,
+        });
+        both.defaults = Some(defaults);
+        let merged = resolve(
+            &both,
+            parse_repo(&format!(
+                "{SMALL}sessions: {{relay_tokens: {{judge: 60000}}, scout: [l]}}\n"
+            ))
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        assert_eq!(merged.sessions.relay(Role::Reviewer), Some(100_000));
+        assert_eq!(merged.sessions.relay(Role::Judge), Some(60_000));
+        assert!(merged.sessions.scouts("l"));
     }
 }

@@ -643,6 +643,9 @@ fn call_options(call: &Call, keep_logs: bool, timeout: Option<u64>) -> RunOption
         // its bridge allows, unless its binding caps it, and the bridge
         // ends one that stalls.
         timeout,
+        // A reviewer or Judge that hands off past a size: a fresh session
+        // carries on from its handoff.
+        relay_tokens: call.relay_tokens,
         ..options_for(call.binding)
     };
     // No tools at all: it answers from what it's given.
@@ -725,6 +728,7 @@ pub(crate) fn options_for(b: &config::Binding) -> RunOptions {
         facts: None,
         cache_key: None,
         allowed_tools: None,
+        relay_tokens: None,
     }
 }
 
@@ -1362,6 +1366,8 @@ struct BridgeCaller {
     /// has been answered: to tell when a fan-out's first has filled the
     /// prompt cache.
     sent: std::sync::Mutex<std::collections::HashMap<String, (String, String, bool)>>,
+    /// Agents asked to relay that can't be steered mid-call, said once each.
+    unrelayed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Drop for BridgeCaller {
@@ -1398,6 +1404,7 @@ impl BridgeCaller {
             calls_file: std::sync::Mutex::new(None),
             shared: std::sync::Mutex::new(None),
             sent: Default::default(),
+            unrelayed: Default::default(),
         })
     }
 
@@ -1756,6 +1763,24 @@ impl BridgeCaller {
                 // The bridge made it for this reply alone.
                 if let Some(a) = whole {
                     self.noted(&a.sha256);
+                }
+                // Asked to relay, on an agent its bridge can't steer: the
+                // call ran whole, and a person following the review is told.
+                if call.relay_tokens.is_some()
+                    && result
+                        .and_then(|r| r.applied.as_ref())
+                        .is_some_and(|a| a.relay_tokens.is_none())
+                    && self
+                        .unrelayed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(b.agent.clone())
+                {
+                    self.progress.line(&format!(
+                        "{}: its agent can't be steered mid-call, so its calls don't relay and \
+                         run whole",
+                        b.agent
+                    ));
                 }
                 Ok(Answer {
                     text,
@@ -2240,6 +2265,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     for r in &summary.repairs {
         eprintln!("{APP_NAME}: {}", r.line());
+    }
+    for x in &summary.sessions {
+        eprintln!("{APP_NAME}: {}", x.line());
     }
     for p in &run.prefixes {
         eprintln!("{APP_NAME}: round {}: {}", p.round, p.line());
@@ -2897,11 +2925,16 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
             let unreported = report::writes_unreported(&run.usage);
+            let sessions = report::sessions(&run.usage);
             if json {
+                // Each session of a call broken up, as its own call.
+                let parts: Vec<&flow::Usage> =
+                    run.usage.iter().filter(|u| u.part.is_some()).collect();
                 let out = serde_json::json!({
                     "run_id": run.id, "by_role": rows, "facts": run.facts,
                     "prefixes": run.prefixes, "repairs": repairs,
                     "first_turns": firsts, "cache_writes_unreported": unreported,
+                    "sessions": sessions, "session_calls": parts,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -2919,6 +2952,12 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                 }
                 if unreported {
                     println!("{}", report::WRITES_UNREPORTED);
+                }
+                for x in &sessions {
+                    println!("{}", x.line());
+                }
+                for line in report::session_lines(&run.usage) {
+                    println!("{line}");
                 }
                 if run.usage.iter().any(|u| u.label.is_none()) {
                     println!(
@@ -3509,6 +3548,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: false,
             no_tools: false,
+            relay_tokens: None,
             repo: &tree,
             label: format!(
                 "the check: {name}{place}",
@@ -3584,6 +3624,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             artifact: None,
             writes: true,
             no_tools: false,
+            relay_tokens: None,
             repo: &s.tree,
             label: "the check: the steelman".to_string(),
         });
@@ -4162,6 +4203,7 @@ fn calibrate(
             artifact: Some(&artifact),
             writes: false,
             no_tools: false,
+            relay_tokens: None,
             repo: &s.tree,
             label: format!("{}: the Judge, on the key's findings", lens.id),
         })?;
@@ -4181,6 +4223,7 @@ fn calibrate(
                     artifact: Some(&artifact),
                     writes: false,
                     no_tools: false,
+                    relay_tokens: None,
                     repo: &s.tree,
                     label: format!("{}: the first-pass Judge, on the key's findings", lens.id),
                 })
@@ -4225,6 +4268,7 @@ fn calibrate(
                             artifact: Some(artifact),
                             writes: false,
                             no_tools: false,
+                            relay_tokens: None,
                             repo: tree,
                             label: format!("{}: the Judge, on key finding {i}", lens.id),
                         });
@@ -5360,6 +5404,7 @@ mod tests {
             artifact: None,
             writes: true,
             no_tools: false,
+            relay_tokens: None,
             repo: Path::new("."),
             label: "the Orchestrator, fixing".into(),
         };
@@ -5528,9 +5573,23 @@ mod tests {
             artifact: None,
             writes: false,
             no_tools,
+            relay_tokens: None,
             repo: &repo,
             label: "x".into(),
         };
+        // A call that relays asks its bridge to hand off past its size.
+        let relaying = flow::Call {
+            relay_tokens: Some(90_000),
+            ..call(Role::Reviewer, false)
+        };
+        assert_eq!(
+            call_options(&relaying, false, Some(60)).relay_tokens,
+            Some(90_000)
+        );
+        assert_eq!(
+            call_options(&call(Role::Reviewer, false), false, Some(60)).relay_tokens,
+            None
+        );
         for role in [Role::Judge, Role::Reviewer, Role::Orchestrator, Role::Sizer] {
             let options = call_options(&call(role, false), false, Some(60));
             assert_eq!(options.tools, binding.tools, "{role:?}");
@@ -5581,6 +5640,7 @@ mod tests {
             artifact: None,
             writes,
             no_tools,
+            relay_tokens: None,
             repo: &repo,
             label: "x".into(),
         };
@@ -5665,6 +5725,7 @@ mod tests {
                 artifact: *artifact,
                 writes: false,
                 no_tools: false,
+                relay_tokens: None,
                 repo: &repo,
                 label: label.to_string(),
             };

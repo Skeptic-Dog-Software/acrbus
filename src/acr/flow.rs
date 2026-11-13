@@ -37,6 +37,9 @@ pub struct Call<'a> {
     /// It runs with no tools at all, to answer from what it's given: the
     /// Sizer's first look. Its bridge refuses it if its agent can't.
     pub no_tools: bool,
+    /// The prompt tokens of one turn past which it hands off to a fresh
+    /// session, when its role's calls relay and its agent can.
+    pub relay_tokens: Option<u64>,
     /// The repository, which every role works in: reviewers read it, and an
     /// Orchestrator fixes it.
     pub repo: &'a Path,
@@ -418,6 +421,10 @@ pub struct Usage {
     /// first turn read from the cache, which shows a warm-up worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_turn: Option<crate::proto::TurnUsage>,
+    /// Its part of a call broken into sessions: "leg 2" of a relay,
+    /// "scout", or "verify 3".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
 }
 
 /// Whose answer a repair put in form: its role, binding and model.
@@ -815,6 +822,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         first: false,
         repaired: None,
         first_turn: None,
+        part: None,
     };
     match &answer.usage {
         Some(counted) => {
@@ -886,6 +894,134 @@ fn input_bytes(prompt: &str, artifact: Option<&Path>) -> usize {
             .map_or(0, |m| m.len() as usize)
 }
 
+/// One call's sessions. With `relay_tokens` set, a session past that size
+/// hands off, and a fresh one on the same binding carries on from its
+/// handoff, from the shared opening, until one answers. Without it, one
+/// session, as always.
+pub struct Legs {
+    /// Each session's usage, marked "leg N" when there was more than one.
+    pub usage: Vec<Usage>,
+    /// The handoffs' answers, holding what each session found, to merge.
+    pub handed: Vec<String>,
+    /// The last session's answer.
+    pub last: String,
+    /// The last session's label.
+    pub label: String,
+}
+
+/// Runs `call`, relayed if it asks to be. A handoff that can't be read, or
+/// two in a row with nothing new and the same left to do, is an error,
+/// never a finished call: what's left would go unchecked.
+pub fn relayed(
+    caller: &dyn Caller,
+    call: &Call,
+    used: &dyn Fn(&Call, &Answer) -> Usage,
+) -> Result<Legs> {
+    let mut usage = Vec::new();
+    let mut handed = Vec::new();
+    let mut checked: Vec<String> = Vec::new();
+    let mut earlier: Vec<roles::Earlier> = Vec::new();
+    let mut last_left: Option<String> = None;
+    let mut prompt = call.prompt.to_string();
+    let mut session: u32 = 1;
+    loop {
+        let label = if session == 1 {
+            call.label.clone()
+        } else {
+            format!("{} (session {session})", call.label)
+        };
+        let this = Call {
+            role: call.role,
+            binding_name: call.binding_name,
+            binding: call.binding,
+            prompt: &prompt,
+            artifact: call.artifact,
+            writes: call.writes,
+            no_tools: call.no_tools,
+            relay_tokens: call.relay_tokens,
+            repo: call.repo,
+            label: label.clone(),
+        };
+        let answer = caller.call(&this)?;
+        let mut u = used(&this, &answer);
+        u.part = Some(format!("leg {session}"));
+        usage.push(u);
+        let handoff = if call.relay_tokens.is_some() {
+            roles::handoff_of(&answer.text)
+        } else {
+            None
+        };
+        let Some(handoff) = handoff else {
+            if usage.len() == 1 {
+                usage[0].part = None;
+            }
+            return Ok(Legs {
+                usage,
+                handed,
+                last: answer.text,
+                label,
+            });
+        };
+        let (body, h) = handoff.with_context(|| label.clone())?;
+        let new = roles::earlier_of(&body);
+        let left = h.left.trim().to_string();
+        if new.is_empty() && last_left.as_deref() == Some(left.as_str()) {
+            bail!(
+                "{label}: handed off again with nothing new found and the same left to check, \
+                 so its relay stopped there and what's left went unchecked"
+            );
+        }
+        last_left = Some(left.clone());
+        caller.say(&format!(
+            "{label}: out of room, so it handed off what it found ({} so far) to session {}",
+            earlier.len() + new.len(),
+            session + 1
+        ));
+        checked.push(h.checked);
+        earlier.extend(new);
+        handed.push(body);
+        session += 1;
+        prompt = format!(
+            "{}{}",
+            call.prompt,
+            roles::continuation(&checked, &left, &earlier, session)
+        );
+    }
+}
+
+/// Findings merged across sessions: each once, by its title and where it
+/// points.
+fn merged<T>(
+    lists: Vec<Vec<T>>,
+    key: impl Fn(&T) -> (String, Option<String>, Option<u64>),
+) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in lists.into_iter().flatten() {
+        let (title, file, line) = key(&item);
+        if seen.insert((title.trim().to_lowercase(), file, line)) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn raw_key(f: &Raw) -> (String, Option<String>, Option<u64>) {
+    (f.title.clone(), f.file.clone(), f.line)
+}
+
+/// A Judge's ratings from every session its call took, each once.
+fn ratings_of(legs: &Legs) -> Result<Vec<roles::Rating>> {
+    let mut lists = Vec::new();
+    for text in &legs.handed {
+        lists.push(roles::read_ratings(text)?);
+    }
+    lists.push(roles::read_ratings(&legs.last)?);
+    Ok(merged(lists, |r: &roles::Rating| {
+        (r.title.clone(), r.file.clone(), r.line)
+    }))
+}
+
 /// One call to a role, on the record.
 #[allow(clippy::too_many_arguments)]
 fn ask(
@@ -907,6 +1043,7 @@ fn ask(
         artifact,
         writes: false,
         no_tools: false,
+        relay_tokens: None,
         repo: &repo,
         label: what.to_string(),
     };
@@ -935,6 +1072,7 @@ fn ask_bare(
         artifact: None,
         writes: false,
         no_tools: true,
+        relay_tokens: None,
         repo: &repo,
         label: what.to_string(),
     };
@@ -1661,7 +1799,7 @@ fn attack(
     let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
     let parallel = cfg.tests.parallel.unwrap_or(2) as usize;
     let checkout = source;
-    type Done = (Option<Usage>, Vec<Raw>, Option<String>);
+    type Done = (Vec<Usage>, Vec<Raw>, Option<String>);
     // A reviewer's findings, said at once when its answer can't be read,
     // rather than only when the round ends.
     let repairs: std::sync::Mutex<Vec<Usage>> = Default::default();
@@ -1719,6 +1857,144 @@ fn attack(
         }
     }
     // One reviewer's work: its call, and whatever its stage runs after.
+    // A call's findings, from every session it took: what each handoff
+    // already held, then its last answer, each once.
+    let gathered = |legs: &Legs, asked: &Call| -> Result<Vec<Raw>> {
+        let mut lists = Vec::new();
+        for text in &legs.handed {
+            lists.push(roles::read_findings(text)?);
+        }
+        let last = Call {
+            role: asked.role,
+            binding_name: asked.binding_name,
+            binding: asked.binding,
+            prompt: asked.prompt,
+            artifact: asked.artifact,
+            writes: asked.writes,
+            no_tools: asked.no_tools,
+            relay_tokens: asked.relay_tokens,
+            repo: asked.repo,
+            label: legs.label.clone(),
+        };
+        lists.push(read(&legs.last, &last)?);
+        Ok(merged(lists, raw_key))
+    };
+    // A scouted lens's reviewer: one session lists what it suspects, and
+    // each suspicion is confirmed or dropped in a session of its own, from
+    // the reviewer's brief and that suspicion alone. Every suspicion is
+    // checked, however many there are, as many at once as the bridge runs.
+    // One that can't be checked fails the reviewer: an unchecked suspicion is
+    // never taken for a clean lens.
+    let scouted = |call: &Call, used: &(dyn Fn(&Call, &Answer) -> Usage + Sync)| -> Result<Done> {
+        let scout_prompt = format!("{}{}", call.prompt, roles::scout_part());
+        let scout = Call {
+            role: call.role,
+            binding_name: call.binding_name,
+            binding: call.binding,
+            prompt: &scout_prompt,
+            artifact: call.artifact,
+            writes: false,
+            no_tools: false,
+            relay_tokens: call.relay_tokens,
+            repo: call.repo,
+            label: call.label.clone(),
+        };
+        let legs = relayed(caller, &scout, used)?;
+        let mut lists = Vec::new();
+        for text in &legs.handed {
+            lists.push(roles::read_suspects(text)?);
+        }
+        lists.push(
+            roles::read_suspects(&legs.last)
+                .with_context(|| format!("{}: the scout's list couldn't be read", call.label))?,
+        );
+        let suspects = merged(lists, |s: &roles::Suspect| {
+            (s.title.clone(), s.file.clone(), s.line)
+        });
+        let mut usage: Vec<Usage> = legs
+            .usage
+            .into_iter()
+            .map(|mut u| {
+                u.part = Some(match u.part {
+                    Some(leg) => format!("scout, {leg}"),
+                    None => "scout".into(),
+                });
+                u
+            })
+            .collect();
+        caller.say(&format!(
+            "{}: the scout suspects {} thing(s), each to be verified on its own",
+            call.label,
+            suspects.len()
+        ));
+        let verified: Vec<Result<(Vec<Usage>, Vec<Raw>)>> = thread::scope(|scope| {
+            let handles: Vec<_> = suspects
+                .iter()
+                .enumerate()
+                .map(|(i, suspect)| {
+                    scope.spawn(move || -> Result<(Vec<Usage>, Vec<Raw>)> {
+                        let n = i + 1;
+                        let prompt = format!("{}{}", call.prompt, roles::verify_part(suspect));
+                        let check = Call {
+                            role: call.role,
+                            binding_name: call.binding_name,
+                            binding: call.binding,
+                            prompt: &prompt,
+                            artifact: call.artifact,
+                            writes: false,
+                            no_tools: false,
+                            relay_tokens: call.relay_tokens,
+                            repo: call.repo,
+                            label: format!("{}: verify {n}", call.label),
+                        };
+                        let legs = relayed(caller, &check, used)?;
+                        let found = gathered(&legs, &check)?;
+                        let usage = legs
+                            .usage
+                            .into_iter()
+                            .map(|mut u| {
+                                u.part = Some(match u.part {
+                                    Some(leg) => format!("verify {n}, {leg}"),
+                                    None => format!("verify {n}"),
+                                });
+                                u
+                            })
+                            .collect();
+                        Ok((usage, found))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("a verifying session's thread died")))
+                })
+                .collect()
+        });
+        let mut found = Vec::new();
+        let mut failed = Vec::new();
+        for (i, v) in verified.into_iter().enumerate() {
+            match v {
+                Ok((mut u, mut f)) => {
+                    usage.append(&mut u);
+                    found.push(std::mem::take(&mut f));
+                }
+                Err(e) => failed.push(format!("verify {}: {e:#}", i + 1)),
+            }
+        }
+        if !failed.is_empty() {
+            bail!(
+                "{}: {} of its suspicions couldn't be checked, so the lens isn't clean: {}",
+                call.label,
+                failed.len(),
+                failed.join("; ")
+            );
+        }
+        Ok((usage, merged(found, raw_key), None))
+    };
+    // One reviewer's work: its call, relayed if its role's calls relay, and
+    // whatever its stage runs after.
     let review = |lens: &Lens, brief: &Brief, label: &String, first: bool| -> Result<Done> {
         let artifact = artifacts.for_lens(lens);
         let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
@@ -1729,6 +2005,13 @@ fn attack(
             | Brief::Probe { prompt, repo, .. }
             | Brief::Mutate { prompt, repo, .. } => (prompt, repo),
         };
+        // A mutation proposer answers with mutants, not findings, so it
+        // runs whole.
+        let relay_tokens = if matches!(brief, Brief::Mutate { .. }) {
+            None
+        } else {
+            cfg.sessions.relay(Role::Reviewer)
+        };
         let call = Call {
             role: Role::Reviewer,
             binding_name: name,
@@ -1737,16 +2020,24 @@ fn attack(
             artifact: Some(artifact),
             writes: false,
             no_tools: false,
+            relay_tokens,
             repo: repo.as_path(),
             label: label.clone(),
         };
-        let answer = caller.call(&call)?;
-        let mut usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
-        usage.fan_out = Some("reviewers".into());
-        usage.first = first;
+        let used = |c: &Call, a: &Answer| -> Usage {
+            let mut u = usage(cfg, c, input_bytes(c.prompt, Some(artifact)), a);
+            u.fan_out = Some("reviewers".into());
+            // Its first session only, which goes alone to warm the cache.
+            u.first = first && c.label == *label && c.prompt == prompt.as_str();
+            u
+        };
+        if matches!(brief, Brief::Review { .. }) && cfg.sessions.scouts(&lens.id) {
+            return scouted(&call, &used);
+        }
+        let legs = relayed(caller, &call, &used)?;
         match brief {
             Brief::Mutate { runs, command, .. } => {
-                let mutants = stages::read_mutants(&answer.text)?;
+                let mutants = stages::read_mutants(&legs.last)?;
                 let runner = stages::Runner {
                     repo: checkout,
                     dir: runs,
@@ -1755,7 +2046,7 @@ fn attack(
                     limit,
                 };
                 let (found, summary) = stages::run_mutants(&runner, &mutants)?;
-                Ok((Some(usage), found, Some(summary)))
+                Ok((legs.usage, found, Some(summary)))
             }
             Brief::Probe { kept, before, .. } => {
                 // Kept before its answer is read, so a prober
@@ -1763,12 +2054,12 @@ fn attack(
                 let note = before
                     .as_deref()
                     .and_then(|before| stages::keep_probes(repo, before, kept));
-                let found = read(&answer.text, &call)?;
-                Ok((Some(usage), found, note))
+                let found = gathered(&legs, &call)?;
+                Ok((legs.usage, found, note))
             }
             _ => {
-                let found = read(&answer.text, &call)?;
-                Ok((Some(usage), found, None))
+                let found = gathered(&legs, &call)?;
+                Ok((legs.usage, found, None))
             }
         }
     };
@@ -1779,7 +2070,12 @@ fn attack(
     let (warm_reviewers, warm_judges, stop) = (&warm_reviewers, &warm_judges, &stop);
     let (kept_alive, judge_prompts) = (&kept_alive, &judge_prompts);
     // One Judge's call, after its fan-out's first has warmed the cache.
-    let judge_call = |prompt: &str, artifact: &Path, label: String| -> Result<(Usage, String)> {
+    // Relayed if Judges' calls relay: its ratings are every session's,
+    // each once.
+    let judge_call = |prompt: &str,
+                      artifact: &Path,
+                      label: String|
+     -> Result<(Vec<Usage>, Vec<roles::Rating>)> {
         let first = warm_judges.enter(&label, caller, "Judges");
         let call = Call {
             role: Role::Judge,
@@ -1789,17 +2085,22 @@ fn attack(
             artifact: Some(artifact),
             writes: false,
             no_tools: false,
+            relay_tokens: cfg.sessions.relay(Role::Judge),
             repo: main,
             label: label.clone(),
         };
-        let answer = caller.call(&call);
+        let used = |c: &Call, a: &Answer| -> Usage {
+            let mut u = usage(cfg, c, input_bytes(c.prompt, Some(artifact)), a);
+            u.fan_out = Some("judges".into());
+            u.first = first && c.label == label;
+            u
+        };
+        let legs = relayed(caller, &call, &used);
         warm_judges.done(&label);
-        let answer = answer?;
+        let legs = legs?;
         lock_vec(judge_prompts).push(prompt.to_string());
-        let mut usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
-        usage.fan_out = Some("judges".into());
-        usage.first = first;
-        Ok((usage, answer.text))
+        let ratings = ratings_of(&legs)?;
+        Ok((legs.usage, ratings))
     };
     let judge_call = &judge_call;
     // The savings: kept rulings a later round's same claim takes, and a
@@ -1839,6 +2140,8 @@ fn attack(
         let mut usages = Vec::new();
         if let Some((name, binding)) = first_pass {
             let first_prompt = format!("{prompt}{}", roles::FIRST_PASS_NOTE);
+            // Relayed, as the Judge's own calls are: a first pass that
+            // can't hand off cleanly fails, and the Judge rules.
             let call = Call {
                 role: Role::Judge,
                 binding_name: name,
@@ -1847,20 +2150,19 @@ fn attack(
                 artifact: Some(artifact),
                 writes: false,
                 no_tools: false,
+                relay_tokens: cfg.sessions.relay(Role::Judge),
                 repo: main,
                 label: format!("{label}, first pass"),
             };
-            match caller.call(&call) {
-                Ok(answer) => {
-                    let mut spent = usage(
-                        cfg,
-                        &call,
-                        input_bytes(&first_prompt, Some(artifact)),
-                        &answer,
-                    );
-                    spent.fan_out = Some("first-pass Judges".into());
-                    usages.push(spent);
-                    match roles::read_ratings(&answer.text) {
+            let used = |c: &Call, a: &Answer| -> Usage {
+                let mut spent = usage(cfg, c, input_bytes(c.prompt, Some(artifact)), a);
+                spent.fan_out = Some("first-pass Judges".into());
+                spent
+            };
+            match relayed(caller, &call, &used) {
+                Ok(legs) => {
+                    usages.extend(legs.usage.iter().cloned());
+                    match ratings_of(&legs) {
                         Ok(mut ratings)
                             if !ratings
                                 .iter()
@@ -1889,9 +2191,8 @@ fn attack(
                 )),
             }
         }
-        let (spent, answer) = judge_call(prompt, artifact, label)?;
-        usages.push(spent);
-        let mut ratings = roles::read_ratings(&answer)?;
+        let (mut spent, mut ratings) = judge_call(prompt, artifact, label)?;
+        usages.append(&mut spent);
         if first_pass.is_some() {
             for r in &mut ratings {
                 r.ruled_by = Some(judge_name.to_string());
@@ -2159,7 +2460,7 @@ fn attack(
     for ((lens, _), (results, judged)) in groups.iter().zip(done) {
         for answer in results {
             let result = answer.map(|(usage, findings, note)| {
-                if let Some(mut usage) = usage {
+                for mut usage in usage {
                     usage.round = run.round;
                     run.usage.push(usage);
                 }
@@ -2387,6 +2688,7 @@ fn keep_alive(
                 artifact: None,
                 writes: false,
                 no_tools: false,
+                relay_tokens: None,
                 repo,
                 label: format!("cache keep-alive: {}", a.what),
             };
@@ -2692,6 +2994,7 @@ fn write_tests(
             artifact: None,
             writes: true,
             no_tools: false,
+            relay_tokens: None,
             repo: &repo,
             label: "the test writer".to_string(),
         };
@@ -2945,6 +3248,7 @@ fn findings_of(
         artifact: None,
         writes: false,
         no_tools: false,
+        relay_tokens: None,
         repo: asked.repo,
         label: format!("{}, put in form by the Sizer", asked.label),
     };
@@ -3838,6 +4142,7 @@ fn fix(
         artifact: None,
         writes: true,
         no_tools: false,
+        relay_tokens: None,
         repo: &repo,
         label: if run.converge {
             format!("the steelman, folding in {} finding(s)", folded.len())
@@ -4075,6 +4380,7 @@ fn blast_radius(run: &mut Run, s: &Setting, caller: &dyn Caller) {
         artifact: None,
         writes: false,
         no_tools: true,
+        relay_tokens: None,
         repo: &repo,
         label: "the blast-radius check".into(),
     };
@@ -4645,6 +4951,8 @@ lenses:
         told: Mutex<Vec<String>>,
         /// The roles of the calls made with no tools.
         bare: Mutex<Vec<Role>>,
+        /// Each call's role and where it was asked to hand off.
+        relays: Mutex<Vec<(Role, Option<u64>)>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -4665,6 +4973,7 @@ lenses:
                 slow: None,
                 told: Mutex::new(Vec::new()),
                 bare: Mutex::new(Vec::new()),
+                relays: Mutex::new(Vec::new()),
             }
         }
 
@@ -4686,6 +4995,10 @@ lenses:
                 .lock()
                 .unwrap()
                 .push(format!("call: {}", call.label));
+            self.relays
+                .lock()
+                .unwrap()
+                .push((call.role, call.relay_tokens));
             if call.no_tools {
                 self.bare.lock().unwrap().push(call.role);
             }
@@ -8916,5 +9229,341 @@ lenses:
             FindingState::Deferred
         );
         let _ = fs::remove_dir_all(dir);
+    }
+    /// A first session out of room: what it found, checked and left.
+    const HANDED: &str = "ACRBUS-HANDOFF\n{\"findings\": [{\"title\": \"first half\", \"detail\": \
+        \"why\", \"file\": \"a.src\", \"line\": 3}], \"handoff\": {\"checked\": \"the parser\", \
+        \"left\": \"the writer, next its flush\"}}";
+    /// The next session's answer, one finding of it the first's again.
+    const SECOND: &str = r#"{"findings": [{"title": "second half", "detail": "why", "file": "a.src", "line": 9}, {"title": "First half", "detail": "said again", "file": "a.src", "line": 3}]}"#;
+
+    fn prompts(
+        fake: &Fake<impl Fn(Role, &str) -> Result<String> + Sync>,
+        role: Role,
+        has: &str,
+    ) -> Vec<String> {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == role && c.3.contains(has))
+            .map(|c| c.3.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_session_past_its_size_hands_off_and_the_next_carries_its_findings_through() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "sessions: {relay_tokens: {reviewer: 40000}}",
+        );
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && prompt.contains("# Carrying on") => {
+                    SECOND.into()
+                }
+                Role::Reviewer if prompt.contains("alpha") => HANDED.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge => r#"{"findings": [{"title": "first half", "file": "a.src", "line": 3, "severity": "Low"}, {"title": "second half", "file": "a.src", "line": 9, "severity": "Low"}]}"#.into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert_eq!(alpha.len(), 2, "two sessions");
+        // The second starts with the first's brief, so it shares its cached
+        // prefix, and is told what the first checked, left and found.
+        assert!(alpha[1].starts_with(&alpha[0]));
+        assert!(alpha[1].contains("you are session 2"));
+        assert!(alpha[1].contains("- Session 1: the parser"));
+        assert!(alpha[1].contains("the writer, next its flush"));
+        assert!(alpha[1].contains("- first half (a.src:3)"));
+        // Both sessions' findings reach the Judge, each once.
+        let judged = prompts(&fake, Role::Judge, "alpha");
+        assert_eq!(judged.len(), 1);
+        assert!(judged[0].contains("first half") && judged[0].contains("second half"));
+        assert!(!judged[0].contains("said again"), "{}", judged[0]);
+        // Each session is a call of its own in the usage, marked as a leg.
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| {
+                u.label
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with("alpha: reviewer"))
+            })
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("leg 1".into()), Some("leg 2".into())]);
+        assert!(
+            run.usage
+                .iter()
+                .filter(|u| u.label.as_deref().is_some_and(|l| l.starts_with("beta")))
+                .all(|u| u.part.is_none())
+        );
+        // The report counts it: one call relayed into two sessions.
+        let sessions = report::sessions(&run.usage);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            (sessions[0].role, sessions[0].relayed, sessions[0].legs),
+            (Role::Reviewer, 1, 2)
+        );
+        assert!(
+            sessions[0]
+                .line()
+                .contains("1 call(s) relayed, 2 session(s) in all")
+        );
+        assert_eq!(report::session_lines(&run.usage).len(), 2);
+        // Every reviewer's call carried its size; the Judge's, none.
+        let relays = fake.relays.lock().unwrap();
+        assert!(
+            relays
+                .iter()
+                .filter(|r| r.0 == Role::Reviewer)
+                .all(|r| r.1 == Some(40_000))
+        );
+        assert!(
+            relays
+                .iter()
+                .filter(|r| r.0 == Role::Judge)
+                .all(|r| r.1.is_none())
+        );
+    }
+
+    #[test]
+    fn a_handoff_that_cant_be_read_or_makes_no_progress_is_never_a_pass() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "sessions: {relay_tokens: {reviewer: 40000}}",
+        );
+        let stuck = "ACRBUS-HANDOFF\n{\"findings\": [], \"handoff\": {\"checked\": \"x\", \"left\": \"the same\"}}";
+        for (answer, sessions) in [("ACRBUS-HANDOFF\nI ran out of room, sorry", 1), (stuck, 2)] {
+            let fake = Fake::new(move |role, prompt: &str| {
+                Ok(match role {
+                    Role::Reviewer if prompt.contains("alpha") => answer.into(),
+                    Role::Reviewer => CLEAN.into(),
+                    _ => NOTHING.into(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert_eq!(
+                prompts(&fake, Role::Reviewer, "alpha").len(),
+                sessions,
+                "{answer}"
+            );
+            assert_ne!(run.status, Status::Confirmed);
+            assert_eq!(run.waiting, Some(Gate::Escalation));
+            assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
+            assert_eq!(run.lenses["beta"].outcome, Outcome::Confirmed);
+            assert!(run.escalations[0].reason.contains("wasn't fully reviewed"));
+        }
+    }
+
+    #[test]
+    fn without_a_relay_a_call_runs_in_one_session_as_before() {
+        let cfg = plain("exception", 3, 1);
+        assert_eq!(
+            cfg.sessions,
+            super::super::config::SessionsConfig::default()
+        );
+        // Even an answer that looks like a handoff is the answer.
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => HANDED.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge => rating("Low"),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(prompts(&fake, Role::Reviewer, "alpha").len(), 1);
+        assert!(fake.relays.lock().unwrap().iter().all(|r| r.1.is_none()));
+        assert!(run.usage.iter().all(|u| u.part.is_none()));
+        assert!(prompts(&fake, Role::Judge, "alpha")[0].contains("first half"));
+        assert!(prompts(&fake, Role::Reviewer, "# This session").is_empty());
+    }
+
+    #[test]
+    fn a_judge_past_its_size_hands_off_and_its_ratings_are_merged() {
+        let cfg = config(
+            "exception",
+            3,
+            1,
+            "",
+            "sessions: {relay_tokens: {judge: 40000}}",
+        );
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => r#"{"findings": [{"title": "A", "file": "a.src", "line": 1}, {"title": "B", "file": "a.src", "line": 2}]}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge if prompt.contains("# Carrying on") => r#"{"findings": [{"title": "B", "file": "a.src", "line": 2, "severity": "Low"}]}"#.into(),
+                Role::Judge => "ACRBUS-HANDOFF\n{\"findings\": [{\"title\": \"A\", \"file\": \"a.src\", \"line\": 1, \"severity\": \"Low\"}], \"handoff\": {\"checked\": \"A\", \"left\": \"B\"}}".into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(fake.count(Role::Judge), 2);
+        let titles: Vec<String> = run.lenses["alpha"]
+            .rounds
+            .last()
+            .unwrap()
+            .findings
+            .iter()
+            .map(|f| f.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"A".to_string()) && titles.contains(&"B".to_string()),
+            "{titles:?}"
+        );
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.role == Role::Judge)
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("leg 1".into()), Some("leg 2".into())]);
+    }
+
+    #[test]
+    fn a_scouted_lens_lists_suspicions_and_verifies_each_on_its_own() {
+        let cfg = config("exception", 3, 1, "", "sessions: {scout: [alpha]}");
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("# This session: scout") => r#"{"suspects": [{"title": "S1", "file": "a.src", "line": 1, "claim": "c1", "check": "k1"}, {"title": "S2", "file": "a.src", "line": 2, "claim": "c2", "check": "k2"}]}"#.into(),
+                Role::Reviewer if prompt.contains("Title: S1") => r#"{"findings": [{"title": "S1 holds", "detail": "evidence", "file": "a.src", "line": 1}]}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge => rating("Low"),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert_eq!(alpha.len(), 3, "a scout, and a check for each suspicion");
+        let scout = &alpha[0];
+        let brief = &scout[..scout.find("\n\n# This session: scout").unwrap()];
+        let checks: Vec<&String> = alpha
+            .iter()
+            .filter(|p| p.contains("# This session: verify"))
+            .collect();
+        assert_eq!(checks.len(), 2);
+        for c in &checks {
+            // From the reviewer's brief and its own suspicion alone.
+            assert!(c.starts_with(brief));
+            assert!(c.contains("Title: S1") != c.contains("Title: S2"));
+        }
+        // S1 held and S2 didn't: one finding reaches the Judge.
+        let judged = prompts(&fake, Role::Judge, "alpha");
+        assert!(judged[0].contains("S1 holds") && !judged[0].contains("S2"));
+        let mut parts: Vec<String> = run
+            .usage
+            .iter()
+            .filter(|u| {
+                u.label
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with("alpha: reviewer"))
+            })
+            .filter_map(|u| u.part.clone())
+            .collect();
+        parts.sort();
+        assert_eq!(parts, vec!["scout", "verify 1", "verify 2"]);
+        let sessions = report::sessions(&run.usage);
+        assert_eq!(
+            (
+                sessions[0].scouts,
+                sessions[0].verifies,
+                sessions[0].relayed
+            ),
+            (1, 2, 0)
+        );
+        let json = serde_json::to_value(report::report(&run, &cfg)).unwrap();
+        assert_eq!(json["sessions"][0]["verifies"], 2);
+        // A lens not scouted reviews as before.
+        assert!(!prompts(&fake, Role::Reviewer, "beta")[0].contains("# This session"));
+    }
+
+    #[test]
+    fn a_suspicion_that_cant_be_checked_fails_the_reviewer() {
+        let cfg = config("exception", 3, 1, "", "sessions: {scout: [alpha]}");
+        for broken in ["Title: S2", "# This session: scout"] {
+            let fake = Fake::new(move |role, prompt: &str| {
+                Ok(match role {
+                    Role::Reviewer if prompt.contains(broken) => "I couldn't tell.".into(),
+                    Role::Reviewer if prompt.contains("# This session: scout") => {
+                        r#"{"suspects": [{"title": "S1"}, {"title": "S2"}]}"#.into()
+                    }
+                    Role::Reviewer => CLEAN.into(),
+                    _ => NOTHING.into(),
+                })
+            });
+            let (run, _) = go(&cfg, &["a.src"], &fake);
+            assert_ne!(run.status, Status::Confirmed, "{broken}");
+            assert_eq!(run.lenses["alpha"].outcome, Outcome::Open);
+            assert!(run.escalations[0].reason.contains("wasn't fully reviewed"));
+        }
+    }
+
+    #[test]
+    fn a_first_pass_relays_like_the_judge_and_a_reused_ruling_takes_no_session() {
+        // Judges relay: the first pass hands off once, and its sessions'
+        // ratings settle the lens together, with no Judge call.
+        let cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "savings: {first_pass_judge: small}\nsessions: {relay_tokens: {judge: 40000}}",
+        );
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") => r#"{"findings": [{"title": "A", "file": "a.src", "line": 1}, {"title": "B", "file": "a.src", "line": 2}]}"#.into(),
+                Role::Reviewer => CLEAN.into(),
+                Role::Judge if prompt.contains("You're the first pass") && prompt.contains("# Carrying on") => {
+                    r#"{"findings": [{"title": "B", "file": "a.src", "line": 2, "severity": "Low"}]}"#.into()
+                }
+                Role::Judge if prompt.contains("You're the first pass") => "ACRBUS-HANDOFF\n{\"findings\": [{\"title\": \"A\", \"file\": \"a.src\", \"line\": 1, \"severity\": \"Low\"}], \"handoff\": {\"checked\": \"A\", \"left\": \"B\"}}".into(),
+                Role::Judge => r#"{"findings": [{"title": "A", "file": "a.src", "line": 1, "severity": "High"}]}"#.into(),
+                _ => NOTHING.into(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        let calls = fake.calls.lock().unwrap();
+        let on = |name: &str| {
+            calls
+                .iter()
+                .filter(|c| c.0 == Role::Judge && c.1 == name)
+                .count()
+        };
+        assert_eq!(
+            (on("small"), on("large")),
+            (2, 0),
+            "two first-pass sessions, no Judge"
+        );
+        drop(calls);
+        let found = &run.lenses["alpha"].rounds[0].findings;
+        let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
+        assert!(titles.contains(&"A") && titles.contains(&"B"), "{titles:?}");
+        assert!(found.iter().all(|f| f.ruled_by.as_deref() == Some("small")));
+        let parts: Vec<Option<String>> = run
+            .usage
+            .iter()
+            .filter(|u| u.fan_out.as_deref() == Some("first-pass Judges"))
+            .map(|u| u.part.clone())
+            .collect();
+        assert_eq!(parts, vec![Some("leg 1".into()), Some("leg 2".into())]);
+        // Every Judge call it made carried the relay size.
+        assert!(
+            fake.relays
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == Role::Judge)
+                .all(|r| r.1 == Some(40_000))
+        );
     }
 }

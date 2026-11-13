@@ -127,6 +127,18 @@ way it would have gone, and a skipped lens is reported as skipped, never as
 passing. [Savings](acr-repo-setup.md#5c-savings-judges-and-later-rounds)
 says how, and how to check a cheaper Judge before you trust it.
 
+## Long calls can run in shorter sessions
+
+Every turn of a session rereads everything it has read, so a long call's cost
+grows faster than its turns. Two settings, off by default, break one up:
+past a size a session hands off what it found, checked and left to a fresh one
+that starts from the cached opening, and a lens can scout first, listing what
+it suspects, then check each suspicion in a short session of its own. A
+handoff that can't be read, or a suspicion that can't be checked, fails the
+call rather than passing it. [Long calls in shorter
+sessions](acr-repo-setup.md#5d-long-calls-in-shorter-sessions) has the
+settings and how to measure them.
+
 ## It survives its agents, and says what they're doing
 
 Each headless run gets an environment of its own, and a watch for going

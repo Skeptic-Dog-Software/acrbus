@@ -404,6 +404,71 @@ key: blockers agreed, missed and overrated, how many dimensions the first
 pass settled, and which findings it rated differently from the Judge. Turn
 it on only if it misses no blocker the Judge alone catches.
 
+## 5d. Long calls in shorter sessions
+
+A reviewer works in turns, and every turn rereads everything the session has
+read so far, most of it from the prompt cache. So a long session's cost grows
+faster than its turns. One measured reviewer averaged about 71k cached tokens
+a turn over 47 turns, against a 37k shared opening: about half of what it
+read was its own growing history. Two settings break long calls into shorter
+sessions, each of which starts from the shared opening the cache holds. Both
+are off unless set, and neither takes a tool or a lens away.
+
+```yaml
+sessions:
+  relay_tokens: {reviewer: 120000, judge: 120000}
+  scout: [correctness]
+```
+
+**`relay_tokens`, by role: hand off past a size.** When one turn of a
+reviewer's or Judge's call reads more prompt tokens than this, and the call is
+still calling tools, it's told to stop and answer with everything it would
+report so far, in full, plus what it has checked and what's left. A fresh
+session on the same binding then gets the call's own brief, so it shares the
+cached prefix, followed by what the earlier sessions checked, what's left, and
+what they already found, not to be reported again. It may hand off in turn.
+The call's answer is every session's findings, each once.
+
+- Only an agent acrbus can steer mid-call relays: pi, through acrbus's
+  extension. A call on any other agent runs whole, and progress says so once
+  for that agent.
+- A handoff that can't be read is never taken for a finished call, and
+  neither is a run of handoffs that find nothing new with the same left to
+  check. Either fails the call, which escalates as any failed reviewer or
+  Judge does.
+- The least it can be set to is 32000 tokens: a session needs room to work
+  past the shared opening.
+
+**`scout`, by lens: list first, then check each.** A scouted lens's reviewer
+first runs a scout session, which explores the change and lists everything it
+suspects, with how to confirm or rule each out, and verifies nothing. Each
+suspicion then gets a session of its own: the reviewer's brief and that
+suspicion alone, confirmed with evidence or dropped. Every suspicion is
+checked, however many there are, as many at once as the bridge runs. A
+suspicion that can't be checked fails the reviewer: the lens isn't clean.
+Scouting suits a lens whose reviewers read widely and long, where most of a
+long session is rereading; a lens whose reviews are short gains little.
+
+**What it shows.** Progress says when a session hands off and how many
+suspicions a scout listed. Each session is a call of its own in `acrbus acr
+usage <run id>`, marked as `leg N`, `scout` or `verify N`, and the run's
+report and `acr usage` sum them by role in a `sessions` line.
+
+**Measure it before you rely on it.** A handoff is a summary, so check that
+nothing found is lost at one. On a change whose defects you already know (a
+key, as §8 describes), run the trial twice, with `sessions` unset and then
+set in the repository's config, everything else the same:
+
+1. `acrbus acr check <key>`, then `acrbus acr trial <key> --arm separated`,
+   with `sessions` unset.
+2. Set `sessions`, accept the config, and run the same two again.
+3. Compare the two runs' scores, what each caught and missed, with `acrbus
+   acr rescore`, and their cost with `acrbus acr usage <run id>`. Relays
+   that lose findings show as misses the first run caught.
+
+On a live review the comparison is the same: the same change reviewed with
+and without, by round, in `acr usage`.
+
 ## 6. Check it
 
 ```sh
