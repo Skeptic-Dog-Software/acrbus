@@ -2065,6 +2065,66 @@ fn ask(
     Ok(answer.text)
 }
 
+/// The form an answer is asked in: the reminder its prompt ends with, its
+/// shape for a repair, and what reads it.
+type InForm<'a, T> = (&'a str, roles::Shape, fn(&str) -> Result<T>);
+
+/// [`ask`], for an answer in a JSON form: the form said again at the end
+/// of its prompt; an answer that can't be read put in form by the Sizer;
+/// and one that still can't be, asked again once, fresh, before it fails.
+#[allow(clippy::too_many_arguments)]
+fn ask_in_form<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    role: Role,
+    what: &str,
+    prompt: &str,
+    artifact: Option<&Path>,
+    (reminder, shape, read): InForm<'_, T>,
+) -> Result<T> {
+    let prompt = format!("{prompt}{reminder}");
+    let once = |run: &mut Run, label: &str| -> Result<T> {
+        let text = ask(run, s, caller, role, label, &prompt, artifact)?;
+        let repo = run.reading().to_path_buf();
+        let asked = Call {
+            role,
+            binding_name: s.cfg.binding_name(role, None)?,
+            binding: s.cfg.binding(role, None)?,
+            prompt: &prompt,
+            artifact,
+            writes: false,
+            no_tools: false,
+            relay_tokens: None,
+            repo: &repo,
+            label: label.to_string(),
+        };
+        let repairs = std::sync::Mutex::new(Vec::new());
+        let got = repaired(caller, s.cfg, &text, &asked, &repairs, shape, read);
+        for mut u in repairs.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            u.round = run.round;
+            run.usage.push(u);
+        }
+        got
+    };
+    match once(run, what) {
+        Err(first) if first.downcast_ref::<Unreadable>().is_some() => {
+            let why = "its answer couldn't be read, even put in form";
+            caller.say(&format!(
+                "restarted fresh: {what}, attempt 2, because {why}"
+            ));
+            let start = run.usage.len();
+            let again = once(run, &format!("{what}, again"));
+            for u in &mut run.usage[start..] {
+                u.restart = Some(why.to_string());
+            }
+            again
+                .map_err(|then| anyhow!("came back unusable twice: first {first:#}; then {then:#}"))
+        }
+        other => other,
+    }
+}
+
 /// [`ask`], of a call with no tools and no attachment: it answers from its
 /// prompt alone.
 fn ask_bare(
@@ -2837,7 +2897,7 @@ fn attack(
                             &scope,
                             cfg.tests.mutants.unwrap_or(12),
                             &guide,
-                        ),
+                        ) + roles::MUTANTS_REMINDER,
                         repo,
                         runs: stages::mutation_dir(dir, &lens.id, n),
                         command: command.clone(),
@@ -2938,8 +2998,17 @@ fn attack(
     // already held, then its last answer, each once.
     let gathered = |legs: &Legs, asked: &Call| -> Result<Vec<Raw>> {
         let mut lists = Vec::new();
+        // A handoff's findings, put in form as an answer's are.
         for text in &legs.handed {
-            lists.push(roles::read_findings(text).map_err(unreadable)?);
+            lists.push(repaired(
+                caller,
+                cfg,
+                text,
+                asked,
+                repairs,
+                roles::Shape::Findings,
+                roles::read_findings,
+            )?);
         }
         let last = Call {
             role: asked.role,
@@ -2982,22 +3051,30 @@ fn attack(
             label: call.label.clone(),
         };
         let legs = relayed(caller, &scout, used)?;
-        let listed = read_something(caller, &call.label, &legs).and_then(|()| {
-            let mut lists = Vec::new();
-            for text in &legs.handed {
-                lists.push(roles::read_suspects(text).map_err(unreadable)?);
-            }
-            lists.push(
-                roles::read_suspects(&legs.last)
-                    .map_err(unreadable)
-                    .with_context(|| {
-                        format!("{}: the scout's list couldn't be read", call.label)
-                    })?,
-            );
-            Ok(merged(lists, |s: &roles::Suspect| {
-                (s.title.clone(), s.file.clone(), s.line)
-            }))
-        });
+        let listed =
+            read_something(caller, &call.label, &legs).and_then(|()| {
+                let mut lists = Vec::new();
+                let in_form = |text: &str| {
+                    repaired(
+                        caller,
+                        cfg,
+                        text,
+                        &scout,
+                        repairs,
+                        roles::Shape::Suspects,
+                        roles::read_suspects,
+                    )
+                };
+                for text in &legs.handed {
+                    lists.push(in_form(text)?);
+                }
+                lists.push(in_form(&legs.last).with_context(|| {
+                    format!("{}: the scout's list couldn't be read", call.label)
+                })?);
+                Ok(merged(lists, |s: &roles::Suspect| {
+                    (s.title.clone(), s.file.clone(), s.line)
+                }))
+            });
         let mut usage: Vec<Usage> = legs
             .usage
             .into_iter()
@@ -3168,20 +3245,27 @@ fn attack(
         }
         let legs = relayed(caller, &call, &used)?;
         let got = match brief {
-            Brief::Mutate { runs, command, .. } => stages::read_mutants(&legs.last)
-                .map_err(unreadable)
-                .and_then(|mutants| {
-                    let runner = stages::Runner {
-                        repo: checkout,
-                        dir: runs,
-                        command,
-                        parallel,
-                        limit,
-                    };
-                    let (found, summary) = stages::run_mutants(&runner, &mutants)
-                        .map_err(|e| idle_said(caller, label, e))?;
-                    Ok((found, Some(summary)))
-                }),
+            Brief::Mutate { runs, command, .. } => repaired(
+                caller,
+                cfg,
+                &legs.last,
+                &call,
+                repairs,
+                roles::Shape::Mutants,
+                stages::read_mutants,
+            )
+            .and_then(|mutants| {
+                let runner = stages::Runner {
+                    repo: checkout,
+                    dir: runs,
+                    command,
+                    parallel,
+                    limit,
+                };
+                let (found, summary) = stages::run_mutants(&runner, &mutants)
+                    .map_err(|e| idle_said(caller, label, e))?;
+                Ok((found, Some(summary)))
+            }),
             Brief::Probe { kept, before, .. } => {
                 // Kept before its answer is read, so a prober
                 // that answers badly still leaves its probes.
@@ -4345,7 +4429,7 @@ fn gate_round(
     let dir = Copies::fresh(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
-    let proposed = ask(
+    let proposed = ask_in_form(
         run,
         s,
         caller,
@@ -4353,8 +4437,12 @@ fn gate_round(
         &format!("{}: proposing mutants", lens.id),
         &prompt,
         Some(&artifacts.diff),
-    )
-    .and_then(|text| stages::read_mutants(&text));
+        (
+            roles::MUTANTS_REMINDER,
+            roles::Shape::Mutants,
+            stages::read_mutants,
+        ),
+    );
     let mutants = match proposed {
         Ok(m) => m,
         Err(e) => {
@@ -4406,7 +4494,7 @@ fn gate_round(
             let prompt = prompt
                 + "\n\nKeep each finding's title as it's given, with its [G..] tag, and don't \
                    merge them.";
-            let text = ask(
+            ask_in_form(
                 run,
                 s,
                 caller,
@@ -4414,8 +4502,12 @@ fn gate_round(
                 &format!("{}: the Judge", lens.id),
                 &prompt,
                 Some(artifacts.for_lens(lens)),
-            )?;
-            roles::read_ratings(&text)
+                (
+                    roles::RATINGS_REMINDER,
+                    roles::Shape::Ratings,
+                    roles::read_ratings,
+                ),
+            )
         });
         match judged {
             Ok(ratings) => {
@@ -8330,6 +8422,67 @@ lenses:
         let _ = fs::remove_dir_all(&root);
         let calls = fake.calls.lock().unwrap().clone();
         (run, calls)
+    }
+
+    #[test]
+    fn the_gates_mutant_proposer_and_judge_are_reminded_put_in_form_and_restarted() {
+        use super::super::change::tests::repo_with;
+        let cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "stages: [gate]\ntests: {command: 'true', gate: warn}",
+        );
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-gate-form-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let judged = Mutex::new(0);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                // The proposer answers in words, which the Sizer puts in form.
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    assert!(prompt.ends_with(roles::MUTANTS_REMINDER));
+                    "I'd change x = 1 to x = 2 in a.src.".to_string()
+                }
+                Role::Sizer if prompt.contains("proposed these small breaks") => {
+                    r#"{"mutants": [{"file": "a.src", "find": "x = 1", "replace": "x = 2", "why": "x is one", "tests": []}]}"#
+                        .to_string()
+                }
+                // The gate's Judge: unreadable even in form the first time,
+                // then fresh, it answers.
+                Role::Judge if prompt.contains("[G0]") => {
+                    let mut n = judged.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        "no idea".to_string()
+                    } else {
+                        r#"{"findings": [{"title": "[G0] a mutant every test passes", "file": "a.src", "severity": "High"}]}"#
+                            .to_string()
+                    }
+                }
+                Role::Sizer => "unreadable".to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let gate = &run.lenses["tests"].rounds[0];
+        assert!(gate.failures.is_empty(), "{:?}", gate.failures);
+        assert_eq!(gate.findings.len(), 1);
+        assert_eq!(*judged.lock().unwrap(), 2, "restarted once");
+        let told = said(&fake);
+        assert!(
+            told.contains("restarted fresh: tests: the Judge, attempt 2"),
+            "{told}"
+        );
+        assert!(run.usage.iter().any(|u| u.repaired.is_some()));
+        assert!(run.usage.iter().any(|u| u.restart.is_some()));
     }
 
     #[test]
