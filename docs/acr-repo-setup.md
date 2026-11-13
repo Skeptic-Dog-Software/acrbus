@@ -301,6 +301,9 @@ since by then it holds the change's context.
     shared: true          # build the map and give it to reviewers and Judges
     warm_secs: 60         # a role's first call goes alone, until its turn shows
                           # it read its prompt, or this many seconds; 0: no wait
+    stagger_secs: 3       # then the rest start this far apart, so a burst of
+                          # new sessions isn't spread over replicas without
+                          # the prefix; 0: all at once
     keep_alive_secs: 240  # refresh a prefix still in use this often; 0: off
     judges: per-lens      # per-finding: a Judge per finding, given its claim
                           # and the lines it cites, none of the reviewer's case
@@ -402,6 +405,10 @@ savings:
   first_pass_judge: small    # off unless set; check it first, below
   focus_after_fix: true      # off by default
   blast_radius: true         # off by default
+  fixer:                     # off unless set
+    binding: small           # a cheaper binding that may write
+    max_severity: Medium     # the default
+    max_files: 1             # the default
 ```
 
 - **`reuse_rulings`** (default on). A Judge's ruling that didn't block (a
@@ -455,6 +462,28 @@ savings:
   skipped, and gets no lens label. In a review to convergence, the final
   sweep still attacks it on the last version, so a skip saves the rounds
   in between.
+
+- **`fixer`**: a cheaper binding for the fix groups the rules call easy,
+  while the Orchestrator's other calls (its briefs, the steelman, test
+  writing, and the rest) stay on its own binding. With `group_fixes`, each
+  group is routed by its blockers' facts. A group is easy only if all of
+  these hold for every blocker in it: its severity is at or below
+  `max_severity` (default Medium); the group's blockers cite at most
+  `max_files` distinct files (default 1); the Judge stated its cause, with a
+  file, a line and a detail; it isn't a person's call (a values call, a
+  split, or a pre-existing Critical); it isn't a defect a person reported
+  missed; and it isn't recurring, the same claim in the same lens as a
+  blocker an earlier round's fix fixed. Anything else is hard, and goes to
+  the Orchestrator's binding. An easy group whose fix fails (it did no
+  work, or its answer can't be used) isn't easy any more: its one fresh
+  restart runs on the Orchestrator's binding. Progress says each group's
+  route and why, such as `fix group 2: to small (easy: 1 file(s), Medium,
+  cause stated)` or `fix group 3: to large (hard: a High blocker; cites 3
+  files)`. Usage keeps each fix's role as the Orchestrator, with the binding
+  it ran on, and `acr usage` gives each binding's fix groups, calls and
+  dollars, and how many of their blockers held: weren't raised again the
+  next round. `acr validate` and `acr doctor` check the binding is allowed
+  and may write; `acr plan` says where easy groups go.
 
 **Check a first pass before you turn it on.** `acrbus acr judge-check
 <key>... --first-pass <binding>` rates each key's findings with the Judge
@@ -539,11 +568,38 @@ as timed out, and pi's own retry sends it again; its log says
 that carry no event, such as a gateway's keep-alive, aren't a response,
 and pi's own timeout of the same silence counts too. After
 `ACRBUS_NO_RESPONSE_TRIES` (3) in a row the call ends with exit code 75,
-which its bridge fails, never passes, so the review retries or escalates
-it as it does any failed call. A request that's answering, however
+which its bridge fails, never passes, so the review restarts it fresh, or
+pauses for an outage, as below. A request that's answering, however
 slowly, is never cut off. Both are in the pi kind's `[env]`, and a
 bridge's own `[env]` in `config.toml` overrides them, for every binding
 that names it; `"0"` turns the watch off.
+
+**A unit that comes back unusable is restarted, once.** A reviewer,
+prober, mutant proposer, scout, scouted check, Judge, first pass or fix
+whose answer can't be read even put in form, whose run failed or lost its
+requests, or that did no work, is restarted in a fresh session on the same
+binding, with the same inputs and none of the failed session's context: a
+prober in a fresh copy, without the probes the failed one wrote. Progress
+says `restarted fresh: <unit>, attempt 2, because <why>`, and the other
+lenses don't wait. A restart after the model couldn't be reached goes with
+a new cache key, so it may land on another replica. A refusal, a cancel or
+a config error isn't restarted, since a fresh session would only repeat
+it. A restart that fails too is a failure, naming both reasons, asked
+about at the gate: never a pass. Restarts are marked in usage, with why,
+and said apart from repairs at each round's end and in `acr usage`.
+
+**An outage pauses the round.** When calls that couldn't reach their model
+(lost requests, or a connection refused, reset or unresolved) are at least
+two, and at least half of those in flight, with none answered in between,
+the round stops starting calls. A unit that couldn't reach its model
+first waits up to 60 seconds to tell an outage from its own failure. The
+round's finished units, its briefs and each reviewer's and Judge's work,
+are kept in the review's folder as they finish (`round-<n>.units.jsonl`),
+the review is saved, and `acr run` or `acr resume` says `gateway
+unreachable: saved, continue with acrbus acr resume <id>` and exits 5.
+`acrbus acr resume <id>` goes on with the same round: what finished keeps
+its results, its tests gate isn't run again, and only what didn't finish
+runs, with its one restart still to come.
 
 **What it shows.** Progress says when a session hands off and how many
 suspicions a scout listed. Each session is a call of its own in `acrbus acr

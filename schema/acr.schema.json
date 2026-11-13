@@ -189,6 +189,7 @@
       "properties": {
         "shared": {"type": "boolean", "description": "Build the facts each round and give them to every reviewer and Judge. Default true."},
         "warm_secs": {"type": "integer", "minimum": 0, "description": "Seconds the rest of a role's calls wait for its first to fill the prompt cache before they start. 0 starts them all at once. Default 60."},
+        "stagger_secs": {"type": "integer", "minimum": 0, "description": "Seconds between the starts of a role's other calls once its first has warmed the cache: a burst of new sessions can be spread over a provider's replicas, of which only one holds the prefix, where calls a little apart land on it. 0 starts them all at once. Default 3."},
         "keep_alive_secs": {"type": "integer", "minimum": 0, "description": "Seconds between refreshes of a role's cached prefix while its calls run, so the provider doesn't evict it: a minimal call through the same binding, only when its bridge has a slot to spare, counted apart as keep-alive. 0 turns it off. Default 240."},
         "judges": {"enum": ["per-lens", "per-finding"], "description": "per-lens, the default: one Judge rates a lens's findings together. per-finding: a Judge for each finding, given its claim and the lines it cites, and none of the reviewer's reasoning."},
         "reviewers": {"enum": ["all", "facts-only"], "description": "all, the default: reviewers get the Orchestrator's briefs and the decided non-issues too. facts-only: only what tools found, and no decided non-issues, which the Judge still applies."},
@@ -206,7 +207,18 @@
         "first_pass_judge": {"type": "string", "description": "A binding that rules on findings first, such as a cheaper model. What it would have block, rates Medium or above, calls a split or a values call, or marks unsure goes to the Judge's binding, which rules on it fresh, without the first pass's ruling. Left out, none. Check it with acr judge-check --first-pass before turning it on."},
         "focus_after_fix": {"type": "boolean", "description": "After a fix, tell each lens's reviewers what it changed and what it could affect (its references and tests) as where to look first. The whole change stays theirs. Default false."},
         "blast_radius": {"type": "boolean", "description": "After a fix, ask one small call on the Sizer's binding whether each lens that passed before the fix needs to attack again. A lens it skips is reported as skipped, with the reason, never as passing the new version. A lens with blockers of its own always attacks again. Default false."},
-        "group_fixes": {"type": "boolean", "description": "Fix a round's blockers in groups, each in a fresh session on the Orchestrator's binding: blockers in the same files together, the rest each alone, one group after another in the checkout, each seeing what the groups before it changed. Default true."}
+        "group_fixes": {"type": "boolean", "description": "Fix a round's blockers in groups, each in a fresh session on the Orchestrator's binding: blockers in the same files together, the rest each alone, one group after another in the checkout, each seeing what the groups before it changed. Default true."},
+        "fixer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["binding"],
+          "description": "A cheaper binding for the fix groups the rules call easy: every blocker in the group at or below max_severity, the group citing at most max_files files, each with its cause stated (file, line and detail), none a person's call or a defect a person reported missed, and none like one fixed in an earlier round. Every other group, and an easy group's restart after its fix failed, goes to the Orchestrator's binding, as do its other calls. Left out, the Orchestrator's binding fixes every group.",
+          "properties": {
+            "binding": {"type": "string", "description": "A binding in allowed_bindings that may write."},
+            "max_severity": {"enum": ["Critical", "High", "Medium", "Low"], "description": "The most severe a blocker in an easy group may be. Default Medium."},
+            "max_files": {"type": "integer", "minimum": 1, "description": "The most files an easy group's blockers may cite. Default 1."}
+          }
+        }
       }
     },
     "sessions": {
