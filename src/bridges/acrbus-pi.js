@@ -23,6 +23,16 @@
 //   applied, where it echoes it, as Fireworks does in
 //   fireworks-conversation-options, or, when it doesn't, that it didn't, or
 //   that no response's headers reached the extension at all.
+// - ACRBUS_NO_RESPONSE_SECS, ACRBUS_NO_RESPONSE_TRIES: a model request
+//   that gets no response for this many seconds, no headers before it or,
+//   once a stream has begun, no event in it, is lost: it's aborted as timed
+//   out, which pi's own retry takes up, and stderr says so. Bytes that carry
+//   no event, such as a gateway's keep-alive, aren't a response. Pi's own
+//   timeout of the same silence counts too. After that many in a row, the
+//   call ends with exit code 75, which its bridge fails, never passes, so
+//   acrbus retries or escalates it. A request that's answering, however
+//   slowly, is never cut off, and only a model request is watched: one sent
+//   between pi's before_provider_request and the turn's end.
 // - ACRBUS_EFFORT: the thinking level the call asked for. pi rounds a level
 //   the model doesn't have to one it does, and stderr says so.
 // - ACRBUS_ALLOWED_TOOLS: the tools this call may use, comma-separated, when
@@ -195,9 +205,171 @@ function openaiChat(payload, model) {
   );
 }
 
+// Why a call ends when its requests keep getting no response: an exit code
+// its bridge fails, as EX_TEMPFAIL says, so acrbus tries again.
+const NO_RESPONSE_EXIT = 75;
+// Marks a fetch already wrapped, so the guard wraps it once a process.
+const GUARDED = Symbol.for("acrbus.no-response-guard");
+// pi's HTTP client's own timeouts, as undici and the OpenAI SDK name them.
+const OWN_TIMEOUT = /UND_ERR_(HEADERS|BODY)_TIMEOUT|timed? ?out|timeout/i;
+// An SSE line that's an event, not a comment or a blank keep-alive.
+const SSE_EVENT = /(^|[\r\n])(data|event):/;
+
+// The no-response guard, when ACRBUS_NO_RESPONSE_SECS is set: it wraps
+// fetch, which pi's providers call through, once per process.
+function guard(pi, turnNow) {
+  const secs = Number.parseFloat(process.env.ACRBUS_NO_RESPONSE_SECS ?? "");
+  if (!Number.isFinite(secs) || secs <= 0) return;
+  const parsed = Number.parseInt(process.env.ACRBUS_NO_RESPONSE_TRIES ?? "", 10);
+  const tries = Number.isFinite(parsed) && parsed > 0 ? parsed : 3;
+  const real = globalThis.fetch;
+  if (typeof real !== "function" || real[GUARDED]) return;
+  const ms = secs * 1000;
+  // Between a provider request and its turn's end, a fetch is the model's.
+  let inCall = false;
+  // Lost requests in a row, and the request now waiting for an event.
+  let misses = 0;
+  let live = null;
+  pi.on("before_provider_request", () => {
+    inCall = true;
+    return undefined;
+  });
+  const done = () => {
+    inCall = false;
+    live?.stop();
+    return undefined;
+  };
+  pi.on("message_end", (event) => (event?.message?.role === "assistant" ? done() : undefined));
+  pi.on("agent_end", done);
+  pi.on("provider_stream_event", () => {
+    live?.heard();
+    return undefined;
+  });
+  const say = (line) => console.error(`acrbus cache: turn ${turnNow()}: ${line}`);
+  // One more lost request: said, and past the limit, the call ends.
+  const missed = (line) => {
+    misses += 1;
+    if (misses < tries) {
+      say(line);
+      return;
+    }
+    const last = `acrbus cache: turn ${turnNow()}: no response ${misses} times in a row: ending the call, so acrbus retries or escalates it\n`;
+    const exit = () => process.exit(NO_RESPONSE_EXIT);
+    setTimeout(exit, 2000).unref?.();
+    process.stderr.write(last, exit);
+  };
+  const wrapped = async function (input, init = {}) {
+    const method = String(init?.method ?? input?.method ?? "GET").toUpperCase();
+    if (!inCall || method !== "POST") return real.call(this, input, init);
+    const streamed = typeof init.body === "string" && /"stream"\s*:\s*true/.test(init.body);
+    const outer = init.signal;
+    const ctl = new AbortController();
+    const at = Date.now();
+    let timer = null;
+    let answered = false;
+    let ended = false;
+    let body = null;
+    const lost = new Error(`acrbus: no response in ${secs}s: request timed out`);
+    const stop = () => {
+      ended = true;
+      clearTimeout(timer);
+      if (live === watch) live = null;
+    };
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (ended) return;
+        stop();
+        missed(`no response in ${secs}s, aborted and retried`);
+        ctl.abort(lost);
+        try {
+          body?.error(lost);
+        } catch {}
+      }, ms);
+    };
+    const watch = {
+      stop,
+      heard() {
+        if (ended || !streamed) return;
+        answered = true;
+        misses = 0;
+        arm();
+      },
+    };
+    const onOuter = () => {
+      if (ended) return;
+      // pi's own timeout of the same silence ends it from outside.
+      if (!answered && Date.now() - at >= ms * 0.9) missed("no response, ended at pi's own timeout, retried");
+      stop();
+      ctl.abort(outer.reason);
+    };
+    if (outer?.aborted) ctl.abort(outer.reason);
+    else outer?.addEventListener?.("abort", onOuter, { once: true });
+    live?.stop();
+    live = watch;
+    arm();
+    const ours = (e) => e === lost || ctl.signal.reason === lost;
+    const own = (e) => !ours(e) && !outer?.aborted && OWN_TIMEOUT.test(`${e?.code ?? ""} ${e?.message ?? e} ${e?.cause?.code ?? ""}`);
+    let res;
+    try {
+      res = await real.call(this, input, { ...init, signal: ctl.signal });
+    } catch (e) {
+      if (!ended && own(e)) missed(`no response, ended at its own timeout (${oneLine(e?.code ?? e?.message ?? e)}), retried`);
+      stop();
+      // Ours goes on as a timeout, never as an abort, which pi would take
+      // for its own cancelling.
+      throw ours(e) ? lost : e;
+    }
+    if (ended) return res;
+    if (!streamed || !res.body) {
+      misses = 0;
+      stop();
+      return res;
+    }
+    const reader = res.body.getReader();
+    const text = new TextDecoder();
+    const piped = new ReadableStream({
+      start(c) {
+        body = c;
+      },
+      async pull(c) {
+        try {
+          const { done: end, value } = await reader.read();
+          if (end) {
+            stop();
+            c.close();
+            return;
+          }
+          if (SSE_EVENT.test(text.decode(value, { stream: true }))) watch.heard();
+          c.enqueue(value);
+        } catch (e) {
+          if (!ended && own(e)) missed(`no response, ended at its own timeout (${oneLine(e?.code ?? e?.message ?? e)}), retried`);
+          stop();
+          try {
+            c.error(ours(e) ? lost : e);
+          } catch {}
+        }
+      },
+      cancel(why) {
+        stop();
+        return reader.cancel(why);
+      },
+    });
+    const out = new Response(piped, { status: res.status, statusText: res.statusText, headers: res.headers });
+    Object.defineProperty(out, "url", { value: res.url });
+    return out;
+  };
+  wrapped[GUARDED] = true;
+  globalThis.fetch = wrapped;
+}
+
 export default function acrbus(pi) {
   const key = process.env.ACRBUS_CACHE_KEY;
   const turns = process.env.ACRBUS_TURNS === "1";
+  // The model calls this call has ended so far: the turn log's count, and
+  // what the no-response guard names the turn in progress by.
+  let turn = 0;
+  guard(pi, () => turn + 1);
   // This model call's request: when it went, and where its response, if
   // one came, says it went. Reset as each request goes.
   let requestAt = null;
@@ -264,7 +436,6 @@ export default function acrbus(pi) {
   // turn followed it.
   let unanswered = false;
   if (turns || relays) {
-    let turn = 0;
     pi.on("message_end", (event) => {
       const message = event?.message;
       if (!message || message.role !== "assistant" || !message.usage) return undefined;

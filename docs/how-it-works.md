@@ -152,8 +152,11 @@ Nothing cuts off a call that's working.
 
 A review says what each call is doing at least once a minute, with the
 tokens it has used so far and the run's total against its plan, and warns of
-a call that has logged no new turn in a while. Stopping a
-review stops its calls. A failed reviewer or Judge is never taken for a
+a call that has logged no new turn in a while, again for as long as it
+lasts. A pi call's model request that gets no response at all is aborted
+and retried, and a call whose requests keep getting none fails, so it's
+tried again. Stopping a review stops its calls, and its usage still counts
+every call that finished, in a round marked as unfinished. A failed reviewer or Judge is never taken for a
 clean pass, and a lens with nothing for its Judge says so.
 
 ## Reviewers stay in their lane

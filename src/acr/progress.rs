@@ -9,9 +9,10 @@
 //! or the run passes that most.
 //!
 //! A call whose agent has logged no new turn for a while (three minutes by
-//! default) is warned of once, until it moves again: a call waiting on a
-//! slow provider uses no CPU and changes no file, so its bridge's watch for
-//! a quiet run never sees it.
+//! default) is warned of then, and again at each multiple of that while the
+//! silence lasts, until it moves: a call waiting on a slow provider uses no
+//! CPU and changes no file, so its bridge's watch for a quiet run never sees
+//! it, and a long silence shouldn't look like a short one.
 //!
 //! It decides nothing. A call is never cut off while it works: its bridge
 //! ends one that stalls, and a person can stop a review. This only tells
@@ -112,8 +113,9 @@ struct Live {
     /// The turns its agent had logged when last looked at, and since when.
     turns: u64,
     turn_at: Instant,
-    /// It has logged no new turn for the stall time, and was told so.
-    stalled: bool,
+    /// How many times this stall has been said: once at the stall time,
+    /// and again at each multiple of it while no new turn comes.
+    stalled: u32,
 }
 
 /// A call at work, as the heartbeat reads it: its number, label, bridge,
@@ -223,7 +225,7 @@ impl Progress {
                     warned: false,
                     turns: 0,
                     turn_at: Instant::now(),
-                    stalled: false,
+                    stalled: 0,
                 },
             );
             Token(n)
@@ -297,7 +299,8 @@ impl Shared {
     }
 
     /// A warning for each call that has logged no new turn for `stall`,
-    /// once a stall: a turn since ends it, and a later one is said again.
+    /// and again at each multiple of it while that lasts: a turn since ends
+    /// the stall, and a later one is said afresh.
     /// Only calls whose bridge counts their turns.
     fn stalls(&self, stall: Duration) -> Vec<String> {
         let looking: Vec<(u64, String, String)> = lock(&self.state)
@@ -320,9 +323,9 @@ impl Shared {
             if t.turns != call.turns {
                 call.turns = t.turns;
                 call.turn_at = Instant::now();
-                call.stalled = false;
-            } else if !call.stalled && call.turn_at.elapsed() >= stall {
-                call.stalled = true;
+                call.stalled = 0;
+            } else if call.turn_at.elapsed() >= stall * (call.stalled + 1) {
+                call.stalled += 1;
                 out.push(format!(
                     "warning: {} has logged no new turn for {}, {} so far: its provider may be \
                      slow, or a request lost; nothing cuts it off for that",
@@ -916,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn warns_once_when_a_call_logs_no_new_turn_for_a_while_and_again_after_it_moves() {
+    fn warns_when_a_call_logs_no_new_turn_and_again_while_it_lasts_and_after_it_moves() {
         let seen = Seen::default();
         // The call's turns, as its bridge would read them from its agent.
         let turns = Arc::new(std::sync::atomic::AtomicU64::new(3));
@@ -957,21 +960,36 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("nothing cuts it off for that"), "{text}");
-        thread::sleep(Duration::from_millis(700));
-        assert_eq!(
-            seen.text().matches("no new turn").count(),
-            1,
-            "once a stall"
+        // Said again at each multiple of the stall time while it lasts,
+        // with how long it has been, so a long silence is never quiet.
+        let until = Instant::now() + Duration::from_secs(5);
+        while seen.text().matches("no new turn").count() < 3 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let repeated = seen.text();
+        let said: Vec<&str> = repeated
+            .lines()
+            .filter(|l| l.contains("no new turn"))
+            .collect();
+        assert!(said.len() >= 3, "again at each multiple: {repeated}");
+        assert!(
+            said.iter().all(|l| l.contains(", 3 so far:")),
+            "the same stall: {repeated}"
         );
         // A new turn ends the stall; a later one is said again.
+        let before = said.len();
         turns.store(4, Ordering::SeqCst);
         let until = Instant::now() + Duration::from_secs(5);
-        while seen.text().matches("no new turn").count() < 2 && Instant::now() < until {
+        while !seen.text().contains(", 4 so far:") && Instant::now() < until {
             thread::sleep(Duration::from_millis(20));
         }
         let later = seen.text();
         drop(p);
         assert!(later.contains(", 4 so far:"), "{later}");
+        assert!(
+            later.matches("no new turn").count() > before,
+            "a new stall is said: {later}"
+        );
         // Off: never said.
         let quiet = Seen::default();
         let p = Progress::with(

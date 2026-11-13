@@ -1507,6 +1507,43 @@ impl BridgeCaller {
         }
     }
 
+    /// A call answered: kept at once, a line in the run's folder beside
+    /// the calls in flight, so a run stopped before its round ends still
+    /// counts what that round's finished calls used.
+    fn answered(&self, call: &Call, answer: &flow::Answer) {
+        let Some(dir) = self
+            .calls_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|f| f.parent().map(Path::to_path_buf))
+        else {
+            return;
+        };
+        let kept = flow::Answered {
+            id: answer.run_id.clone(),
+            role: call.role,
+            binding: call.binding_name.to_string(),
+            agent: call.binding.agent.clone(),
+            model: call.binding.model.clone(),
+            subscription: call.binding.subscription,
+            label: call.label.clone(),
+            secs: answer.secs,
+            usage: answer.usage.clone(),
+        };
+        let Ok(line) = serde_json::to_string(&kept) else {
+            return;
+        };
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(flow::ANSWERED))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     /// A request sent, or answered: the list in flight, and its file.
     fn in_flight(&self, id: &str, sent: bool) {
         let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
@@ -1660,6 +1697,9 @@ impl Caller for BridgeCaller {
             .progress
             .start(&call.label, call.binding_name, bridge, share);
         let answer = self.call_once(call, bridge, token);
+        if let Ok(a) = &answer {
+            self.answered(call, a);
+        }
         let failed = answer.as_ref().err().map(|e| format!("{e:#}"));
         let used = answer
             .as_ref()
@@ -2260,7 +2300,24 @@ fn following(caller: &BridgeCaller, paths: &Paths, id: &str, cfg: &Config, how: 
 }
 
 /// Prints a run's report, and says what to do next.
+/// `run`, with every call its caller saw answered that it hasn't recorded:
+/// those of a round it stopped in before the round's end, counted from
+/// their answers and marked as from a round that didn't finish.
+fn with_unrecorded(paths: &Paths, run: &Run) -> Run {
+    let mut whole = run.clone();
+    let recorded: std::collections::HashSet<String> =
+        run.usage.iter().map(|u| u.run_id.clone()).collect();
+    for a in flow::Answered::read(&run_dir(paths, &run.id)) {
+        if !recorded.contains(&a.id) && !whole.usage.iter().any(|u| u.run_id == a.id) {
+            whole.usage.push(a.usage(run.round));
+        }
+    }
+    whole
+}
+
 fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<ExitCode> {
+    // A run stopped mid-round counts that round's finished calls too.
+    let run = &with_unrecorded(paths, run);
     save(paths, run, cfg)?;
     // Waiting for you, or over: Grayboard hears, if it's set up.
     grayboard::on_finish(paths, run, cfg);
@@ -2284,6 +2341,9 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     }
     let summary = report::report(run, cfg);
     for line in summary.by_role.iter().map(report::RoleUsage::line) {
+        eprintln!("{APP_NAME}: {line}");
+    }
+    if let Some(line) = report::unfinished_line(&run.usage) {
         eprintln!("{APP_NAME}: {line}");
     }
     if summary.by_role.iter().any(|r| r.shortfall > 0) {
@@ -2955,7 +3015,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
         }
         AcrCmd::Clean { dry_run } => clean(paths, dry_run)?,
         AcrCmd::Usage { run_id, json } => {
-            let run = kept_run(paths, &run_id)?;
+            let run = with_unrecorded(paths, &kept_run(paths, &run_id)?);
             let rows = report::by_role(&run.usage);
             let repairs = report::repairs(&run.usage);
             let firsts = report::first_turns(&run.usage);
@@ -2986,6 +3046,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     .map(|(u, a)| {
                         serde_json::json!({
                             "round": u.round, "role": u.role, "call": u.label,
+                            "unfinished": u.unfinished,
                             "cost": u.usd, "cost_adjusted": a.usd,
                             "cache_shortfall_tokens": a.shortfall,
                             "turns": u.turns, "tool_calls": u.tool_calls,
@@ -3005,6 +3066,9 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             } else {
                 for row in &rows {
                     println!("{}", row.line());
+                }
+                if let Some(line) = report::unfinished_line(&run.usage) {
+                    println!("{line}");
                 }
                 for p in &run.prefixes {
                     println!("round {}: {}", p.round, p.line());
@@ -5464,6 +5528,83 @@ mod tests {
     fn a_review_sends_as_itself_never_a_session() {
         let paths = paths();
         assert_eq!(BridgeCaller::new(&paths).unwrap().agent, "acr");
+    }
+
+    #[test]
+    fn a_stopped_runs_finished_calls_are_counted_from_their_answers() {
+        // A run stopped mid-round recorded only what finished in earlier
+        // rounds: the round's own finished calls were still in hand. Each
+        // answer is kept as it comes, so they count when it's stopped.
+        let paths = paths();
+        let caller = BridgeCaller::new(&paths).unwrap();
+        let dir = run_dir(&paths, "r-answered");
+        fs::create_dir_all(&dir).unwrap();
+        *caller.calls_file.lock().unwrap() = Some(dir.join("calls"));
+        let binding = config::Binding {
+            agent: "pi@here".into(),
+            model: Some("glm".into()),
+            ..config::Binding::default()
+        };
+        let call = |label: &str| Call {
+            role: Role::Reviewer,
+            binding_name: "small",
+            binding: &binding,
+            prompt: "Review",
+            artifact: None,
+            writes: false,
+            no_tools: false,
+            relay_tokens: None,
+            repo: Path::new("."),
+            label: label.into(),
+        };
+        let answer = |id: &str, usd: f64| flow::Answer {
+            text: "{}".into(),
+            run_id: id.into(),
+            usage: Some(crate::proto::RunUsage {
+                calls: 7,
+                input_tokens: 1_000,
+                cache_read_tokens: 40_000,
+                output_tokens: 200,
+                usd: Some(usd),
+                ..crate::proto::RunUsage::default()
+            }),
+            secs: Some(30),
+        };
+        caller.answered(&call("api: reviewer"), &answer("req-1", 0.10));
+        caller.answered(&call("probes: reviewer"), &answer("req-2", 0.25));
+        drop(caller);
+        // The run had recorded req-1 at an earlier round's end, and was in
+        // round 2 when it stopped.
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": "r-answered", "repo": "/r", "base": "main", "head": null,
+            "tier": "core", "tier_why": "", "fan_out": 1, "round": 2, "stage": "review",
+            "status": "running", "waiting": null,
+            "lenses": {}, "escalations": [], "disagreements": [], "usage": []
+        }))
+        .unwrap();
+        let mut kept = flow::Answered::read(&dir)[0].usage(1);
+        kept.unfinished = false;
+        run.usage.push(kept);
+        let whole = with_unrecorded(&paths, &run);
+        assert_eq!(whole.usage.len(), 2, "req-2 added once, req-1 not twice");
+        let added = whole.usage.iter().find(|u| u.run_id == "req-2").unwrap();
+        assert!(added.unfinished);
+        assert_eq!(added.round, 2);
+        assert_eq!(added.label.as_deref(), Some("probes: reviewer"));
+        assert_eq!(added.usd, Some(0.25));
+        assert_eq!(
+            (added.tokens_in, added.cache_read, added.tokens_out),
+            (1_000, 40_000, 200)
+        );
+        assert!(
+            report::unfinished_line(&whole.usage).is_some_and(|l| l
+                .contains("round 2 didn't finish")
+                && l.contains("its 1 finished call")),
+            "{:?}",
+            report::unfinished_line(&whole.usage)
+        );
+        assert!(report::unfinished_line(&run.usage).is_none());
+        let _ = fs::remove_dir_all(paths.config.parent().unwrap());
     }
 
     #[test]
