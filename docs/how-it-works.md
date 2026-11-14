@@ -1,9 +1,13 @@
 # How acrbus works
 
-You can review a change by handing the diff to a coding agent and asking
-what's wrong. You get one model's reading, in one context, judged by the
-same model that found it, once. Those weaknesses are structural, so acrbus
-fixes them in the structure of the review, not in a prompt.
+A single agent with a good prompt and tools can review a change well,
+including checking its own findings in a fresh pass. Its limit is that it
+reads in one framing, and usually rates what it found itself. acrbus bets
+that splitting review by dimension, judging separately and attacking again
+after fixes catches more, and puts that in the structure of the review, not
+in a prompt. That bet isn't measured yet; the
+[FAQ](faq.md#is-there-evidence-it-finds-more-than-a-simpler-review) says
+what would show it.
 
 acrbus doesn't review anything itself. Every reviewer, Judge, Sizer and
 Orchestrator is a model running headless in a harness, such as Claude Code,
@@ -23,21 +27,26 @@ comments, reaches them as claims to check, not to take on trust.
 
 ## The builder directs, and doesn't judge
 
-The session that built the change knows best where it could be wrong, so it
-writes the reviewers a brief: what the change is for, and, for each lens,
-where and how to attack. Without one, reviewers go off on tangents. The
-brief gives direction only. The builder never reviews or rules on its own
-change. [The builder's brief](acr-repo-setup.md#5a-the-builders-brief)
+The session that built the change knows what it's for and where the risky
+parts are, though not its own blind spots, so it writes the reviewers a
+brief: what the change is for, and, for each lens, where and how to attack.
+The brief gives direction only, and the builder never reviews or rules on
+its own change. Where a reviewer is pointed still shapes what it finds: the
+design bets that a brief prevents more tangents than it causes anchoring,
+and `facts.reviewers: facts-only` gives reviewers nothing a model wrote. [The builder's brief](acr-repo-setup.md#5a-the-builders-brief)
 shows the format.
 
-## Rules decide what blocks
+## A separate Judge states facts, and rules map them
 
 Reviewers find; a separate Judge checks each finding against the code and
 states facts about it. Is it a real defect? Was it there before the change?
 Does the change claim to fix it, or make it worse? Does a new test pin
 nothing?
 
-Fixed rules turn those facts into a ruling. A fact that rests on the
+Fixed rules turn those facts into a ruling: they drop some findings and
+raise others to High, and otherwise the Judge's own severity decides. So
+whether most findings block is still a model's call; the rules make the
+mapping the same everywhere, and auditable. A fact that rests on the
 change's own words holds only when the Judge quotes them from the diff.
 Each lens can say what blocks in its dimension, and a finding blocks when
 the Judge shows it meets that.
@@ -51,16 +60,16 @@ each. You read it and accept it, or change it first, and `acrbus acr run`
 refuses a repository until you have.
 
 The proposal is a starting point, not a baseline. After each review you
-say how it did, finding by finding, and what it missed. Recalibrating folds
-that back into the config, aiming the next review at what this one got
+say how it did, finding by finding, and what it missed. Recalibrating, for
+a config kept outside the repository, folds that back into the config, aiming the next review at what this one got
 wrong. A repository
 with little history to go on gets a config from its code, and leans more on
 your feedback.
 
 ## It gathers its own evidence
 
-With its stages on, acrbus runs the change's tests before any reviewer
-starts: coverage of the changed lines, mutants of the changed code that
+With its `gate` stage on, which is off by default, acrbus runs the
+change's tests before any reviewer starts: coverage of the changed lines, mutants of the changed code that
 every test should catch, and the tests again in random order, one at a time
 and in another time zone. Reviewers that run things get a copy of the
 repository of their own, and probes write and run scenarios of what the
@@ -73,8 +82,9 @@ After a round with blockers, the blockers you choose are fixed. Either the
 session that started the review fixes them, since it holds the change's
 context, or the Orchestrator does, if its binding may write. A cheaper
 fixer binding can take the groups of blockers rules call easy: few files,
-not severe, their cause stated, no one's call, and not recurring. Then new
-reviewers attack again, until every lens's latest round has no blocker.
+not Critical, their cause stated, no one's call, and not recurring. Then new
+reviewers attack again, until every lens's latest round has no blocker, or
+`max_rounds` puts what's left to you.
 
 Which lenses attack after a fix is an intensity you set with `reattack`:
 `blocked`, the lenses that had blockers, or `all`, every lens, since a fix
@@ -84,8 +94,8 @@ and whose choice it was. `acrbus acr plan` shows what `all` would be
 expected to cost here.
 
 A review to convergence goes further: after each fix, a steelman folds in
-the blockers and writes tests, and the review ends only when every lens
-agrees on the same version.
+the blockers and writes tests, and, below its 20-round cap, the review ends
+only when every lens passes the same version.
 
 ## You're in the loop
 
@@ -120,10 +130,13 @@ cap, go on without it, or stop. It never cuts off a working call.
 
 ## It's sized to the change
 
-A tier, chosen from what the change touches, decides which lenses run and
-how many reviewers each gets, so a docs fix doesn't pay for a security
-review. `acrbus acr plan` shows the lenses and an estimate before anything
-runs, and every model call is counted.
+Each lens's triggers decide whether it runs on a change, and a tier,
+chosen from what the change touches, sets how many reviewers each lens gets
+and can require lenses. A docs fix skips a security lens whose triggers
+don't match docs, though by default it still pays for `elegance`, `probes`
+where reviewers can run things, a Judge for each lens with findings, and
+the human gates. `acrbus acr plan` shows the lenses and an estimate before
+anything runs, and every model call is counted.
 
 ## It pays once for what every call shares
 
@@ -133,8 +146,8 @@ gate's results. Every reviewer and Judge gets that map in its system
 prompt, after ACR's own instructions and ahead of anything that differs
 between calls.
 
-That order is what makes it cheap. The provider's prompt cache serves the
-shared part to every call after the first, and each round after the first
+That order lets the provider's prompt cache serve the shared part to every
+call after the first, and each round after the first
 keeps the previous round's file sections where they were, with what a fix
 changed after them, so it shares the previous round's map through every
 file. A role's first call warms the cache before the rest start, which then
@@ -198,8 +211,9 @@ duplicates aren't steps of this kind.
 
 Each headless run gets an environment of its own, and a watch for going
 quiet. A run whose processes stop using CPU and writing files is woken, and
-if that doesn't work, it's ended and tried again in a fresh session.
-Nothing cuts off a call that's working.
+if that doesn't work, it's ended and tried again in a fresh session. The
+idle watch never cuts off a call that's working; only a call's time cap,
+4 hours for the shipped kinds, can.
 
 A review says what each call is doing at least once a minute, with the
 tokens it has used so far and the run's total against its plan, and warns of
@@ -254,6 +268,11 @@ reading them again.
 
 ## It's measurable
 
-`acrbus acr trial` reruns a review design blind on a change whose defects
-are already known, and scores what it catches. A change to acrbus, a lens
-or a model choice is a measurement, not a guess.
+`acrbus acr trial` reruns a review design blind on a change whose
+findings an earlier review already settled, and scores what it catches. A
+change to acrbus, a lens or a model choice can be measured that way, over
+several trials per design, since model output varies. A key's findings
+aren't every defect the change has, and trials have no single-reviewer
+design and can't run your own skill: the
+[FAQ](faq.md#how-do-i-measure-a-review-design) says what that leaves
+open.

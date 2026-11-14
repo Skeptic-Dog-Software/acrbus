@@ -13,11 +13,12 @@ variables, `CLI:` commands and flags, and `Tests:` test functions
 
 An orchestrator for adversarial convergence review (ACR) of code changes.
 Fresh reviewers attack a change one dimension at a time, a separate Judge
-checks what they find against the code, fixed rules decide what blocks, the
-blockers are fixed, and new reviewers attack the fixed version. Models do
-the reviewing and judging: every reviewer, Judge, Sizer and Orchestrator is
-a model running headless in a harness. acrbus runs what's around them, and,
-with its stages on, runs the change's tests itself.
+checks what they find against the code and states facts about each finding,
+fixed rules turn those facts into rulings, the blockers chosen are fixed,
+and new reviewers attack the fixed version. Models do the reviewing and
+judging: every reviewer, Judge, Sizer and Orchestrator is a model running
+headless in a harness. acrbus runs what's around them, and, with its `gate`
+stage on, runs the change's tests itself.
 
 Code: src/acr/flow.rs::drive; src/acr/flow.rs::review_round; src/acr/flow.rs::ruling; src/acr/stages.rs::run_gate | CLI: acrbus acr run | Tests: a_clean_change_is_confirmed_in_one_round, only_lenses_with_blockers_are_attacked_again_by_new_reviewers
 
@@ -49,12 +50,13 @@ Code: src/acr/config.rs::Role; src/acr/flow.rs::DEDUPE; src/acr/flow.rs::choose_
 It runs a local daemon, a server on this machine only: it listens on a Unix
 socket and opens no TCP port. The one exception is `acrbus grayboard
 login`, which opens a loopback port on 127.0.0.1 for the sign-in's redirect
-while you sign in. Network traffic comes from elsewhere: each harness sends
-what it reviews to its model's provider, `--pr` and `--post-pr` call GitHub
-through `gh`, and with Grayboard set up, the daemon talks to its team
-server.
+while you sign in. Your code still leaves the machine: each harness sends
+what it reviews to its model's provider; the commands acrbus runs, such as
+`tests.setup`, may fetch packages; `acr doctor` makes one small model call;
+`--pr` and `--post-pr` call GitHub through `gh`; and with Grayboard set up,
+the daemon talks to its team server.
 
-Code: src/daemon.rs::run; src/network.rs::Local; src/grayboard.rs::login; src/acr/facts.rs::fetch_pr | CLI: acrbus grayboard login, acrbus acr run --pr, acrbus acr run --post-pr | Tests: a_local_bus_needs_no_tailscale_and_reaches_only_this_machine, acrbus_is_local_by_default_and_names_the_networks_it_knows
+Code: src/daemon.rs::run; src/network.rs::Local; src/grayboard.rs::login; src/acr/facts.rs::fetch_pr; src/acr/stages.rs::run_setup; src/acr/mod.rs::doctor | CLI: acrbus grayboard login, acrbus acr run --pr, acrbus acr run --post-pr, acrbus acr doctor | Tests: a_local_bus_needs_no_tailscale_and_reaches_only_this_machine, acrbus_is_local_by_default_and_names_the_networks_it_knows
 
 ### Which platforms does it run on?
 
@@ -68,15 +70,18 @@ Code: src/setup.rs::LaunchAgent; src/setup.rs::UserUnit; src/daemon.rs::peer_uid
 
 It chooses no model: every role needs a binding, and a binding names its
 model. One that names none gets its bridge's `model`, which for `kind =
-"claude"` is `claude-sonnet-5-5` unless the bridge sets its own. Lenses,
-tiers and rules come only from the repository's config. acrbus does know a
-few languages' conventions: without `tests.command`, it guesses the test
-command from Flutter, Cargo, Go, npm or pytest files; it recognizes common
-generators' output by name; and `acr doctor` checks for the toolchain those
-files call for. Adding a language needs no change to acrbus: set
-`tests.command`, and `generated.paths` if needed.
+"claude"` is `claude-sonnet-5-5` unless the bridge sets its own. Lenses and
+tiers come from the review's config, the repository's over your `acr.yaml`
+defaults, plus the built-in `elegance` lens and a lens for each stage that's
+on; the rules that turn the Judge's facts into rulings are fixed in code.
+acrbus does know a few languages' conventions: without `tests.command`, it
+guesses the test command from Flutter, Cargo, Go, npm or pytest files; it
+recognizes common generators' output and test files by name; and `acr
+doctor` checks for the toolchain those files call for. Adding a language
+needs no change to acrbus: set `tests.command`, and `generated.paths` if
+needed.
 
-Code: src/acr/config.rs::Binding; src/bridges/claude.toml; src/acr/stages.rs::test_command; src/acr/generated.rs; src/acr/mod.rs::TOOLCHAIN_OF | Config: allowed_bindings, model, tests.command, generated.paths | Tests: the_framework_chooses_no_model, a_repository_in_another_language_needs_no_framework_change, a_repositorys_test_command_is_found_from_its_files
+Code: src/acr/config.rs::Binding; src/bridges/claude.toml; src/acr/config.rs::with_universal_lenses; src/acr/config.rs::with_stage_lenses; src/acr/flow.rs::ruling; src/acr/stages.rs::test_command; src/acr/generated.rs; src/acr/mod.rs::TOOLCHAIN_OF | Config: allowed_bindings, model, defaults, tests.command, generated.paths | Tests: the_framework_chooses_no_model, a_repository_in_another_language_needs_no_framework_change, a_repositorys_test_command_is_found_from_its_files
 
 ## Compared with other approaches
 
@@ -90,7 +95,8 @@ blocker is open, and a script can run the tests and apply a rules table to
 a judge's facts. That fit is its strength: nothing is spent on what the
 change doesn't need, a review can take a shape no fixed method would, it
 runs under your session's own permissions, and for many changes it's
-enough. It needs nothing installed.
+enough. It needs nothing installed, and it's text: if you disagree with a
+rule, you change a line.
 
 acrbus is that kind of orchestrator, already built, tested, and the same on
 every change. It fits the review in other places: the repository's config
@@ -103,21 +109,23 @@ What it does in code, a skill does in code only if you build it:
   table maps the facts to a ruling, so each ruling can be audited and the
   mapping is the same on every change. Whether a finding meets its lens's
   blocker definition, and otherwise its severity, is still the Judge's
-  call.
+  call. The table is code: a lens's `severity` map can change what Medium
+  and Low do, but changing the rules themselves means changing acrbus.
 - **When it's done.** After each fix, acrbus attacks again the lenses that
-  had blockers, any that didn't finish and any the fix now brings in, until
-  none has a blocker or the round cap puts it to you. In `acr run`, a lens
-  that passed before a fix isn't attacked again unless you ask.
+  had blockers, any that didn't finish and any the fix now brings in, or,
+  with `reattack: all`, every lens, until none has a blocker or the round
+  cap puts it to you.
 - **The tests.** With the `gate` stage on, which is off by default, acrbus
-  runs the change's tests, coverage and mutants itself and tells every
-  reviewer what they showed. CI may already run the tests; what the gate
-  adds is coverage of the changed lines, mutants of the changed code, and
-  runs in other orders and time zones.
+  runs the change's tests itself and puts the results in front of every
+  reviewer and the Judge in the same review, and some gaps block by rule.
+  CI can run much of this too: patch coverage, mutation testing scoped to
+  the diff, and runs in random order or another time zone; a mutation tool
+  covers far more mutants than the gate's few, which a model proposes.
 - **Comparability.** With the method fixed, a trial that changes one lens,
-  model or rule changes only that. A design made per change can be measured
-  too, by its results on known defects: `acrbus acr trial`'s builder-led
-  designs do that for a skill. Model output varies either way, so a fair
-  comparison takes several trials, not two reviews.
+  model or rule changes only that. Model output varies either way, so a
+  fair comparison takes several trials, not two reviews. `acr trial` can't
+  run your skill: see [Which designs can a trial
+  run?](#which-designs-can-a-trial-run).
 - **Models.** A skill can mix model families too, in a harness that calls
   several providers or by calling another agent's CLI. acrbus makes it a
   binding per role or lens (see [Can one review mix model
@@ -127,29 +135,34 @@ Whether that structure finds more than a well-built skill isn't shown yet:
 see [Is there evidence it finds more than a simpler
 review?](#is-there-evidence-it-finds-more-than-a-simpler-review).
 
-Code: src/acr/flow.rs::ruling; src/acr/flow.rs::rate; src/acr/flow.rs::settle; src/acr/stages.rs::run_gate; src/acr/config.rs::framework_defaults; src/acr/trial.rs::Arm; src/acr/config.rs::Binding | Config: lenses, tiers, max_rounds, stages | CLI: acrbus acr trial --arm | Tests: rules_decide_what_blocks_from_the_judges_facts, only_lenses_with_blockers_are_attacked_again_by_new_reviewers, the_changes_tests_are_run_other_ways_and_a_failure_is_a_finding, a_lens_can_have_its_own_binding
+Code: src/acr/flow.rs::ruling; src/acr/flow.rs::rate; src/acr/flow.rs::settle; src/acr/flow.rs::reattack; src/acr/stages.rs::run_gate; src/acr/config.rs::framework_defaults; src/acr/config.rs::Tests; src/acr/config.rs::Binding | Config: lenses, lenses.severity, tiers, max_rounds, stages, reattack, tests.mutants | CLI: acrbus acr trial --arm | Tests: rules_decide_what_blocks_from_the_judges_facts, only_lenses_with_blockers_are_attacked_again_by_new_reviewers, reattack_all_attacks_every_lens_after_each_fix_and_blocked_only_those_with_blockers, the_changes_tests_are_run_other_ways_and_a_failure_is_a_finding, a_lens_can_change_what_a_medium_does, a_lens_can_have_its_own_binding
 
 ### Why not one strong reviewer with a good prompt?
 
 For many changes that's enough, and it's far cheaper and faster. One
 context sees how dimensions interact, and it has none of the steps that can
-go wrong here: grouping, format repair, blast radius, handoffs. Its
-weakness is the one acrbus is built around: one reading, in one framing,
-rated by the model that found it. acrbus splits review by lens so each
-reviewer attacks one dimension in depth, rates a real finding outside a
-reviewer's lens like any other, so a defect that crosses lenses isn't
-dropped, and has a separate Judge rate it all. It pays for that in calls.
-Whether the split finds more on your code is for `acr trial` to measure.
+go wrong here: grouping, format repair, blast radius, handoffs. A single
+review plus one fresh-context check of its findings gets a separate rating
+too, for one more call. What acrbus adds beyond that is splitting review by
+lens, so each reviewer attacks one dimension in depth, and attacking again
+after each fix. The cost is calls, and that per-lens reviewers can miss an
+interaction a single reader would see; a real finding outside a reviewer's
+lens is still rated like any other. Whether the split finds more isn't
+shown yet, and `acr trial` has no single-reviewer design to measure it
+with.
 
-Code: src/acr/flow.rs::ruling; src/acr/roles.rs::reviewer_prompt; src/acr/roles.rs::judge_prompt | CLI: acrbus acr trial --arm | Tests: a_real_finding_another_lens_owns_is_rated_like_any_and_noise_is_dropped, fresh_sessions_share_nothing
+Code: src/acr/flow.rs::ruling; src/acr/roles.rs::reviewer_prompt; src/acr/roles.rs::judge_prompt; src/acr/trial.rs::Arm | CLI: acrbus acr trial --arm | Tests: a_real_finding_another_lens_owns_is_rated_like_any_and_noise_is_dropped, fresh_sessions_share_nothing
 
 ### acrbus ships an ACR skill. How does it relate?
 
 The skill is the method, written for a Claude Code session. Without acrbus,
-the session runs it with subagents. With acrbus set up, the session plays
-the builder: it writes the brief, starts `acrbus acr run`, brings every
-question to you, and fixes what you choose when the review leaves fixes to
-it. acrbus runs the reviewers, the Judge and the rules.
+the session runs it with subagents: it starts a reviewer per dimension and
+folds in their findings itself, with no separate Judge, no rules table and
+no gate. That's lighter, and fits where you'd rather the session decide.
+With acrbus set up, the session plays the builder: it writes the brief,
+starts `acrbus acr run`, brings every question to you, and fixes what you
+choose when the review leaves fixes to it. acrbus runs the reviewers, the
+Judge and the rules.
 
 Code: plugin/skills/acr/SKILL.md; src/acr/flow.rs::Fixer | CLI: acrbus acr run --brief, acrbus acr ask, acrbus acr resume --answers, acrbus acr resume --fixed | Tests: the_builder_briefs_round_one_and_the_steelman_the_next
 
@@ -157,43 +170,54 @@ Code: plugin/skills/acr/SKILL.md; src/acr/flow.rs::Fixer | CLI: acrbus acr run -
 
 A workflow designer models a task and composes a workflow of steps for that
 instance; some export it, some run it. Its case is that the right review
-differs for each instance, and a fixed step takes that choice away. That's
-partly right. acrbus fixes the review's shape: reviewers per lens, a
-separate Judge, the rules and the fix loop. A designer still chooses, for
-each instance, whether to call acrbus at all and what to give it: a brief,
-the bindings, the round cap, the human gate, the review's scope, even a
-config of its own with `--config` and `--uncalibrated`. What it can't
-change is the shape. If an instance needs a different shape, the designer
-should design one.
+differs for each instance, and a fixed step takes that choice away. For the
+review step, that's right: once it's handed to acrbus, its shape is fixed,
+reviewers per lens, a separate Judge, the rules and the fix loop, and it
+can't adapt that mid-review. The designer keeps the choice of whether to
+hand it over and what to pass in: a brief, the bindings, the round cap, how
+lenses attack after a fix, the human gate, the review's scope, even a
+config of its own with `--config` and `--uncalibrated`. In exchange it gets
+rulings made the same way across instances, which helps when comparing or
+auditing reviews over time; a designer that always reused one judging step
+and rules table would get that too. If an instance needs a different shape,
+the designer should design one.
 
-Code: src/acr/mod.rs::Target; src/acr/flow.rs::drive | Config: lenses, tiers, stages, max_rounds, human_gate | CLI: acrbus acr run --config, acrbus acr run --uncalibrated, acrbus acr run --brief, acrbus acr run --binding, acrbus acr run --max-rounds, acrbus acr run --human-gate, acrbus acr run --review-scope | Tests: settings_are_checked
+Code: src/acr/mod.rs::Target; src/acr/flow.rs::drive; src/acr/config.rs::Flags | Config: lenses, tiers, stages, max_rounds, human_gate, reattack | CLI: acrbus acr run --config, acrbus acr run --uncalibrated, acrbus acr run --brief, acrbus acr run --binding, acrbus acr run --max-rounds, acrbus acr run --reattack, acrbus acr run --human-gate, acrbus acr run --review-scope | Tests: settings_are_checked
 
 ### Can a designed workflow hand its review step to acrbus?
 
 Yes. A step runs `acrbus acr run` and reads its exit code: 0 when the
-review is confirmed, as every lens agrees or a person waived or deferred
-what was left; 3 when it waits for an answer, or for fixes; 4 when it
-escalates; 5 when an outage paused it, to go on with `acr resume`. The step
-can read the questions with `acr ask`, answer with `acr resume --answers`,
-and read the report as JSON. With `--human-gate exception` and an
-Orchestrator binding that can write, only escalations stop it; if the
-Orchestrator can't write, it also stops with 3 for the step to fix the
-blockers and run `acr resume --fixed`.
+review is confirmed, every lens's latest round having no blocker or a
+person having waived or deferred what was left; 3 when it waits for an
+answer, or for fixes; 4 when it escalates; 5 when an outage or its spend
+cap paused it, to go on with `acr resume`; 1 when it stopped, ended with a
+lens still open, or failed. The step can read the questions with `acr ask`,
+answer with `acr resume --answers`, and read the report as JSON. With
+`--human-gate exception` and an Orchestrator binding that can write, only
+escalations stop it; if the Orchestrator can't write, it also stops with 3
+for the step to fix the blockers and run `acr resume --fixed`.
 
-Whether it should is the designer's call. A fixed step gives up the choice
-of the review's shape, in exchange for rulings made the same way on every
-change.
+A step that answers the questions itself takes the person out of the
+review. A repository whose config sets `answers: person` refuses that:
+see [Can the agent that runs a review answer for
+me?](#can-the-agent-that-runs-a-review-answer-for-me).
 
-Code: src/acr/mod.rs::WAITING; src/acr/mod.rs::ESCALATED; src/acr/mod.rs::OUTAGE; src/acr/config.rs::HumanGate; src/acr/report.rs::Report; src/acr/flow.rs::Fixer | CLI: acrbus acr run --human-gate, acrbus acr ask --text, acrbus acr resume --answers, acrbus acr resume --fixed, acrbus acr usage --json, acrbus acr plan --json | Tests: the_report_can_be_read_by_a_machine, always_escalate_reaches_a_person_whatever_the_gate
+Whether to hand the step over at all is the designer's call. A fixed step
+gives up the choice of the review's shape, in exchange for rulings made the
+same way on every change.
+
+Code: src/acr/mod.rs::WAITING; src/acr/mod.rs::ESCALATED; src/acr/mod.rs::OUTAGE; src/acr/config.rs::HumanGate; src/acr/config.rs::Answers; src/acr/report.rs::Report; src/acr/flow.rs::Fixer | Config: answers | CLI: acrbus acr run --human-gate, acrbus acr ask --text, acrbus acr resume --answers, acrbus acr resume --fixed, acrbus acr usage --json, acrbus acr plan --json | Tests: the_report_can_be_read_by_a_machine, always_escalate_reaches_a_person_whatever_the_gate, under_answers_person_resume_refuses_answers_and_decisions_from_anywhere_but_a_person
 
 ### Isn't a fixed method rigid?
 
 Yes, in its shape. Every review has reviewers per lens, a separate Judge,
 the rules and the fix loop, and a repository is configured and accepted
-before its first review. Small changes pay for that: by default even a
-one-line docs fix runs the `elegance` lens, and the `probes` lens where
-reviewers can run things, each with its Judge, and asks you at the scope,
-at each round's blockers and at the result.
+before its first review, unless you pass `--uncalibrated`. Small changes
+pay for that: by default even a one-line docs fix runs the `elegance` lens,
+and the `probes` lens where reviewers can run things, a Judge for each lens
+with findings, and asks you at the scope, at each round's blockers and at
+the result. A repository can narrow `elegance`'s triggers so docs don't get
+it.
 
 What adapts:
 
@@ -203,12 +227,13 @@ What adapts:
   runs when its path or content triggers match, when the Orchestrator
   judges its description applies, or when the tier requires it.
 - **Per round:** another round runs while blockers remain, when a lens's
-  round didn't finish, or when you ask for one.
+  round didn't finish, or when you ask for one; `reattack` sets whether
+  every lens attacks after a fix or only those with blockers.
 
 If a change doesn't merit that shape, don't send it to acrbus; a scoped
 skill or a single review fits it better.
 
-Code: src/acr/flow.rs::choose_tier; src/acr/flow.rs::choose_lenses; src/acr/plan.rs::select; src/acr/config.rs::with_universal_lenses; src/acr/config.rs::with_stage_lenses; src/acr/config.rs::framework_defaults | Config: tiers, lenses, stages, max_rounds, human_gate | Tests: lenses_come_from_their_triggers, a_tier_can_require_a_lens, every_repository_gets_elegance_worded_its_own_way_if_it_likes, probes_are_on_by_default_wherever_reviewers_can_run_things
+Code: src/acr/flow.rs::choose_tier; src/acr/flow.rs::choose_lenses; src/acr/plan.rs::select; src/acr/config.rs::with_universal_lenses; src/acr/config.rs::with_stage_lenses; src/acr/config.rs::framework_defaults; src/acr/config.rs::Reattack | Config: tiers, lenses, triggers, stages, max_rounds, human_gate, reattack | CLI: acrbus acr run --uncalibrated | Tests: lenses_come_from_their_triggers, a_tier_can_require_a_lens, every_repository_gets_elegance_worded_its_own_way_if_it_likes, probes_are_on_by_default_wherever_reviewers_can_run_things, each_lens_judge_starts_as_its_own_reviewers_answer_and_one_with_nothing_says_so
 
 ### Is there evidence it finds more than a simpler review?
 
@@ -216,22 +241,33 @@ Not yet. A test is being designed that compares acrbus with a single strong
 reviewer and a well-built review skill, per dollar, on changes whose
 defects are known. Until it's published, the design rests on its
 rationale: clean reviewers per dimension, a separate Judge, and attacking
-again after each fix. A review makes several times the calls of a single
-one, and takes more of your time, so use it where you have reason to think
-it catches what a cheaper review misses, and where a miss costs more than
-the difference. `acrbus acr trial` measures that on your own changes,
-against the builder-led designs, before you rely on it.
+again after each fix.
 
-Code: src/acr/trial.rs::Arm; src/acr/trial.rs::score; src/acr/config.rs::framework_defaults | CLI: acrbus acr trial --arm, acrbus acr judge-check | Tests: a_one_size_trial_tells_its_builder_so, new_work_needs_no_findings_and_is_saved_unscored
+What it costs follows from its structure. A round makes about lenses times
+`fan_out` reviewer sessions, each a full agentic read of the code, plus a
+Judge call for each lens with findings and a few small calls, before fixes
+and later rounds. At a tier with `fan_out: 3` over six lenses, that's some
+two dozen agent sessions where a single review is one. It also takes more
+of your time. So use it where you have reason to think it catches what a
+cheaper review misses, and where a miss costs more than the difference.
+
+`acr trial` can't settle this yet: it has no single-reviewer design and
+can't run your own skill, and its keys' findings come from earlier
+reviews, which favors designs like the one that made them (see [How do I
+measure a review design?](#how-do-i-measure-a-review-design)).
+
+Code: src/acr/trial.rs::Arm; src/acr/trial.rs::Key; src/acr/plan.rs::dry_run; src/acr/config.rs::Tier | Config: tiers, fan_out | CLI: acrbus acr trial --arm, acrbus acr plan | Tests: a_one_size_trial_tells_its_builder_so, a_dry_run_estimates_its_cost
 
 ### Does acrbus replace human code review?
 
 No. It gives a person findings checked against the code and asks them to
 decide. It doesn't give a team what review by a teammate does: shared
 knowledge of the code, a check on product intent, and someone accountable
-for the merge. Use it before human review, so that review is spent on what
-only a person can judge. Its short multiple-choice questions make deciding
-quick, which also makes rubber-stamping easy.
+for the merge. The person answering its questions is often the change's
+author, so its independence ends at the gate. Use it before human review,
+so that review is spent on what only a person can judge, and don't let a
+confirmed review stand in for it. Its short multiple-choice questions make
+deciding quick, which also makes rubber-stamping easy.
 
 Code: src/acr/carousel.rs::Carousel; src/acr/config.rs::HumanGate | Config: human_gate | Tests: a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result
 
@@ -249,20 +285,23 @@ It's a harness, not a bare API call, because reviewers need tools: they
 read the code, search it and run it.
 
 A review doesn't strictly need a bus for that: a program could spawn each
-harness directly. What the bus adds:
+harness directly, and get from its own process runner what a bridge gives
+each run: a fresh session in an environment of its own, a stalled run ended
+and tried again, and each run's usage and record kept. What the bus itself
+adds:
 
 - requests kept in a store, so one a crash interrupted runs again, and an
   answer not yet sent still goes out;
 - each bridge's limit on runs at once holds across every review and agent
   that uses it;
 - a call can be cancelled from another process, as `acr stop` does;
-- each run gets a fresh session in an environment of its own, a stalled run
-  is ended and tried again, and each run's usage and record are kept;
 - doors let an agent in another OS account take part, and a program built
   on acrbus, such as tailbus, carries the same bus between machines;
 - your own sessions can use the same bus to message agents.
 
-Its cost is a daemon on your machine.
+Its cost is a daemon on your machine, and a local endpoint that runs agents
+for any process running as you: see [Can my sessions run commands through
+a bridge?](#can-my-sessions-run-commands-through-a-bridge).
 
 Code: src/acr/mod.rs::BridgeCaller; src/acr/mod.rs::stops_calls; src/store.rs::Store; src/bridge.rs::Kind; src/bridge.rs::Settings; src/door.rs::serve; src/config.rs::App | Config: allowed_bindings, lenses.binding, kind, max_concurrent | CLI: acrbus bridge install, acrbus acr stop, acrbus send | Tests: a_message_left_by_a_crash_runs_again_after_what_was_running_is_stopped, an_answer_not_yet_sent_goes_out_without_running_again, keeps_to_the_limit_on_runs_at_once, a_lens_can_have_its_own_binding, an_abandoned_run_is_tried_again_and_can_still_answer, each_run_is_logged_under_its_id
 
@@ -277,13 +316,30 @@ Code: src/bus.rs::Bus; src/store.rs::Store; src/daemon.rs::serve_conn | CLI: acr
 
 ### Is a message from another agent trusted?
 
-No. A bridge runs only requests from the bus's `owner`, and by default
-wraps each one in a note saying it comes from another agent, not the user,
-and is a request and nothing more; a bridge's own `message` replaces that
-note. For Claude Code, omp and pi bridges, ACR's system prompt adds that
-what a role reads is data, never instructions.
+Not as instructions. A bridge runs only requests from the bus's `owner`,
+and on one machine every local sender counts as the owner, so that check
+matters across machines, not within one. By default a bridge wraps each
+request in a note saying it comes from another agent, not the user, and is
+a request and nothing more; a bridge's own `message` replaces that note.
+For Claude Code, omp and pi bridges, ACR's system prompt adds, in a review,
+that what a role reads is data, never instructions.
 
-Code: src/bridge.rs::default_message; src/acr/system-prompt.md | Config: owner, message | Tests: answers_only_its_owner, the_owner_is_checked_before_any_option_is_read, the_default_message_says_who_its_from_and_that_it_isnt_the_user
+Code: src/bridge.rs::default_message; src/acr/system-prompt.md | Config: owner, message | Tests: answers_only_its_owner, the_owner_is_checked_before_any_option_is_read, the_default_message_says_who_its_from_and_that_it_isnt_the_user, a_reviews_every_role_gets_acrs_system_prompt_and_nothing_else_does
+
+### Can my sessions run commands through a bridge?
+
+On a bridge that accepts them, yes. With acrbus set up, each Claude Code
+session has bus tools, and a request to a bridge runs its agent with the
+bridge's tools, Bash included, with no permission prompt and, outside a
+review, without ACR's system prompt. So letting a session send to such a
+bridge amounts to letting it run commands as you. Bridges that `acrbus
+setup acr` writes have `accepts = "review"`: they run only ACR review
+calls, and refuse anything else with a message saying so. A bridge you
+write accepts any request unless you set that. It narrows what the bus
+tools can do; it isn't a wall against a process with a shell, which could
+build a review call's request itself.
+
+Code: src/bridge.rs::Accepts; src/setup.rs::acr; src/proto.rs::RunOptions | Config: accepts | CLI: acrbus setup acr | Tests: a_bridge_made_for_reviews_runs_only_review_calls
 
 ### What does a bridge do with a request?
 
@@ -298,11 +354,11 @@ Code: src/bridge.rs::Settings; src/bridge.rs::Allowed; src/bridge.rs::SessionMod
 ### What is a bridge's kind?
 
 `kind = "claude"`, `"omp"` or `"pi"` takes the defaults acrbus ships for
-that agent: its arguments, tools, efforts, where it records its usage, and,
-for claude and pi, how to run it with no tools. A bridge's own table wins over them, and any
+that agent: its arguments, tools, efforts, how to run it with no tools, and
+where it records its usage. A bridge's own table wins over them, and any
 other agent CLI works with a table of its own.
 
-Code: src/bridge.rs::Kind; src/bridges/claude.toml; src/bridges/pi.toml; src/bridges/omp.toml | Config: kind, extra_args | Tests: loads_its_table_and_reports_on_itself, a_bridge_that_names_its_kind_says_only_whats_its_own
+Code: src/bridge.rs::Kind; src/bridges/claude.toml; src/bridges/pi.toml; src/bridges/omp.toml | Config: kind, extra_args, no_tools_args | Tests: loads_its_table_and_reports_on_itself, a_bridge_that_names_its_kind_says_only_whats_its_own, pi_and_omp_defaults_turn_off_what_a_review_call_didnt_ask_for
 
 ### How many calls run at once?
 
@@ -338,7 +394,9 @@ Code: src/network.rs::Kind; src/config.rs::App; src/acr/mod.rs::check_machine | 
 1. The config is read from outside the change, and the repository must be
    calibrated, unless you pass `--uncalibrated`.
 2. The Sizer picks a tier, and the triggered lenses are chosen.
-3. You approve the scope, if the human gate asks.
+3. You approve the scope, if the human gate asks, and, when the config
+   doesn't say, choose how lenses attack after a fix, and who fixes when
+   the Orchestrator can write.
 4. Stages gather evidence, such as the test gate, and the change map is
    built.
 5. Each lens's reviewers attack, in fresh sessions.
@@ -346,12 +404,13 @@ Code: src/network.rs::Kind; src/config.rs::App; src/acr/mod.rs::check_machine | 
    that are one defect are then grouped, to be decided once.
 7. If the human gate asks, as the default does, you decide each blocker;
    otherwise every blocker is folded in. Those folded in are fixed by the
-   Orchestrator if its binding can write, or else by the session that ran
-   the review.
+   Orchestrator if its binding can write, or by `savings.fixer`'s binding
+   for a group the rules call easy, or else by the session that ran the
+   review. Each fix is held to its own files.
 8. New reviewers attack the fixed version, until no lens has a blocker or
    `max_rounds` is reached.
 
-Code: src/acr/flow.rs::drive; src/acr/flow.rs::Stage; src/acr/flow.rs::Gate | Config: human_gate, max_rounds, stages | Tests: a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result, a_clean_change_is_confirmed_in_one_round
+Code: src/acr/flow.rs::drive; src/acr/flow.rs::Stage; src/acr/flow.rs::Gate; src/acr/carousel.rs::reattack_question; src/acr/flow.rs::fix_route | Config: human_gate, max_rounds, stages, reattack, savings.fixer | Tests: a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result, a_clean_change_is_confirmed_in_one_round
 
 ### What is a lens?
 
@@ -359,7 +418,7 @@ One dimension of review, such as correctness or regression safety. It has
 `criteria` (what's wrong in this lens), `attack` (techniques that find it),
 `blocker` (what blocks here, set at calibration), and `triggers` (which
 changes it reviews). Every repository also gets a built-in `elegance` lens,
-which its config can reword but not remove.
+which its config can reword, or narrow by its triggers, but not remove.
 
 Code: src/acr/config.rs::Lens; src/acr/config.rs::Triggers; src/acr/config.rs::ELEGANCE | Config: lenses, criteria, attack, blocker, triggers | Tests: every_repository_gets_elegance_worded_its_own_way_if_it_likes, a_finding_blocks_by_the_lenss_definition_only_quoting_it
 
@@ -404,9 +463,10 @@ relevant and real, was it there before the change, does the change claim to
 fix it or make it worse, does a new test pin nothing, does a claim mislead,
 does it meet the lens's blocker definition. With per-lens Judges, the
 default, it starts from the diff hunks its findings point at. It keeps
-every tool its binding gives, and must not change what it reads: a Judge
-that does fails its lens's round, which escalates. A lens is judged as soon
-as its own reviewers finish. A ruling reused from an earlier round, or
+every tool its binding gives, and must not change what it reads: if the
+checkout changes during the reviewers' or Judges' turn, every lens reviewed
+that round fails, whoever changed it, which escalates. A lens is judged as
+soon as its own reviewers finish. A ruling reused from an earlier round, or
 settled by a first-pass Judge, takes no Judge call.
 
 Code: src/acr/roles.rs::judge_prompt; src/acr/roles.rs::Rating; src/acr/change.rs::hunks_for; src/acr/flow.rs::rate | Config: facts.judges, savings.reuse_rulings, savings.first_pass_judge | Tests: a_judge_gets_the_hunks_its_findings_point_at, a_judge_gets_the_diff_and_may_not_change_the_checkout, a_lens_is_judged_as_soon_as_its_own_reviewers_finish
@@ -467,51 +527,60 @@ Code: src/acr/flow.rs::same_defects; src/acr/flow.rs::identifiers; src/acr/flow.
 
 ### What if a reviewer or Judge answers in the wrong format?
 
-Every reviewer's and Judge's prompt ends with a one-line reminder of its
-answer's form, after everything its calls share. An answer in prose, or in
-JSON of another shape, is put into the asked-for form by a quick call on the
-Sizer's binding, told why it couldn't be read, which adds and drops nothing,
-and is counted as a repair. One that still can't be read is an error, never
-an empty result, and its unit is restarted once, fresh. A binding whose
+Each reviewer's and Judge's prompt ends with a one-line reminder of its
+answer's form, after everything its calls share, and so do the test gate's
+mutant proposer and Judge. An answer in prose, or in JSON of another shape,
+is put into the asked-for form by a quick call on the Sizer's binding, told
+why it couldn't be read, which adds and drops nothing, and is counted as a
+repair; the mutation stage's proposer, a scout's list and a relay's handoff
+get that repair too. One that still can't be read is an error, never an
+empty result, and its unit is restarted once, fresh. A binding whose
 answers keep needing repair is named in progress.
 
-Code: src/acr/flow.rs::findings_of; src/acr/flow.rs::ratings_repaired; src/acr/flow.rs::repaired; src/acr/roles.rs::reformat_prompt; src/acr/roles.rs::Shape; src/acr/roles.rs::FINDINGS_REMINDER; src/acr/roles.rs::RATINGS_REMINDER; src/acr/flow.rs::REPAIR_WARN_SHARE | Tests: a_reviewer_that_reports_in_prose_is_put_in_form_not_failed, a_judges_answer_is_put_in_form_and_one_that_cant_be_is_restarted, an_unreadable_answer_is_an_error_not_an_empty_result, a_binding_whose_answers_keep_needing_repair_is_said_in_progress
+Code: src/acr/flow.rs::findings_of; src/acr/flow.rs::ratings_repaired; src/acr/flow.rs::repaired; src/acr/flow.rs::ask_in_form; src/acr/roles.rs::reformat_prompt; src/acr/roles.rs::Shape; src/acr/roles.rs::FINDINGS_REMINDER; src/acr/roles.rs::RATINGS_REMINDER; src/acr/flow.rs::REPAIR_WARN_SHARE | Tests: a_reviewer_that_reports_in_prose_is_put_in_form_not_failed, a_judges_answer_is_put_in_form_and_one_that_cant_be_is_restarted, the_gates_mutant_proposer_and_judge_are_reminded_put_in_form_and_restarted, an_unreadable_answer_is_an_error_not_an_empty_result, a_binding_whose_answers_keep_needing_repair_is_said_in_progress
 
 ### When does `acr run` end?
 
 When every lens has finished its latest round with no blocker, every defect
 you reported is fixed, and you approve the result if the human gate asks.
-After a fix, the lenses that had blockers attack again with fresh
-reviewers, along with any lens whose round didn't finish and any the fixed
-change now triggers. Every lens attacks again when you choose "Another
-round" at the result, or report a defect the reviewers missed.
-`max_rounds`, 3 by default, caps the rounds: a lens still blocked there is
-put to you, to run one more round or stop.
+Which lenses attack a fixed version is `reattack`: with `blocked`, the
+default, the lenses that had blockers attack again with fresh reviewers,
+along with any lens whose round didn't finish and any the fixed change now
+triggers; with `all`, every lens does. Left unset, the scope gate asks, and
+a review whose gate doesn't ask there takes `blocked`, and its report says
+nobody chose. Every lens also attacks again when you choose "Another round"
+at the result, or report a defect the reviewers missed; with
+`savings.blast_radius` on and `reattack: blocked`, its check can skip a
+lens it says the fix can't touch. `max_rounds`, 3 by default, caps the
+rounds: a lens still blocked there is put to you, to run one more round or
+stop.
 
-Code: src/acr/flow.rs::settle; src/acr/flow.rs::reopen_all; src/acr/flow.rs::choose_lenses; src/acr/config.rs::framework_defaults; src/acr/flow.rs::About | Config: max_rounds | CLI: acrbus acr run --max-rounds | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, a_lens_a_later_version_of_the_change_needs_joins_and_none_leaves, a_blocker_at_max_rounds_stops_and_escalates
+Code: src/acr/flow.rs::settle; src/acr/flow.rs::reattack; src/acr/flow.rs::reopen_all; src/acr/flow.rs::blast_radius; src/acr/flow.rs::choose_lenses; src/acr/config.rs::Reattack; src/acr/config.rs::framework_defaults; src/acr/flow.rs::About | Config: max_rounds, reattack, savings.blast_radius | CLI: acrbus acr run --max-rounds, acrbus acr run --reattack | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, reattack_all_attacks_every_lens_after_each_fix_and_blocked_only_those_with_blockers, a_lens_a_later_version_of_the_change_needs_joins_and_none_leaves, a_blocker_at_max_rounds_stops_and_escalates
 
 ### What is a review to convergence?
 
 The fuller form of the method: after each round with a blocker, a steelman
 folds the upheld blockers in, a test writer pins the fixes where that stage
-is on, and the lenses attack again. Before it can end, a final sweep runs
-every lens that hasn't attacked the latest version, so, below its cap, it
-ends confirmed only when one round on one version has no blocker in any
-lens. It runs as `acr trial --arm converge`, with nobody in the loop, capped
-at 20 rounds; at the cap the sweep is skipped. `acr run` doesn't use it.
+is on, and the lenses the fix touched attack again. Before it can end, a
+final sweep runs every lens that hasn't attacked the latest version, so,
+below its cap, it ends confirmed only when every lens passes the same
+version. It runs as `acr trial --arm converge`, with nobody in the loop,
+capped at 20 rounds; at the cap the sweep is skipped. `acr run` doesn't run
+the steelman or the sweep; there, `reattack: all` has every lens attack
+after each fix.
 
-Code: src/acr/flow.rs::Steelman; src/acr/flow.rs::settle; src/acr/mod.rs::CONVERGE_CAP; src/acr/mod.rs::pipeline_run | CLI: acrbus acr trial --arm | Tests: a_review_to_convergence_attacks_every_lens_after_each_steelman, after_a_fix_only_what_it_touched_attacks_then_a_sweep_covers_the_rest
+Code: src/acr/flow.rs::Steelman; src/acr/flow.rs::settle; src/acr/flow.rs::refocus; src/acr/mod.rs::CONVERGE_CAP; src/acr/mod.rs::pipeline_run | Config: reattack | CLI: acrbus acr trial --arm | Tests: a_review_to_convergence_attacks_every_lens_after_each_steelman, after_a_fix_only_what_it_touched_attacks_then_a_sweep_covers_the_rest
 
 ### What does a confirmed review tell me?
 
 That in its last round, fresh reviewers in every lens that attacked found
 nothing the Judge upheld as blocking, and that what was left was accepted.
 It's a stopping rule, not a proof: reviewers vary, another round could find
-more, and in `acr run` a lens that passed before a fix isn't attacked again
-unless you ask. `acr residual`, and trials on known defects, measure what
-gets through.
+more, and with `reattack: blocked` a lens that passed before a fix isn't
+attacked again unless you ask. `acr residual`, and trials on known defects,
+measure what gets through.
 
-Code: src/acr/flow.rs::settle; src/acr/trial.rs::residual | CLI: acrbus acr residual --patch, acrbus acr trial | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, one_defect_list_holds_the_keys_findings_and_a_runs_upheld_blockers
+Code: src/acr/flow.rs::settle; src/acr/trial.rs::residual | Config: reattack | CLI: acrbus acr residual --patch, acrbus acr trial | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, one_defect_list_holds_the_keys_findings_and_a_runs_upheld_blockers
 
 ### What is the steelman?
 
@@ -525,12 +594,15 @@ Code: src/acr/roles.rs::steelman_prompt; src/acr/mod.rs::STEELMAN_BINDING; src/a
 
 ### What does a review cover: the whole pull request or one commit?
 
-`review_scope: whole-pr`, the default, reviews all of `base...head`, from
-their merge base, as one diff, which is what merging puts on the base. `bottom-of-stack` reviews only
-the first commit after the base, for stacks whose pull requests merge one
-by one.
+`review_scope: whole-pr`, the default, reviews the change as one diff. With
+`--head`, round one's diff is `base...head`, from their merge base, which
+is what merging puts on the base. Without `--head`, and in every round
+after a fix, it's the working tree against the base itself, so a base that
+has moved on since the branch point shows its newer commits too.
+`bottom-of-stack` reviews only the first commit after the base, for stacks
+whose pull requests merge one by one.
 
-Code: src/acr/config.rs::ReviewScope; src/acr/change.rs::bottom_of_stack | Config: review_scope | CLI: acrbus acr run --review-scope | Tests: reads_a_change_whole_or_from_the_bottom_of_its_stack, a_stacks_review_is_of_its_bottom_commit_which_must_be_checked_out
+Code: src/acr/config.rs::ReviewScope; src/acr/change.rs::load; src/acr/change.rs::bottom_of_stack; src/acr/mod.rs::reload | Config: review_scope | CLI: acrbus acr run --review-scope, acrbus acr run --head | Tests: reads_a_change_whole_or_from_the_bottom_of_its_stack, a_stacks_review_is_of_its_bottom_commit_which_must_be_checked_out
 
 ### What happens to generated files?
 
@@ -556,12 +628,13 @@ Code: src/acr/carry.rs::carry; src/acr/carry.rs::carrier | CLI: acrbus acr carry
 
 A YAML file from the session that built the change: a `scope` statement,
 what the change does mechanism by mechanism and what it doesn't touch, and
-for each lens, where and how to attack. Pass it with `acr run --brief`.
+for each lens, where and how to attack. Pass it with `acr run --brief`;
+it's kept with the review, so the rounds after `acr resume` get it too.
 Every role that reads the change gets the scope ahead of the diff, as
 claims to check, unless `facts.reviewers: facts-only` leaves it out, and
 each reviewer gets its own lens's part.
 
-Code: src/acr/stages.rs::BuilderBrief; src/acr/stages.rs::read_builder_brief; src/acr/config.rs::ReviewerInput | Config: facts.reviewers | CLI: acrbus acr run --brief | Tests: the_builder_briefs_round_one_and_the_steelman_the_next, a_brief_holds_what_a_reviewer_needs_and_only_that
+Code: src/acr/stages.rs::BuilderBrief; src/acr/stages.rs::read_builder_brief; src/acr/config.rs::ReviewerInput | Config: facts.reviewers | CLI: acrbus acr run --brief | Tests: the_builder_briefs_round_one_and_the_steelman_the_next, a_runs_builder_brief_is_kept_so_a_resume_after_the_scope_gate_still_briefs_round_one, a_brief_holds_what_a_reviewer_needs_and_only_that
 
 ### Doesn't the builder's brief break the rule that a worker doesn't check its own work?
 
@@ -590,12 +663,14 @@ Code: src/acr/stages.rs::briefer_prompt; src/acr/stages.rs::read_briefs; src/acr
 
 ### Who briefs the rounds after a fix?
 
-In a review to convergence, the steelman briefs the next round's lenses. In
-`acr run`, the scope from the builder's brief still reaches every round,
-and with the `brief` stage on, the Orchestrator briefs each lens again;
-with it off, a later round's lenses get no brief of their own.
+In a review to convergence, the steelman briefs the next round's lenses.
+In `acr run`, the scope from the builder's brief reaches every round; the
+session that ran the review, when it fixes, passes a brief on what its
+fixes changed with `acr resume --fixed --brief`, which the next round's
+reviewers get; and with the `brief` stage on, the Orchestrator briefs each
+lens again. Otherwise a later round's lenses get no brief of their own.
 
-Code: src/acr/flow.rs::Steelman; src/acr/stages.rs::briefer_prompt | Config: stages | Tests: the_builder_briefs_round_one_and_the_steelman_the_next
+Code: src/acr/flow.rs::Steelman; src/acr/flow.rs::fixed_by_session; src/acr/stages.rs::briefer_prompt | Config: stages | CLI: acrbus acr resume --fixed --brief | Tests: the_builder_briefs_round_one_and_the_steelman_the_next, a_fixing_sessions_brief_reaches_the_next_rounds_reviewers
 
 ### How are the change's claims about itself treated?
 
@@ -613,12 +688,15 @@ Code: src/acr/stages.rs::claims; src/acr/stages.rs::claims_prompt; src/acr/flow.
 At `~/.config/acrbus/acr/<repository>.yaml`, outside the repository, or
 else the repository's own `.acr/config.yaml` read from the base branch,
 never from the change; a `--config` file you name wins over both. Either
-way, nothing in the change's files can switch off its own review. A
-repository's config can choose among your bindings but can't add secrets,
-tools or bindings. It does set the test commands acrbus runs:
-`tests.command`, `setup`, `coverage` and `variants`.
+way, nothing in the change's files can switch off its own review. Run
+flags that make a review weaker than its config are said at its start, at
+every gate and in its report (see [Can the agent that runs a review answer
+for me?](#can-the-agent-that-runs-a-review-answer-for-me)). A repository's
+config can choose among your bindings but can't add secrets, tools or
+bindings. It does set the test commands acrbus runs: `tests.command`,
+`setup`, `coverage` and `variants`.
 
-Code: src/acr/mod.rs::repo_layer; src/acr/config.rs::REPO_CONFIG; src/acr/config.rs::SCHEMA; src/acr/config.rs::Tests | Config: tests.command, tests.setup, tests.coverage, tests.variants | CLI: acrbus acr validate, acrbus acr schema, acrbus acr run --config | Tests: the_config_comes_from_the_base_never_the_change, a_config_kept_outside_the_repository_wins_and_brings_its_own_list, a_repository_cant_add_secrets_tools_commands_or_bindings, a_repository_chooses_only_from_the_users_bindings
+Code: src/acr/mod.rs::repo_layer; src/acr/config.rs::REPO_CONFIG; src/acr/config.rs::SCHEMA; src/acr/config.rs::Tests; src/acr/config.rs::weakened | Config: tests.command, tests.setup, tests.coverage, tests.variants | CLI: acrbus acr validate, acrbus acr schema, acrbus acr run --config | Tests: the_config_comes_from_the_base_never_the_change, a_config_kept_outside_the_repository_wins_and_brings_its_own_list, a_repository_cant_add_secrets_tools_commands_or_bindings, a_repository_chooses_only_from_the_users_bindings, what_a_runs_flags_make_weaker_than_its_config_is_said
 
 ### How is a repository configured?
 
@@ -634,11 +712,12 @@ Code: src/acr/configure.rs::propose; src/acr/configure.rs::prompt; src/acr/confi
 
 `acr calibration --accept` puts a waiting proposal in place, or takes the
 config as it is, and records its fingerprint. It keeps the config it
-replaces as a backup, up to 3, and puts the proposal's decided non-issues in
-their own file. `acr run` refuses a repository until its config is
-accepted, unless you pass `--uncalibrated`. Accepting measures nothing.
+replaces as a backup, up to 3, and puts the proposal's decided non-issues
+in the file the config names. `acr run` refuses a repository until its
+config is accepted, unless you pass `--uncalibrated`. Accepting measures
+nothing.
 
-Code: src/acr/calibration.rs::accept; src/acr/configure.rs::BACKUPS_KEPT; src/acr/mod.rs::calibrated | CLI: acrbus acr calibration --accept | Tests: a_proposal_waits_then_goes_in_place_keeping_backups_and_non_issues, accepting_a_config_calibrates_it_until_the_config_changes
+Code: src/acr/calibration.rs::accept; src/acr/configure.rs::BACKUPS_KEPT; src/acr/mod.rs::calibrated | Config: not_findings | CLI: acrbus acr calibration --accept | Tests: a_proposal_waits_then_goes_in_place_keeping_backups_and_non_issues, a_proposals_non_issues_go_to_the_file_its_config_names, accepting_a_config_calibrates_it_until_the_config_changes
 
 ### What makes a repository need accepting again?
 
@@ -696,10 +775,10 @@ Code: src/acr/calibration.rs::accept; src/acr/configure.rs::propose; src/acr/cal
 
 Things settled as not findings in this repository, kept in the file
 `not_findings` points at. Reviewers, unless `facts.reviewers: facts-only`,
-the brief stage and the Judge get them. They're part of the config's fingerprint, so changing them means
-accepting again.
+and the Judge get them; the brief stage doesn't. They're part of the
+config's fingerprint, so changing them means accepting again.
 
-Code: src/acr/mod.rs::not_findings; src/acr/calibration.rs::Fingerprint | Config: not_findings | Tests: the_brief_and_the_judge_get_the_decided_non_issues
+Code: src/acr/mod.rs::not_findings; src/acr/calibration.rs::Fingerprint | Config: not_findings, facts.reviewers | Tests: the_brief_and_the_judge_get_the_decided_non_issues, facts_only_reviewers_get_nothing_a_model_wrote_and_no_decided_non_issues
 
 ### What is the runbook?
 
@@ -756,7 +835,7 @@ Code: src/acr/config.rs::Stage; src/acr/config.rs::framework_defaults; src/acr/c
 In each round its lens is open, before the reviewers start, acrbus runs the
 change's tests itself: changed lines no test runs, from a coverage report,
 when `tests.coverage` is set; mutants of the changed code every test
-passes, proposed by a reviewer-role call; and, with `tests.variants` and
+passes, proposed by a reviewer-role call; and, with `tests.variants` or
 `tests.repeat`, the change's own tests run other ways, such as in random
 order or another time zone, and again. A Judge rates the gaps, and every
 reviewer is told what the gate found. A mutant every test passes that
@@ -777,11 +856,14 @@ Code: src/acr/config.rs::GateMode; src/acr/flow.rs::gate_round | Config: tests.g
 
 ### Which tests count as the change's own?
 
-Files the change adds lines to whose path has "test" or "spec" in it,
-other than docs. It's a heuristic, and catches files such as `latest.rs`
-too. In Rust, a source file counts too when the change adds lines to its
-top-level `#[cfg(test)]` module; that's the only language whose in-file tests
-acrbus recognizes.
+Test files the change adds lines to, other than docs. A test file is known
+by where it is or what it's named, in the common languages' ways: a folder
+such as `tests/`, `__tests__/` or `testdata/`, or a name such as
+`test_x.py`, `x_test.go`, `x.test.ts`, `x.spec.js` or `XTest.java`. A name
+that merely contains "test", such as `latest.rs`, isn't one. In Rust, a
+source file counts too when the change adds lines to its top-level
+`#[cfg(test)]` module; that's the only language whose in-file tests acrbus
+recognizes.
 
 Code: src/acr/stages.rs::is_test_path; src/acr/stages.rs::test_modules; src/acr/stages.rs::changed_tests | Tests: a_rust_files_own_tests_are_its_test_module_brace_to_brace, a_pin_in_the_file_it_tests_is_checked_without_the_fix
 
@@ -837,12 +919,14 @@ Calls, turns and context. Each call is a session that works in turns, and
 every turn rereads everything before it, mostly from the provider's prompt
 cache, at the cached rate. So a review's cost is roughly the sum, over its
 calls, of what each turn reads and writes, priced at each role's model.
-Each round makes about lenses times `fan_out` reviewer calls, plus Judges,
-the Sizer, the Orchestrator and stage calls, and a later round runs only the
-lenses that attack again. What changes it: the tier, the models per role,
-how much of each turn the cache serves, and how many turns a call takes.
+Each round makes about lenses times `fan_out` reviewer calls, plus a Judge
+call for each lens with findings, the Sizer, the Orchestrator and stage
+calls, and fixes between rounds; a later round runs only the lenses that
+attack again, unless `reattack: all` has every lens attack. What changes
+it: the tier, the models per role, how much of each turn the cache serves,
+how many turns a call takes, and what a fix touches.
 
-Code: src/acr/plan.rs::dry_run; src/acr/config.rs::Price; src/acr/report.rs::RoleUsage | Config: tiers, fan_out, allowed_bindings, costs | Tests: cached_input_has_its_own_price_or_the_inputs, the_most_is_every_round_with_a_fix_between
+Code: src/acr/plan.rs::dry_run; src/acr/config.rs::Price; src/acr/report.rs::RoleUsage | Config: tiers, fan_out, allowed_bindings, costs, reattack | Tests: cached_input_has_its_own_price_or_the_inputs, the_most_is_every_round_with_a_fix_between
 
 ### How do I estimate a review before running it?
 
@@ -859,13 +943,29 @@ Code: src/acr/plan.rs::Plan; src/acr/plan.rs::dry_run; src/acr/config.rs::PerCal
 
 `acr usage <run id>` sums a review's calls by round and role: fresh,
 cached and output tokens, dollars and times, with dedupe, repairs,
-restarts, keep-alives and relay sessions apart, and, with `savings.fixer`,
-fixes by binding. Progress says each call's tokens so
+restarts, keep-alives and relay sessions apart; each fix session's scope,
+what was put back and what it cost; tools each call used by name, and any
+its binding doesn't name; and, with `savings.fixer`, fixes by binding.
+Progress says each call's tokens so
 far and the run's total against its plan. On a subscription, with no
 prices, it counts tokens and no dollars, and a review's calls count against
 your plan's limits.
 
 Code: src/acr/report.rs::Report; src/acr/report.rs::session_lines; src/acr/report.rs::restarts; src/acr/report.rs::fix_routes; src/acr/progress.rs::Progress | CLI: acrbus acr usage, acrbus acr usage --json | Tests: calls_are_summed_by_round_and_role_with_dedupe_and_keep_alive_apart, says_each_calls_tokens_so_far_and_the_runs_against_the_plan_and_warns_once, on_a_subscription_it_counts_tokens_and_no_dollars, a_call_without_a_price_leaves_the_total_unknown
+
+### Can I cap what a review spends?
+
+Yes, if you want one: `spend_cap: {usd, tokens}` in the config, or
+`--spend-cap-usd` for a run. It's off unless set. Once a review's finished
+calls reach it, no new call starts, calls already working finish, and the
+review stops at a gate: raise the cap, go on without it, or stop. It never
+cuts off a call that's working. `acr plan` and the review's start show it,
+and spend from before a resume counts. Beyond it, the levers are the tier's
+`fan_out`, the lenses' triggers, `max_rounds`, `reattack`, the human gate,
+the savings and `acr stop`; progress also warns once when a run passes its
+plan.
+
+Code: src/acr/config.rs::SpendCap; src/acr/flow.rs::SPEND_CAP; src/acr/carousel.rs::new_cap; src/acr/flow.rs::About | Config: spend_cap, spend_cap.usd, spend_cap.tokens | CLI: acrbus acr run --spend-cap-usd, acrbus acr plan, acrbus acr stop | Tests: at_its_spend_cap_a_review_starts_no_new_call_and_asks_whether_to_go_on, says_each_calls_tokens_so_far_and_the_runs_against_the_plan_and_warns_once
 
 ### What is the change map, or shared facts?
 
@@ -885,8 +985,8 @@ seen. So every reviewer and Judge gets ACR's own instructions first, then
 the shared facts, then what differs between calls. A later round keeps
 every earlier round's file sections where they were and adds what a fix
 changed after them, so it shares the last round's cached prefix through all
-of them, unless the pull request's title and description, read again each
-round ahead of the files, changed. The round's number, review comments and
+of them, unless the pull request's title, description or linked issues,
+read again each round ahead of the files, changed. The round's number, review comments and
 gate results come last.
 
 Code: src/acr/facts.rs::render_with; src/acr/facts.rs::shared_prefix; src/acr/facts.rs::Prefix | Tests: same_role_calls_share_their_head_byte_for_byte_and_what_differs_comes_last, a_fix_to_the_first_file_keeps_every_earlier_section_and_adds_its_new_one_last, a_pull_requests_words_sit_where_the_cache_wants_them
@@ -914,8 +1014,8 @@ Code: src/acr/learned.rs::Learned; src/acr/learned.rs::MIN_OPENS; src/acr/facts.
 
 With `facts.shared` on, a role's first call goes alone until its turn shows
 it read its prompt, or it finishes, or for `warm_secs` (60 by default), so the rest of its fan-out start on a
-cached prefix. Then the rest start `stagger_secs` apart (3 by default; 0 for
-all at once): a burst of new sessions can be spread over a provider's
+cached prefix. When the first went alone, the rest then start
+`stagger_secs` apart (3 by default; 0 for all at once): a burst of new sessions can be spread over a provider's
 replicas, of which only one holds the prefix. Progress says when they're
 staggered, and `acr usage` gives each call's first turn's cached share. A
 keep-alive is a minimal call that refreshes a prefix still
@@ -939,14 +1039,33 @@ Code: src/acr/mod.rs::cache_key; src/bridge.rs::CACHE_KEY_ENV; src/bridges/acrbu
 
 ### What are matched tools?
 
-With `match_tools` on, the default, the reviewers and the Judge bound to one
-bridge and model are shown the union of their tools, so their prompts share
-a prefix, and each call is told which tools are its own. Only pi's calls
-can be held to their own: acrbus's extension refuses any other tool and
-says which it may use. On another agent, give those roles the same tools,
-or set `facts.match_tools: false`.
+With `match_tools` on, the default, reviewers and the Judge bound to one
+pi bridge and model are shown the union of their tools, so their prompts
+share a prefix, and acrbus's extension holds each call to its own,
+refusing any other and saying which it may use. Only bridges that can hold
+a call to its tools get matched tools, so on Claude Code or omp each call
+keeps its own list.
 
-Code: src/acr/flow.rs::matched_tools; src/bridge.rs::ALLOWED_TOOLS_ENV; src/bridges/acrbus-pi.js | Config: facts.match_tools | Tests: matched_tools_are_the_union_for_a_bridge_and_model_only_where_lists_differ, a_reviewers_and_judges_calls_get_the_rounds_facts_key_and_matched_tools
+Code: src/acr/flow.rs::matched_tools; src/bridge.rs::holds_tools; src/bridge.rs::ALLOWED_TOOLS_ENV; src/bridges/acrbus-pi.js | Config: facts.match_tools | Tests: matched_tools_are_the_union_for_a_bridge_and_model_only_where_lists_differ, a_reviewers_and_judges_calls_get_the_rounds_facts_key_and_matched_tools
+
+### Can a review call use tools or MCP servers its binding doesn't name?
+
+Not on pi: acrbus's extension refuses any tool a review call's binding
+doesn't name, including one a gateway added to the request or one the
+model made up, and logs each refusal. pi review calls get `--no-mcp`
+unless the binding names servers, as `mcp: [name]`, that its bridge's
+`options.mcp` allows; the call then gets only those servers' tools. Claude
+Code's bridge passes `--strict-mcp-config`, so its calls get no MCP
+servers; omp has no flag that turns its servers off, so it gets those its
+config in the bridge's home names. On any agent whose bridge reports tools
+by name, a tool a call's model asked for that its binding doesn't name
+gets a progress line, and a line in
+the report and `acr usage`. A gateway that adds its own tools to requests
+can be told not to with a header: `ACRBUS_REQUEST_HEADERS`, one
+`name=value` a line in a pi bridge's `[env]`, puts headers on every model
+request a review call makes.
+
+Code: src/bridges/acrbus-pi.js::requestHeaders; src/bridges/pi.toml; src/bridges/claude.toml; src/acr/config.rs::Binding; src/acr/flow.rs::unnamed_tools | Config: mcp, options.mcp, ACRBUS_REQUEST_HEADERS | Tests: a_pi_review_call_gets_no_mcp_server_unless_it_names_one_and_is_held_to_its_tools, a_tool_a_calls_model_asked_for_that_its_binding_doesnt_name_is_recorded_and_reported, pi_and_omp_defaults_turn_off_what_a_review_call_didnt_ask_for
 
 ### What does the pi extension log for each turn?
 
@@ -992,19 +1111,20 @@ Code: src/acr/flow.rs::reusable; src/acr/flow.rs::keep_rulings; src/acr/flow.rs:
 
 A binding, such as a cheaper model, that rules first and marks what it
 isn't sure of. Anything it would have block, rates Medium or above, calls a
-split or values call, states a fact the rules raise, or marks unsure goes on
-to the Judge, with the rest of its lens, which the Judge rules fresh from
-its own prompt without seeing the first pass. It's off unless set, and the report says which binding ruled
-each finding.
+split or values call, states a fact the rules raise, marks unsure, or
+leaves unrated goes on to the Judge, with the rest of its lens, which the
+Judge rules fresh from its own prompt without seeing the first pass. It's
+off unless set, and the report says which binding ruled each finding.
 
-Code: src/acr/flow.rs::first_pass_escalates; src/acr/roles.rs::FIRST_PASS_NOTE; src/acr/config.rs::SavingsConfig | Config: savings.first_pass_judge | Tests: the_first_pass_escalates_whatever_could_block_or_it_isnt_sure_of, what_the_first_pass_sends_on_the_judge_rules_fresh_from_its_own_prompt, a_first_pass_that_settles_a_lens_saves_its_judge_call, a_first_pass_that_rates_nothing_settles_nothing
+Code: src/acr/flow.rs::first_pass_escalates; src/acr/roles.rs::FIRST_PASS_NOTE; src/acr/config.rs::SavingsConfig | Config: savings.first_pass_judge | Tests: the_first_pass_escalates_whatever_could_block_or_it_isnt_sure_of, what_the_first_pass_sends_on_the_judge_rules_fresh_from_its_own_prompt, a_first_pass_that_settles_a_lens_saves_its_judge_call, a_first_pass_that_rates_nothing_settles_nothing, a_finding_the_first_pass_leaves_unrated_goes_on_to_the_judge
 
 ### How do I check a first-pass Judge before turning it on?
 
 `acr judge-check <key>... --first-pass <binding>` rates each key's findings
 with the Judge alone and with the first pass in front of it, and prints both
 against the key: blockers agreed, missed and overrated. The JSON it writes
-with `--out` also says which findings the first pass rated differently. Turn it on only if it misses no blocker
+with `--out` also lists the findings whose blocking verdict the first pass
+got differently from the Judge. Turn it on only if it misses no blocker
 the Judge alone catches.
 
 Code: src/acr/mod.rs::AcrCmd | Config: savings.first_pass_judge | CLI: acrbus acr judge-check --first-pass, acrbus acr judge-check --out
@@ -1039,19 +1159,22 @@ Code: src/acr/config.rs::JudgeMode; src/acr/roles.rs::judge_finding_parts | Conf
 
 ### What does `savings.fixer` do?
 
-It sends the fix groups the rules call easy to a cheaper binding that may
+When the Orchestrator's binding fixes, outside a review to convergence, it
+sends the fix groups the rules call easy to a cheaper binding that may
 write, while every other group, and the Orchestrator's other calls, its
 briefs, steelman and tests, stay on the Orchestrator's binding. A group is
-easy only if every blocker in it is at or below `max_severity` (Medium by
-default), the group cites at most `max_files` files (1 by default), the
-Judge stated each cause with a file, line and detail, none is a person's
-call or a defect a person reported missed, and none is like one an earlier
-round's fix fixed. An easy group whose fix fails is restarted on the
-Orchestrator's binding. Progress says each group's route and why, and `acr
+easy only if every blocker in it is at or below `max_severity` (High by
+default; a Critical is never easy, and `Critical` isn't accepted), the
+group cites at most `max_files` files (1 by default), the Judge stated each
+cause with a file, line and detail, none is a person's call or a defect a
+person reported missed, and none is like one an earlier round's fix fixed.
+An easy group whose fix fails is restarted on the Orchestrator's binding.
+`acr validate`, `acr plan` and a review's start warn when no severity that
+blocks could be easy. Progress says each group's route and why, and `acr
 usage` gives each binding's groups, calls, dollars and how many of their
 blockers held the next round. It's off unless set.
 
-Code: src/acr/flow.rs::fix_route; src/acr/flow.rs::fix_call; src/acr/flow.rs::FixRoute; src/acr/config.rs::FixerPolicy; src/acr/config.rs::FixerConfig; src/acr/report.rs::fix_routes | Config: savings.fixer, savings.fixer.binding, savings.fixer.max_severity, savings.fixer.max_files | CLI: acrbus acr plan, acrbus acr validate, acrbus acr doctor, acrbus acr usage | Tests: a_fix_group_is_easy_only_if_every_rule_holds, savings_fixer_sends_easy_groups_to_its_binding_and_hard_ones_to_the_orchestrators, savings_fixer_names_a_binding_that_may_write_and_defaults_its_rules
+Code: src/acr/flow.rs::fix_route; src/acr/flow.rs::fix_call; src/acr/flow.rs::FixRoute; src/acr/config.rs::FixerPolicy; src/acr/config.rs::FixerConfig; src/acr/report.rs::fix_routes | Config: savings.fixer, savings.fixer.binding, savings.fixer.max_severity, savings.fixer.max_files | CLI: acrbus acr plan, acrbus acr validate, acrbus acr doctor, acrbus acr usage | Tests: a_fix_group_is_easy_only_if_every_rule_holds, savings_fixer_sends_easy_groups_to_its_binding_and_hard_ones_to_the_orchestrators, savings_fixer_names_a_binding_that_may_write_and_defaults_its_rules, a_fixer_whose_max_severity_no_blocker_reaches_is_said_to_route_nothing, a_restarted_easy_fix_is_counted_on_the_orchestrators_row_even_with_no_hard_group
 
 ### Does any saving take a tool or a file away from a reviewer?
 
@@ -1086,32 +1209,35 @@ Code: src/bridge.rs::RELAY_ENV; src/bridges/acrbus-pi.js | Config: sessions.rela
 A scouted lens's reviewer first runs a scout session, which lists everything
 it suspects, with how to confirm or rule each out, and verifies nothing.
 Each suspicion then gets a short session of its own, from the reviewer's
-brief and that suspicion alone. Every suspicion is checked; one that can't
-be checked fails the reviewer. It's off unless set.
+brief and that suspicion alone. Every suspicion is checked: a check that
+fails is restarted once, fresh, and one that fails again fails the
+reviewer. It's off unless set.
 
-Code: src/acr/roles.rs::scout_part; src/acr/roles.rs::verify_part; src/acr/roles.rs::Suspect | Config: sessions.scout | Tests: a_scout_lists_suspects_and_each_is_verified_from_its_own_brief, a_scouted_lens_lists_suspicions_and_verifies_each_on_its_own, a_suspicion_that_cant_be_checked_fails_the_reviewer
+Code: src/acr/roles.rs::scout_part; src/acr/roles.rs::verify_part; src/acr/roles.rs::Suspect; src/acr/flow.rs::Restarter | Config: sessions.scout | Tests: a_scout_lists_suspects_and_each_is_verified_from_its_own_brief, a_scouted_lens_lists_suspicions_and_verifies_each_on_its_own, a_suspicion_that_cant_be_checked_fails_the_reviewer, a_suspicion_whose_check_cant_be_read_is_checked_again_fresh
 
 ### Can a handoff lose findings?
 
-It can: a handoff is a summary. A handoff that can't be read, or that did no
-work, fails the call. To check that nothing is lost, run the same trial
-with `sessions` unset and set, and compare what each caught and what each
-cost. Each session shows in `acr usage` as `leg N`, `scout` or `verify N`.
+It can: a handoff is a summary. A handoff that can't be read even put in
+form, or that did no work, fails the call, and its unit is restarted once,
+fresh. To check that nothing is lost, run the same trial with `sessions`
+unset and set, and compare what each caught and what each cost. Each
+session shows in `acr usage` as `leg N`, `scout` or `verify N`.
 
-Code: src/acr/roles.rs::handoff_of; src/acr/report.rs::Sessions | Config: sessions | CLI: acrbus acr trial --arm, acrbus acr rescore --results, acrbus acr usage | Tests: a_handoff_that_cant_be_read_or_makes_no_progress_is_never_a_pass, a_handoff_is_read_from_its_mark_or_its_field_and_a_bad_one_is_an_error
+Code: src/acr/roles.rs::handoff_of; src/acr/report.rs::Sessions; src/acr/flow.rs::Restarter | Config: sessions | CLI: acrbus acr trial --arm, acrbus acr rescore --results, acrbus acr usage | Tests: a_handoff_that_cant_be_read_or_makes_no_progress_is_never_a_pass, a_handoff_is_read_from_its_mark_or_its_field_and_a_bad_one_is_an_error
 
 ## Fixes
 
 ### Who fixes the blockers?
 
 By default, a fresh agent on the Orchestrator's binding, when that binding
-has `writes: true`, or, for a group the rules call easy, on `savings.fixer`'s
-binding if it's set. If it can't write, the session that ran the review
-fixes them, since it holds the change's context, and resumes with `acr
-resume --fixed`. When the Orchestrator can write and the human gate asks
-about the scope, the scope gate asks you which.
+has `writes: true`; with `savings.fixer` set, a group the rules call easy
+goes to its binding instead. If the Orchestrator can't write, the session
+that ran the review fixes them, since it holds the change's context, and
+resumes with `acr resume --fixed`. When the Orchestrator can write and the
+human gate asks about the scope, the scope gate asks you which. In a
+review to convergence, the steelman fixes.
 
-Code: src/acr/flow.rs::Fixer; src/acr/flow.rs::session_fixes; src/acr/carousel.rs::fixer; src/acr/carousel.rs::SESSION | Config: allowed_bindings | CLI: acrbus acr resume --fixed | Tests: a_fix_needs_somewhere_to_go, a_fix_by_the_session_that_ran_the_review_is_flagged_too
+Code: src/acr/flow.rs::Fixer; src/acr/flow.rs::session_fixes; src/acr/flow.rs::fix_route; src/acr/carousel.rs::fixer; src/acr/carousel.rs::SESSION | Config: allowed_bindings, savings.fixer | CLI: acrbus acr resume --fixed | Tests: a_fix_needs_somewhere_to_go, a_fix_by_the_session_that_ran_the_review_is_flagged_too
 
 ### Where do fixes go, and does acrbus commit them?
 
@@ -1141,20 +1267,54 @@ Code: src/acr/flow.rs::fix_groups; src/acr/flow.rs::fix_in_groups; src/acr/flow.
 It measures what the session's prompt grew since its own first turn, not
 the prompt itself, and hands off only once the session has made an edit, or
 has grown twice the size without one. The handoff carries what it changed,
-what it read, the edits it was about to make, and what's left. A fixer
-session that hands off without changing the working tree did no work: the
-fix fails, and is restarted or escalated like any failed fix.
+what it read, the edits it was about to make, what's left, and its scope.
+A fixer session that hands off without changing the working tree, or whose
+only changes were outside its files and put back, did no work: the fix
+fails, and is restarted or escalated like any failed fix.
 
-Code: src/bridge.rs::RELAY_GROWTH_ENV; src/acr/roles.rs::fix_continuation | Config: sessions.relay_tokens | Tests: a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, the_pi_extension_relays_a_fixer_by_its_growth_and_only_after_its_first_edit, a_fixers_handoff_carries_its_reading_and_planned_edits_to_the_next_session, a_fixer_that_hands_off_twice_with_nothing_more_done_stops_its_relay, a_fixers_relay_reaches_pi_as_growth_after_an_edit
+Code: src/bridge.rs::RELAY_GROWTH_ENV; src/acr/roles.rs::fix_continuation; src/acr/flow.rs::put_back | Config: sessions.relay_tokens | Tests: a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, the_pi_extension_relays_a_fixer_by_its_growth_and_only_after_its_first_edit, a_fixers_handoff_carries_its_reading_and_planned_edits_to_the_next_session, a_fixer_that_hands_off_twice_with_nothing_more_done_stops_its_relay, a_fixers_relay_reaches_pi_as_growth_after_an_edit
 
 ### What keeps a fix in scope?
 
-The fixer is told to change code, tests and docs, not what's built from
-them, and not to run a command that rewrites tracked files beyond the fix.
-Afterwards every file it changed is listed. A binary, or a file none of its
-blockers points at, is put to you at the next gate, to keep or revert.
+Each fix group is held to its own files: those its blockers point at or
+name, test files in the same directories, for tests that pin the fix, and
+any a person allowed. A group whose blockers point at no file may change
+code, but no doc and no binary. A pi fixer is refused a write or edit
+anywhere else, and told to note what it needs instead. Since there's no
+sandbox, after every fix session and relay leg, on any agent, acrbus puts
+back from the fix's snapshot whatever it changed outside those files,
+tracked, new or deleted, and any binary no blocker cites, before any
+reviewer reads it. A file put back, or one you reverted at a gate, is
+locked: no later fix may change it unless a later blocker cites it. The
+fixer is told to build into a temporary folder, not the tree, and the
+report shows each session's scope, what was put back and why, and what it
+cost.
 
-Code: src/acr/roles.rs::FIX_SCOPE; src/acr/flow.rs::flag_fix; src/acr/flow.rs::revert_flagged; src/acr/carousel.rs::KEEP_THEM | Tests: a_fix_that_changes_a_binary_or_a_file_no_blocker_names_is_flagged_and_asked_at_the_next_gate, a_file_the_blockers_name_is_not_flagged_and_a_revert_that_fails_asks_again, what_a_fix_changed_says_which_files_are_binary_and_each_reverts_as_its_command_says
+Code: src/acr/flow.rs::FixScope; src/acr/flow.rs::fix_scope; src/acr/flow.rs::named_files; src/acr/flow.rs::put_back; src/acr/flow.rs::revert_flagged; src/acr/flow.rs::Locked; src/acr/roles.rs::FIX_SCOPE; src/bridge.rs::ALLOWED_PATHS_ENV; src/bridges/acrbus-pi.js::scopeAllows; src/acr/report.rs::guarded_line | Tests: a_fix_scope_allows_its_files_tests_beside_them_and_nothing_locked, a_fix_that_changes_a_binary_or_a_file_outside_its_scope_has_it_put_back_at_once, the_pi_extension_holds_a_fix_to_its_files, a_fixs_allowed_paths_must_be_a_json_object_and_reach_only_a_pi_agent_as_env
+
+### What if a fix needs a file outside its scope, or leaves a doc stale?
+
+The fixer notes it instead of editing it: a file it needs, such as a
+caller of a signature it changed, with why, and a doc its fix left wrong,
+as "file:line now says X". Under a gate that asks at rounds, those notes,
+and any file the session that ran the review changed outside its blockers,
+are put to you right after the fix and before the next round's reviewers,
+so nothing you'd revert gets reviewed: fix it now, in a follow-up held to
+that file, defer it to a ticket, or leave it. Under `exception`, notes
+become tickets and out-of-scope changes are reverted; under `ends`, you're
+asked at the result.
+
+Code: src/acr/roles.rs::Fixed; src/acr/flow.rs::keep_notes; src/acr/flow.rs::FixNote; src/acr/flow.rs::waits_on_fix; src/acr/flow.rs::follow_ups; src/acr/report.rs::note_line | Config: human_gate | Tests: what_a_fix_notes_is_asked_before_the_next_round_and_allowed_ones_are_followed_up, a_fixers_answer_carries_what_it_needs_elsewhere_and_the_docs_it_left_stale
+
+### What does a fixer start with?
+
+Its blockers, its scope, and its files as they are: each cited file whole
+up to 16 KiB, or else 60 lines either side of where its blockers point, up
+to 64 KiB in all, naming any file left out, so its sessions don't spend
+turns reading them again. A relay or restart session gets the same, with
+the handoff.
+
+Code: src/acr/flow.rs::fix_files; src/acr/flow.rs::FIX_FILE_WHOLE; src/acr/flow.rs::FIX_FILES_MOST; src/acr/flow.rs::FIX_FILE_AROUND; src/acr/roles.rs::fix_prompt | Tests: a_fixers_brief_carries_its_files_whole_or_around_where_its_blockers_point
 
 ### Which tests does a fixer run?
 
@@ -1169,11 +1329,14 @@ Code: src/acr/roles.rs::FIX_TESTS; src/acr/roles.rs::fix_prompt | Tests: a_fixer
 ### What if a fix fails?
 
 It's restarted once, fresh, on the Orchestrator's binding, even if it was an
-easy group's on `savings.fixer`'s. If that fails too, it escalates to you,
-with both reasons and three choices: the Orchestrator tries again, the
-session that ran the review fixes and resumes with `--fixed`, or the review
-stops. An Orchestrator's fix that leaves the checkout as it found it did no
-work and fails, unless it declines each of its blockers with a reason.
+easy group's on `savings.fixer`'s. The restart starts from the checkout as
+the failed session left it, is shown what that session changed, and is
+judged against the checkout as the fix found it. If that fails too, it
+escalates to you, with both reasons and three choices: the Orchestrator
+tries again, the session that ran the review fixes and resumes with
+`--fixed`, or the review stops. A fix that leaves the checkout as it found
+it did no work and fails, unless it declines each of its blockers with a
+reason.
 
 Code: src/acr/flow.rs::fix_call; src/acr/flow.rs::fix_once; src/acr/flow.rs::Restarter; src/acr/flow.rs::About; src/acr/carousel.rs::AGAIN | Tests: a_fix_group_that_changes_nothing_did_no_work_unless_it_declines_each_blocker, a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, savings_fixer_sends_easy_groups_to_its_binding_and_hard_ones_to_the_orchestrators, a_fixer_is_told_what_its_handoff_holds_and_how_to_decline
 
@@ -1182,32 +1345,39 @@ Code: src/acr/flow.rs::fix_call; src/acr/flow.rs::fix_once; src/acr/flow.rs::Res
 ### Can a failed step pass as clean?
 
 No. A unit that comes back unusable is restarted once, fresh, and one that
-fails again leaves its lens open, never a clean pass; an answer that can't
-be read is an error, never an empty result. A lens with nothing for its
-Judge says so. Failures are recorded, and an unfinished lens is put to you.
+fails again leaves its lens open, or, for a fix, escalates as unfixed, and
+for a first pass, hands its findings to the Judge; never a clean pass. An
+answer that can't be read is an error, never an empty result. A lens with
+nothing for its Judge says so. Failures are recorded, and an unfinished
+lens is put to you.
 
 Code: src/acr/flow.rs::LensResult; src/acr/flow.rs::escalate_about; src/acr/flow.rs::About | Tests: a_failed_reviewer_is_never_a_clean_pass, a_failed_judge_leaves_the_lens_open, one_failed_reviewer_of_several_leaves_the_lens_open, each_lens_judge_starts_as_its_own_reviewers_answer_and_one_with_nothing_says_so
 
 ### What does "did no work" mean?
 
 A step is judged by what it must do, never by what it found: a reviewer
-that read the change and found nothing did its work. A step observed doing
+that read the change and found nothing did its work. A unit observed doing
 none fails, to be restarted once, fresh, and then escalated, and progress
 says "did no work" and why:
 
-- an Orchestrator's fix, or one session of it, that leaves the checkout
-  unchanged, unless the whole fix declines each blocker with a reason;
+- a fix session that hands off with the checkout unchanged, or changed
+  only outside its files;
+- a fix, each group's when fixes go in groups, that leaves the checkout
+  unchanged, unless it declines each of its own blockers with a reason;
+- the session that ran the review saying it fixed, with the tree
+  unchanged;
 - a handoff that adds nothing;
 - a reviewer, scout or prober that made no tool call, where its bridge
   counts them, and a prober that wrote no probe;
-- a Judge that rated none of its findings;
-- a test run that passed but ran no tests.
+- a Judge that rated none of its findings; a first pass that rated none
+  hands them to the Judge.
 
-The Sizer's tool-free first look, keep-alives and grouping duplicates are
-exempt. Other steps, such as the Sizer's full read, the Orchestrator's
-choice of lenses and the briefer, aren't checked this way.
+A test gate run that passed but ran no tests fails the gate's lens, with
+no restart. The Sizer's tool-free first look, keep-alives and grouping
+duplicates are exempt. Other steps, such as the Sizer's full read, the
+Orchestrator's choice of lenses and the briefer, aren't checked this way.
 
-Code: src/acr/flow.rs::no_work; src/acr/flow.rs::read_something; src/acr/stages.rs::ran_no_tests | Tests: a_reviewer_that_calls_no_tool_did_no_work, a_judge_that_rates_none_of_its_findings_did_no_work, a_prober_that_writes_no_probe_did_no_work, a_coverage_run_that_ran_no_tests_did_no_work, a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, a_run_that_says_it_ran_no_tests_ran_none_and_one_that_ran_some_did
+Code: src/acr/flow.rs::no_work; src/acr/flow.rs::read_something; src/acr/flow.rs::fixed_by_session; src/acr/stages.rs::ran_no_tests | Tests: a_reviewer_that_calls_no_tool_did_no_work, a_judge_that_rates_none_of_its_findings_did_no_work, a_prober_that_writes_no_probe_did_no_work, a_coverage_run_that_ran_no_tests_did_no_work, a_fixer_that_hands_off_with_no_change_to_the_tree_did_no_work, a_session_that_says_it_fixed_with_the_tree_unchanged_did_no_work, a_run_that_says_it_ran_no_tests_ran_none_and_one_that_ran_some_did
 
 ### What happens when a call stalls?
 
@@ -1226,7 +1396,10 @@ No. A call asks its bridge for as long as the bridge allows:
 omp and pi kinds set 14400, 4 hours, as a cap no review should reach. A
 binding's `timeout`, if set, is also a cap, not a budget. A call that runs
 out of time is a failure: its unit is restarted once, fresh, on the same
-binding, and nothing tries it elsewhere.
+binding, except an easy fix under `savings.fixer`, which restarts on the
+Orchestrator's; no other binding takes it over. A call that isn't a unit,
+such as the Sizer's, isn't restarted: a Sizer that fails means the highest
+tier.
 
 Code: src/bridge.rs::default_timeout; src/bridges/claude.toml; src/bridges/pi.toml; src/acr/config.rs::Binding | Config: timeout_secs, max_timeout_secs, timeout | Tests: a_call_asks_its_bridge_for_as_long_as_it_allows_not_its_default, a_call_out_of_time_is_a_failure_and_nothing_tries_it_elsewhere, a_config_with_time_budgets_still_loads_and_says_what_they_do
 
@@ -1248,9 +1421,9 @@ its stream has begun, no event, for `ACRBUS_NO_RESPONSE_SECS` (300 for a
 `kind = "pi"` bridge; 0 turns it off) is aborted as timed out, and pi
 retries it. After
 `ACRBUS_NO_RESPONSE_TRIES` (3) in a row the call ends with exit code 75,
-which its bridge fails. The review restarts its unit once, fresh, with a new
-cache key, so it may land on another replica, or pauses the round if it's
-an outage. Bytes with no event don't count as a response, and a request
+which its bridge fails. A unit is restarted once, fresh, with a new cache
+key, so it may land on another replica; if it's an outage, the review
+pauses instead. Bytes with no event don't count as a response, and a request
 that's answering is never cut off.
 
 Code: src/bridges/acrbus-pi.js::guard; src/bridges/acrbus-pi.js::NO_RESPONSE_EXIT; src/bridges/pi.toml; src/acr/mod.rs::NO_RESPONSE_EXIT; src/acr/flow.rs::Failure; src/acr/mod.rs::rekey | Config: ACRBUS_NO_RESPONSE_SECS, ACRBUS_NO_RESPONSE_TRIES | Tests: the_pi_extension_ends_a_request_with_no_response_and_retries_it, a_call_that_lost_its_requests_is_restarted_fresh_with_a_new_cache_key
@@ -1258,41 +1431,50 @@ Code: src/bridges/acrbus-pi.js::guard; src/bridges/acrbus-pi.js::NO_RESPONSE_EXI
 ### What is a fresh restart?
 
 A unit of work that comes back unusable is run once more in a fresh
-session, on the same binding, with the same inputs and none of the failed
-session's context: a reviewer, a prober in a fresh copy without the probes
-the failed one wrote, a mutant proposer, a scout or one of its checks, a
-Judge, a first pass, or a fix. It's restarted when its answer can't be read
-even put in form, its run failed or lost its requests, or it did no work;
-not for a refusal, a cancel or a config error, which a fresh session would
+session, with the same inputs and none of the failed session's context: a
+reviewer, a prober in a fresh copy without the probes the failed one
+wrote, a mutant proposer, a scout or one of its checks, a Judge, a first
+pass, or a fix. It runs on the same binding, except an easy fix under
+`savings.fixer`, which restarts on the Orchestrator's; a fix's restart
+starts from the checkout as the failed session left it, and is shown what
+that session changed. It's restarted when its answer can't be read even
+put in form, its run failed or lost its requests, or it did no work; not
+for a refusal, a cancel or a config error, which a fresh session would
 only repeat. Progress says `restarted fresh: <unit>, attempt 2, because
 <why>`, and the other lenses don't wait. One restart, then a failure
-naming both reasons, put to you. Restarts are marked in usage with why, and
-said apart from repairs at each round's end and in `acr usage`.
+naming both reasons, put to you; a first pass that fails twice hands its
+findings to the Judge instead. Restarts are marked in usage with why, and
+said apart from repairs in `acr usage`.
 
 Code: src/acr/flow.rs::Restarter; src/acr/flow.rs::restartable; src/acr/flow.rs::restarted_label; src/acr/flow.rs::restarted_copy; src/acr/flow.rs::CallFailed; src/acr/flow.rs::Failure; src/acr/flow.rs::Usage; src/acr/report.rs::Restarts | CLI: acrbus acr usage | Tests: a_reviewer_whose_answer_cant_be_read_even_put_in_form_is_asked_again_fresh, a_call_that_lost_its_requests_is_restarted_fresh_with_a_new_cache_key, a_restarted_prober_gets_a_fresh_copy_without_the_first_ones_probes, a_suspicion_whose_check_cant_be_read_is_checked_again_fresh, a_first_pass_that_rates_nothing_settles_nothing
 
 ### What happens during a network outage?
 
-The round pauses. When calls that couldn't reach their model, by lost
+The review pauses. When calls that couldn't reach their model, by lost
 requests or a connection refused, reset or unresolved, are at least two and
-at least half of those in flight, with none answered in between, the round
-starts no more calls and restarts none. A unit that couldn't reach its model
-first waits up to 60 seconds to tell an outage from its own failure. What
-the round's units finished is kept in the review's folder as each finishes,
-the review is saved, and `acr run` or `acr resume` says "gateway
-unreachable: saved, continue with acrbus acr resume <id>" and exits 5. `acr
-resume` goes on with the same round, running only what didn't finish, and
-doesn't run its tests gate again.
+at least half of those in flight, with none answered in between, no more
+calls start and none is restarted. A unit that couldn't reach its model
+first waits up to 60 seconds to tell an outage from its own failure. The
+Sizer, the Orchestrator's choice of lenses and a fix pause the review the
+same way; merging duplicates and the blast-radius check fall back instead,
+merging nothing and attacking every lens. What the round's units finished
+is kept in the review's folder as each finishes, the review is saved, and
+`acr run` or `acr resume` says "gateway unreachable: saved, continue with
+acrbus acr resume <id>" and exits 5. `acr resume` goes on from where it
+paused, running only what didn't finish; fixes carry on from the first
+group not done. An outage at the Sizer as a review starts exits 5 with
+nothing saved: run it again once it's back.
 
-Code: src/acr/flow.rs::OutageWatch; src/acr/flow.rs::Watched; src/acr/flow.rs::Outage; src/acr/flow.rs::Units; src/acr/flow.rs::UnitDone; src/acr/flow.rs::Paused; src/acr/mod.rs::paused; src/acr/mod.rs::OUTAGE; src/acr/mod.rs::OUTAGE_WAIT_SECS; src/acr/mod.rs::unreachable_said | CLI: acrbus acr resume | Tests: an_outage_pauses_the_round_and_resuming_runs_only_what_didnt_finish, calls_that_cant_reach_their_model_together_are_an_outage_and_one_alone_isnt, a_call_that_couldnt_reach_its_model_is_told_by_what_its_agent_said
+Code: src/acr/flow.rs::OutageWatch; src/acr/flow.rs::Watched; src/acr/flow.rs::Outage; src/acr/flow.rs::Units; src/acr/flow.rs::UnitDone; src/acr/flow.rs::Paused; src/acr/mod.rs::paused; src/acr/mod.rs::OUTAGE; src/acr/mod.rs::OUTAGE_WAIT_SECS; src/acr/mod.rs::unreachable_said | CLI: acrbus acr resume | Tests: an_outage_pauses_the_round_and_resuming_runs_only_what_didnt_finish, an_outage_at_the_sizer_pauses_the_review_saved_instead_of_failing_a_step, calls_that_cant_reach_their_model_together_are_an_outage_and_one_alone_isnt, a_call_that_couldnt_reach_its_model_is_told_by_what_its_agent_said
 
 ### What happens when the Sizer or Orchestrator fails?
 
-A failed Sizer means the highest tier. An Orchestrator that can't say which
-description-triggered lenses apply leaves every candidate in, and you're
-told why.
+A failed Sizer means the highest tier, and an unsure one the higher. An
+Orchestrator that can't say which description-triggered lenses apply leaves
+every candidate in, and you're told why. Either one that can't reach its
+model in an outage pauses the review instead.
 
-Code: src/acr/flow.rs::choose_tier; src/acr/flow.rs::choose_lenses; src/acr/plan.rs::highest | Tests: an_unsure_sizer_means_the_higher_tier, an_orchestrator_that_picks_lenses_in_prose_is_put_in_form
+Code: src/acr/flow.rs::choose_tier; src/acr/flow.rs::choose_lenses; src/acr/plan.rs::highest | Tests: an_unsure_sizer_means_the_higher_tier, an_orchestrator_that_picks_lenses_in_prose_is_put_in_form, an_outage_at_the_sizer_pauses_the_review_saved_instead_of_failing_a_step
 
 ### How do I stop a review?
 
@@ -1335,11 +1517,17 @@ It depends on `human_gate`:
 - `ends`: at the scope and the result;
 - `exception`: only escalations.
 
-Escalations always reach you: a split, a finding the Judge would reject on
-values, a Critical that was there before, a lens that didn't finish, a
-failed fix, a match for `always_escalate`, and `max_rounds`.
+Escalations always stop the review for an answer, whatever the gate: a
+split, a finding the Judge would reject on values, a Critical that was
+there before, a lens that didn't finish, a failed fix or revert, an
+Orchestrator that couldn't check the descriptions, a checkout that doesn't
+hold the reviewed commit, a match for `always_escalate`, `max_rounds`, and
+the spend cap. Under gates that ask at rounds, a fix's notes and
+out-of-scope files are asked about before the next round. Who answers is
+another matter: see [Can the agent that runs a review answer for
+me?](#can-the-agent-that-runs-a-review-answer-for-me).
 
-Code: src/acr/config.rs::HumanGate; src/acr/flow.rs::About | Config: human_gate | CLI: acrbus acr run --human-gate | Tests: a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result, per_round_lets_a_person_decide_what_goes_in, the_ends_gate_asks_about_the_scope_and_the_result, split_reviewers_and_values_calls_escalate_in_any_mode
+Code: src/acr/config.rs::HumanGate; src/acr/flow.rs::About; src/acr/flow.rs::waits_on_fix | Config: human_gate | CLI: acrbus acr run --human-gate | Tests: a_person_in_the_loop_approves_the_scope_decides_each_blocker_and_the_result, per_round_lets_a_person_decide_what_goes_in, the_ends_gate_asks_about_the_scope_and_the_result, split_reviewers_and_values_calls_escalate_in_any_mode
 
 ### What can I answer for each blocker?
 
@@ -1347,13 +1535,16 @@ Code: src/acr/config.rs::HumanGate; src/acr/flow.rs::About | Config: human_gate 
   Other to add a note for the fixer.
 - **Defer to a ticket:** it's real, the change ships without the fix, and a
   ticket is drafted.
-- **Not a blocker:** for a finding that can be waived; it's logged, and the
-  calibration learns it.
-- **Not a defect:** dropped, and the calibration learns it.
+- **Not a blocker:** for a finding that can be waived; it's logged, and
+  kept as feedback for the next `acr calibrate`.
+- **Not a defect:** dropped, and kept as feedback the same way.
 - **Waive it:** typed, for a finding that can be waived, to ship with no
   ticket.
 
-Code: src/acr/carousel.rs::blocker; src/acr/carousel.rs::FIX; src/acr/carousel.rs::DEFER; src/acr/carousel.rs::NOT_BLOCKER; src/acr/carousel.rs::NOT_DEFECT; src/acr/carousel.rs::WAIVE | CLI: acrbus acr resume --fold, acrbus acr resume --waive, acrbus acr resume --defer | Tests: defer_decides_any_blocker_and_waive_still_only_what_can_be, a_blocker_deferred_to_a_ticket_neither_blocks_nor_is_waived_and_gets_a_draft
+Feedback changes nothing until you run `acr calibrate` and accept its
+proposal, which works on a config kept outside the repository.
+
+Code: src/acr/carousel.rs::blocker; src/acr/carousel.rs::FIX; src/acr/carousel.rs::DEFER; src/acr/carousel.rs::NOT_BLOCKER; src/acr/carousel.rs::NOT_DEFECT; src/acr/carousel.rs::WAIVE; src/acr/configure.rs::add_feedback | CLI: acrbus acr resume --fold, acrbus acr resume --waive, acrbus acr resume --defer, acrbus acr calibrate | Tests: defer_decides_any_blocker_and_waive_still_only_what_can_be, a_blocker_deferred_to_a_ticket_neither_blocks_nor_is_waived_and_gets_a_draft, feedback_is_kept_per_repository_and_read_since_a_calibration
 
 ### What does deferring to a ticket do?
 
@@ -1378,28 +1569,55 @@ Yes. When a review stops for you at a round's blockers or at the result, a
 question asks what they missed. A defect you report is folded in like a
 blocker, fixed in a group of its own when fixes go in groups, and every
 lens attacks again after it, since any lens could own it; with
-`savings.blast_radius` on, that check can skip a lens it says the fix can't
-touch. After a review ends, `acr feedback --missed` records one for the
-calibration instead.
+`savings.blast_radius` on and `reattack: blocked`, that check can skip a
+lens it says the fix can't touch. After a review ends, `acr feedback
+--missed` records one for the calibration instead.
 
-Code: src/acr/flow.rs::Reported; src/acr/flow.rs::reopen_all; src/acr/flow.rs::blast_radius; src/acr/carousel.rs::NOTHING | Config: savings.blast_radius | CLI: acrbus acr ask, acrbus acr feedback --missed
+Code: src/acr/flow.rs::Reported; src/acr/flow.rs::reopen_all; src/acr/flow.rs::blast_radius; src/acr/carousel.rs::NOTHING | Config: savings.blast_radius, reattack | CLI: acrbus acr ask, acrbus acr feedback --missed
 
 ### How do I answer a review?
 
 Each question is short and multiple-choice. In Claude Code, the ACR skill
 shows them as question carousels of up to 4 questions; at a terminal, it's a
 numbered prompt; with Grayboard set up, they reach your phone. From any
-shell, `acr ask <id>` shows them and `acr resume <id> --answers` answers. A
-question that needs an answer left unanswered, or an answer to no
-question, is refused.
+shell, `acr ask <id>` shows them and `acr resume <id> --answers` answers,
+unless the config sets `answers: person`. A question that needs an answer
+left unanswered, or an answer to no question, is refused. Each gate's
+answers are recorded with where they came from.
 
-Code: src/acr/carousel.rs::PER_CAROUSEL; src/acr/carousel.rs::Carousel; src/acr/mod.rs::at_terminal | CLI: acrbus acr ask, acrbus acr ask --text, acrbus acr resume --answers | Tests: questions_must_fit_a_question_carousel, what_a_person_types_at_the_terminal_is_their_answer, the_person_can_stop_anywhere_and_must_answer_whats_asked
+Code: src/acr/carousel.rs::PER_CAROUSEL; src/acr/carousel.rs::Carousel; src/acr/mod.rs::at_terminal; src/acr/flow.rs::AnswerSource | Config: answers | CLI: acrbus acr ask, acrbus acr ask --text, acrbus acr resume --answers | Tests: questions_must_fit_a_question_carousel, what_a_person_types_at_the_terminal_is_their_answer, the_person_can_stop_anywhere_and_must_answer_whats_asked
+
+### Can the agent that runs a review answer for me?
+
+By default, yes: `acr resume --answers` takes answers from any process,
+such as the session relaying yours, and only the ACR skill tells it never
+to answer for you. Two things make that visible or closed:
+
+- **Every gate's answers record their source:** a terminal, a Grayboard
+  reply and its sender, or `acr resume` and its flags, and the report
+  shows it. A run's flags that make it weaker than its repository's
+  config, such as a gate that asks less, fewer rounds, another binding,
+  `reattack: blocked` where the config says `all`, a narrower scope, a
+  `--config` in place of its own, or `--uncalibrated`, are said at its
+  start, at every gate and in the report.
+- **With `answers: person` in the config,** `--answers` and the
+  `--fold`, `--waive`, `--defer` and `--approve` flags are refused unless
+  the answers come from a Grayboard reply, and weakening flags need a
+  person to type yes at a terminal, or the run doesn't start.
+
+What it guarantees is that those channels don't work, and that Grayboard
+answers come only from your own human handle, whose sender the server
+verifies. It isn't a wall against an agent with a shell running as you,
+which could type at a terminal or write the files acrbus reads.
+
+Code: src/acr/config.rs::Answers; src/acr/config.rs::weakened; src/acr/mod.rs::weakened_by_flags; src/acr/flow.rs::AnswerSource; src/acr/grayboard.rs::answered_from; src/acr/grayboard.rs::read_replies | Config: answers | CLI: acrbus acr resume --answers, acrbus acr resume --fold, acrbus acr resume --waive, acrbus acr resume --defer, acrbus acr resume --approve | Tests: under_answers_person_resume_refuses_answers_and_decisions_from_anywhere_but_a_person, what_a_runs_flags_make_weaker_than_its_config_is_said, what_a_person_types_at_the_terminal_is_their_answer
 
 ### What does Grayboard add?
 
 With a Grayboard team server, a review waiting for you sends its questions,
 or with `nudge` only that it waits, to your `human` handle, which reaches
-Slack, and your reply there resumes it. A review also claims its change on
+Slack, and your reply there resumes it; a reply from any other handle is
+ignored. A review also claims its change on
 the server, so a second review of it doesn't start while the first runs or
 waits. A crashed review's claim goes after 10 minutes unrenewed. When the
 server is away, reviews go on without it. Each full question carries its
@@ -1410,10 +1628,12 @@ Code: src/acr/grayboard.rs::serve; src/acr/carousel.rs::blocker; src/acr/grayboa
 
 ### Can a review post to a pull request?
 
-Only if the config, yours or the repository's, turns it on, with labels or
-a comment, and you pass `--post-pr`. A repository that turned nothing on gets neither.
+Only if `integrations` turns it on, with labels or a comment, in your
+`acr.yaml` defaults or the repository's config, where the repository's
+replaces yours, and you pass `--post-pr`. With neither turning anything
+on, it posts nothing.
 
-Code: src/acr/config.rs::Integrations; src/acr/config.rs::Labels; src/acr/report.rs::comment | Config: integrations.labels, integrations.comment | CLI: acrbus acr run --post-pr | Tests: a_repository_that_turned_nothing_on_gets_no_labels_or_comment
+Code: src/acr/config.rs::Integrations; src/acr/config.rs::Labels; src/acr/report.rs::comment | Config: integrations, integrations.labels, integrations.comment, defaults | CLI: acrbus acr run --post-pr | Tests: a_repository_that_turned_nothing_on_gets_no_labels_or_comment
 
 ## Models and bindings
 
@@ -1471,12 +1691,15 @@ Code: src/acr/config.rs::Price; src/acr/config.rs::price; src/bridges/pi.toml; s
 
 Not by design. A reviewer whose binding has Bash, Write or Edit works in a
 copy of its own, cloned from the round's warm copy where `tests.setup` ran,
-and nothing is copied back. But there's no sandbox: a role with a shell or
-Write could still write outside its copy. A change to what the review reads
+or from what the review reads where it didn't, and nothing is copied back.
+But there's no sandbox: a role with a shell, or Write on pi and omp, could
+still write outside its copy; `acrbus setup acr` confines Claude Code's
+file tools to its working directories. A change to what the review reads
 during the reviewers' or Judges' turn fails the round and escalates; it
-isn't undone. Only a fix is meant to write to the checkout.
+isn't undone. Only a fix is meant to write to the checkout, held to its
+own files.
 
-Code: src/acr/flow.rs::Copies; src/acr/flow.rs::fresh_copy_dir; src/acr/mod.rs::CLONES | Tests: a_reviewer_that_can_change_files_works_in_a_copy_of_its_own, a_reviewers_copy_is_the_checkout_as_it_is_and_reaches_nothing_back, a_judge_gets_the_diff_and_may_not_change_the_checkout
+Code: src/acr/flow.rs::Copies; src/acr/flow.rs::fresh_copy_dir; src/acr/mod.rs::CLONES; src/setup.rs::confine_settings | Tests: a_reviewer_that_can_change_files_works_in_a_copy_of_its_own, a_reviewers_copy_is_the_checkout_as_it_is_and_reaches_nothing_back, a_judge_gets_the_diff_and_may_not_change_the_checkout, confinement_blocks_reads_and_writes_outside_and_nothing_else
 
 ### Is there a sandbox?
 
@@ -1594,10 +1817,15 @@ Code: src/cli.rs::BridgeCmd; src/acr/flow.rs::write_artifact | CLI: acrbus bridg
 ### How do I measure a review design?
 
 With a key: a real change, frozen with its repository, base, head, a
-paragraph of what it's for, and its dimensions. `acr trial <key>` runs a
-design blind, with nobody in the loop, and a scorer compares what it found
-with the key's findings. For new work, leave the findings out: trials are
-saved unscored, for `acr rescore` once the change's own review is done.
+paragraph of what it's for, its dimensions, and the findings an earlier
+review of it found and its builder upheld. `acr trial <key>` runs a design
+blind, with nobody in the loop, and a scorer compares what it found with
+the key's findings. Those findings aren't every defect the change has: a
+design that finds a real defect the key lacks gets no credit for it, and
+designs like the one that made the key are favored. Keys built from seeded
+defects, or from bugs found after merge, avoid that. For new work, leave
+the findings out: trials are saved unscored, for `acr rescore` once the
+change's own review is done.
 
 Code: src/acr/trial.rs::Key; src/acr/trial.rs::score; src/acr/trial.rs::rescore | CLI: acrbus acr trial, acrbus acr rescore --results | Tests: new_work_needs_no_findings_and_is_saved_unscored, a_scorer_that_fails_is_tried_again_and_then_leaves_the_run_unscored, a_trials_copy_holds_the_head_and_nothing_after_it
 
@@ -1608,17 +1836,22 @@ Code: src/acr/trial.rs::Key; src/acr/trial.rs::score; src/acr/trial.rs::rescore 
 - `separated`: acrbus's pipeline, one round;
 - `converge`: the same pipeline, to convergence.
 
-Left out, the three one-round designs run one after another; `converge` runs
-only when named. A trial's scorer, and the builder of a builder-led design,
-run on headless Claude Code.
+The builder-led designs run acrbus's own ACR skill for one round: the
+builder judges its reviewers' findings, with no separate Judge or rules
+table, and `one-size` runs every reviewer on the same strong model. There's
+no single-reviewer design, and a trial can't run a skill of yours; to
+compare one, run it on the same keys and score it the same way. Left out,
+the three one-round designs run one after another; `converge` runs only
+when named. A trial's scorer, and the builder of a builder-led design, run
+on headless Claude Code.
 
-Code: src/acr/trial.rs::Arm; src/acr/trial.rs::BUILDER_MODEL; src/acr/trial.rs::SCORER_MODEL | CLI: acrbus acr trial --arm, acrbus acr trial --stop-on-failure | Tests: a_one_size_trial_tells_its_builder_so, stop_on_failure_ends_the_run_at_the_first_reviewer_or_judge_failure
+Code: src/acr/trial.rs::Arm; src/acr/trial.rs::SKILL; src/acr/trial.rs::BUILDER_MODEL; src/acr/trial.rs::SCORER_MODEL | CLI: acrbus acr trial --arm, acrbus acr trial --stop-on-failure | Tests: a_one_size_trial_tells_its_builder_so, stop_on_failure_ends_the_run_at_the_first_reviewer_or_judge_failure
 
 ### What does `acr check` do?
 
-It checks that a trial on a key can run before you spend one: where Claude
-Code is set up, a session is started as a builder is, and one through each
-bridge and set of tools the pipeline uses. Each must start, read the trial's copy, fail to read a file
+It checks that a trial on a key can run before you spend one: it starts a
+session through each bridge and set of tools the pipeline uses, and, where
+Claude Code is set up, one as a builder is. Each must start, read the trial's copy, fail to read a file
 outside it, and run a command where it has a shell. A read outside fails the
 check only for an agent its bridge confines; for others it's a note.
 
@@ -1709,34 +1942,47 @@ Code: src/config.rs::Paths; src/setup.rs::instance | Config: ACRBUS_HOME | Tests
 
 ### Where is acrbus weaker?
 
-- **`acr run` doesn't sweep every lens after a fix.** Only lenses with
-  blockers attack again, unless you ask for another round or report a
-  missed defect. The full convergence sweep runs only in `acr trial --arm
-  converge`.
+- **With `reattack: blocked`, `acr run` doesn't sweep every lens after a
+  fix.** A lens that passed isn't attacked again; only those with
+  blockers, any that didn't finish and any the fix brings in are, unless
+  you ask for another round or report a missed defect. `reattack: all`
+  attacks every lens, at about a first round's cost each round, and the
+  full convergence sweep runs only in `acr trial --arm converge`.
 - **Much of the cost and reliability work is pi's alone:** relays, per-turn
-  cache lines, the cache key headers, the lost-request watch, and holding
-  each call to its own tools when tools are matched.
+  cache lines, the cache key headers, the lost-request watch, matched
+  tools, holding each call to its binding's tools, and refusing a fixer's
+  writes outside its files during the session. On Claude Code and omp, a
+  fix's out-of-scope changes are only put back after each session.
 - **There's no sandbox.** Confinement covers Claude Code's file tools only;
-  everything else rests on ACR's system prompt and the models.
+  everything else rests on ACR's system prompt and the models. A bridge
+  that accepts any request runs commands as you for whoever can send to it.
 - **The Judge's facts are a model's.** Fixed rules decide from them, but a
-  wrong fact gives a wrong ruling; calibration and feedback are how that's
-  caught.
+  wrong fact gives a wrong ruling, and the rules themselves are code you'd
+  change by changing acrbus; calibration and feedback are how a wrong
+  ruling is caught.
 - **Grouping, format repairs and blast radius are model calls.** A failed
   grouping groups nothing and a failed blast-radius answer skips nothing,
   each saying so, but a wrong answer can merge or skip what it shouldn't.
 - **A relay's handoff is a summary,** and can lose findings; measure it.
 - **`acr plan` underestimates** what agents read with their tools, unless
   `costs.per_call` is set.
-- **A change's own tests are found by a heuristic:** a path with "test" or
-  "spec" in it, which catches some files that aren't tests, plus Rust's
-  in-file test modules, the only in-file tests recognized.
+- **A change's own tests are found by name and folder,** in the common
+  languages' ways, plus Rust's in-file test modules, the only in-file tests
+  recognized.
 - **Reviewing a change runs its code as you,** with no sandbox; an
   untrusted change needs a disposable machine or account.
+- **`answers: person` closes channels, not shells:** an agent with a shell
+  running as you could still type at a terminal.
 - **A confirmed review is a stopping rule, not a proof,** and whether the
-  method finds more than a simpler review isn't shown yet.
+  method finds more than a simpler review isn't shown yet; `acr trial`
+  can't compare it with a single reviewer or your own skill.
+- **There's a lot of it:** keep-alives, relays, scouts, first passes,
+  learned prefetch and fix scopes are each a mechanism to understand,
+  several on pi only.
 - **Setup is real work:** a bridge, bindings, and calibrating each
   repository.
 - **Trials need headless Claude Code** for their builder and scorer.
 - **It's Unix-only, and one machine.**
 
-Code: src/acr/flow.rs::settle; src/bridges/acrbus-pi.js; src/setup.rs::confine_settings; src/acr/flow.rs::ruling; src/acr/flow.rs::same_defects; src/acr/plan.rs::dry_run; src/acr/stages.rs::is_test_path; src/acr/stages.rs::test_modules; src/acr/trial.rs::BUILDER_MODEL | Config: costs.per_call | CLI: acrbus acr trial --arm | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, a_relay_is_only_for_a_review_and_only_an_agent_that_can_be_steered_takes_it, findings_go_ungrouped_and_say_so_when_the_grouping_fails
+Code: src/acr/flow.rs::settle; src/acr/flow.rs::reattack; src/bridges/acrbus-pi.js; src/setup.rs::confine_settings; src/bridge.rs::Accepts; src/acr/flow.rs::ruling; src/acr/flow.rs::same_defects; src/acr/plan.rs::dry_run; src/acr/stages.rs::is_test_path; src/acr/stages.rs::test_modules; src/acr/config.rs::Answers; src/acr/trial.rs::Arm; src/acr/trial.rs::BUILDER_MODEL | Config: costs.per_call, reattack, answers, accepts | CLI: acrbus acr trial --arm | Tests: only_lenses_with_blockers_are_attacked_again_by_new_reviewers, a_relay_is_only_for_a_review_and_only_an_agent_that_can_be_steered_takes_it, findings_go_ungrouped_and_say_so_when_the_grouping_fails, the_pi_extension_holds_a_fix_to_its_files
+
