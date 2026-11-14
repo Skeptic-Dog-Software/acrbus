@@ -27,12 +27,14 @@ Gather all of this with commands, not with a model.
 
   Give each hit as `file:line` with a few lines around it. Keep the pack under about 2,000 lines, and say what you cut.
 
-## 2. Two fresh reviewers, in parallel
+## 2. Two fresh reviewers, in parallel, through the bus
 
-- **GLM on high:** a bus agent that runs GLM, such as `acrbus call <agent> --model <glm model> --effort high --session fresh`.
-- **Opus on medium:** a subagent with a clean context, on Opus at medium effort.
+Call both through bridge agents, so each starts fresh, holds only what you send it, and has what it used counted:
 
-Use reviewers your user names instead, when they name them. If either can't be reached, ask your user whether to go on with one, and say so in the report. Don't give either reviewer your reasoning or this conversation.
+- **GLM on high:** `acrbus call <agent> --model <glm model> --effort high --session fresh`, to an agent that runs GLM, such as a pi bridge.
+- **Opus on medium:** `acrbus call <agent> --model claude-opus-5-5 --effort medium --session fresh`, to an agent that runs Opus, such as a Claude Code bridge.
+
+Give each only its read-only tools with `--tools`, and add `--verbose` so each call prints what it used, for the report. Use the bindings your user names instead, when they name them. If either can't be reached, ask your user whether to go on with one, and say so in the report. Don't give either reviewer your reasoning or this conversation.
 
 Give both the same brief, with the parts they share first, in this order: the role, the checks, the context pack, the diff, then the PR's claims.
 
@@ -54,7 +56,7 @@ Give both the same brief, with the parts they share first, in this order: the ro
 ## 3. Each family checks the other's findings
 
 - **Merge** the two lists. Two findings at the same place about the same defect are one, found by both.
-- **Send each finding to a fresh checker** from the family that didn't raise it: GLM's findings to Opus, Opus's to GLM. A finding both raised goes to Opus. That's one call per family, in parallel, each given the context pack and the diff. With no findings, skip this step.
+- **Send each finding to a fresh checker** from the family that didn't raise it: GLM's findings to Opus, Opus's to GLM. A finding both raised goes to Opus. That's one call per family, through the same bridges, fresh and in parallel, each given the context pack and the diff. With no findings, skip this step.
 - **For each finding, the checker says,** with evidence from the code:
   - whether it's real;
   - whether it was there before the change. One that was never blocks;
