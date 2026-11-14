@@ -92,7 +92,9 @@ When the change is a PR and the repository's config sets `integrations.labels`, 
 - **Neither:** a lens left out, or one neither reviewer answered. Never confirm a lens nobody checked.
 - **ready** or **not-ready:** not-ready while any lens is waiting. When every lens covered is confirmed, it's ready if none was left out. If some were, ask your user whether to mark it ready, naming them.
 
-Show your user the labels. Once they agree, add them and take off this config's labels that no longer apply, with `gh pr edit <n> --add-label … --remove-label …`. Create a missing label with `gh label create`. A review after your user's fixes sets them again.
+Use only labels the repository already has (`gh label list`). They're how everyone who works on it names its lenses, so never create one. If a lens has no label there, don't label it. Tell your user, naming the repository's lens labels closest to it, since it may be one of those under another name.
+
+Show your user the labels. Once they agree, add them and take off this config's labels that no longer apply, with `gh pr edit <n> --add-label … --remove-label …`. A review after your user's fixes sets them again.
 
 ## Report
 
