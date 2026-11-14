@@ -62,6 +62,10 @@ keeps fixing. It proposes the lenses that matter there and what blocks in
 each. You read it and accept it, or change it first, and `acrbus acr run`
 refuses a repository until you have.
 
+The repository's labels are the names everyone who calibrates it shares,
+so the proposal keeps the names they give each review concern, and only
+accepting a config creates a label.
+
 The proposal is a starting point, not a baseline. After each review you
 say how it did, finding by finding, and what it missed. Recalibrating, for
 a config kept outside the repository, folds that back into the config, aiming the next review at what this one got

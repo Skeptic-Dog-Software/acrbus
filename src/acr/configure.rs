@@ -23,8 +23,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::config::{self, Binding, Role, UserConfig};
+use super::config::{self, Binding, Config, Role, UserConfig};
 use super::flow::{Call, Caller, Run};
+use super::labels::{self, RepoLabel};
 use crate::config::APP_NAME;
 
 /// How to set a repository up, which the configurer follows.
@@ -61,17 +62,25 @@ pub fn binding(user: &UserConfig) -> Result<(String, Binding)> {
 }
 
 /// What the configurer proposes: the config, decided non-issues if the
-/// feedback shows some, and why.
+/// feedback shows some, how it classed the repository's labels, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proposal {
     pub config: String,
     pub not_findings: Option<String>,
+    pub labels: Option<Vec<labels::Class>>,
     pub why: String,
 }
 
 /// The configurer's brief. With `current`, it's a recalibration: the config
-/// as it is, and what the user said of its reviews since.
-pub fn prompt(name: &str, current: Option<&str>, feedback: &[Feedback]) -> String {
+/// as it is, and what the user said of its reviews since. With `repo_labels`,
+/// the repository's labels, which it classifies so its lenses keep the names
+/// people already use.
+pub fn prompt(
+    name: &str,
+    current: Option<&str>,
+    feedback: &[Feedback],
+    repo_labels: Option<&[RepoLabel]>,
+) -> String {
     let mut out = format!(
         "You configure adversarial convergence review (ACR) for the repository {name}. Your \
          working directory is a clone of it of your own, as it is now: read all of it you \
@@ -131,12 +140,16 @@ pub fn prompt(name: &str, current: Option<&str>, feedback: &[Feedback]) -> Strin
         }
         out.push('\n');
     }
+    if let Some(repo_labels) = repo_labels {
+        out.push_str(&labels::brief(repo_labels));
+    }
     out.push_str(&format!(
         "# How to set a repository up\n\n{}\n\n# The schema\n\n```json\n{}\n```\n\n\
          # A config, for its form\n\n```yaml\n{}\n```\n\n\
          # Answer\n\n\
          First the whole config, in one ```yaml block. If you record decided non-issues, \
-         give them in one ```not-findings block, a line each, `- <what> — <why>`. Then \
+         give them in one ```not-findings block, a line each, `- <what> — <why>`. If the \
+         repository's labels are listed above, classify them in one ```labels block. Then \
          `## Why`: for each lens, why it matters here and why its blocker is drawn where it \
          is; what you ran to check the test commands, and what it showed; and what you're \
          unsure of. Last, `## Before the first review`: each thing the machine's user must do \
@@ -163,6 +176,9 @@ pub fn read_proposal(answer: &str) -> Result<Proposal> {
         .or_else(|| block(answer, "yml"))
         .context("the configurer's answer has no ```yaml block")?;
     let not_findings = block(answer, "not-findings").filter(|t| !t.trim().is_empty());
+    let labels = block(answer, "labels")
+        .map(|t| labels::parse(&t))
+        .transpose()?;
     let why = answer
         .rfind("## Why")
         .map(|i| answer[i..].trim().to_string())
@@ -170,26 +186,39 @@ pub fn read_proposal(answer: &str) -> Result<Proposal> {
     Ok(Proposal {
         config,
         not_findings,
+        labels,
         why,
     })
 }
 
-/// Holds a proposed config to the rules a repository's config is held to.
-pub fn check(user: &UserConfig, text: &str) -> Result<()> {
+/// Holds a proposed config to the rules a repository's config is held to,
+/// and gives it as a review would read it.
+pub fn check(user: &UserConfig, text: &str) -> Result<Config> {
     let policy = config::parse_repo(text).context("reading it")?;
-    config::resolve(user, policy, &config::Flags::default())?;
-    Ok(())
+    config::resolve(user, policy, &config::Flags::default())
+}
+
+/// Holds a proposal to those rules, and, when the repository's labels were
+/// read, its classification of them to theirs.
+fn holds(user: &UserConfig, p: &Proposal, repo_labels: Option<&[RepoLabel]>) -> Result<Config> {
+    let cfg = check(user, &p.config)?;
+    if let Some(repo_labels) = repo_labels {
+        labels::check(&cfg, repo_labels, p.labels.as_deref())?;
+    }
+    Ok(cfg)
 }
 
 /// One configuring: the configurer reviews the clone and proposes a config.
 /// A config that doesn't hold gets one more call, to fix just that, not to
-/// review again.
+/// review again. With the repository's labels, what the config does with
+/// them is added to its reasons, for the person who accepts it.
 pub fn propose(
     caller: &dyn Caller,
     user: &UserConfig,
     (name, binding): (&str, &Binding),
     clone: &Path,
     brief: &str,
+    repo_labels: Option<&[RepoLabel]>,
 ) -> Result<Proposal> {
     let call = |prompt: &str| {
         caller.call(&Call {
@@ -208,26 +237,34 @@ pub fn propose(
         })
     };
     let answer = call(brief)?;
-    let first = read_proposal(&answer.text).and_then(|p| check(user, &p.config).map(|_| p));
-    match first {
-        Ok(p) => Ok(p),
+    let first =
+        read_proposal(&answer.text).and_then(|p| holds(user, &p, repo_labels).map(|cfg| (p, cfg)));
+    let (mut p, cfg) = match first {
+        Ok(held) => held,
         Err(e) => {
             let fix = format!(
                 "You were configuring ACR for this repository, and answered this:\n\n{}\n\n\
                  It doesn't hold: {e:#}\n\nFix only that. Don't review the repository again. \
                  Answer the same way: the whole config in one ```yaml block, any decided \
-                 non-issues in a ```not-findings block, then `## Why`.\n\n\
-                 # The schema\n\n```json\n{}\n```",
+                 non-issues in a ```not-findings block, the repository's labels classified \
+                 in a ```labels block if they're listed below, then `## Why`.\n\n\
+                 {}# The schema\n\n```json\n{}\n```",
                 answer.text.trim(),
+                repo_labels.map(labels::brief).unwrap_or_default(),
                 config::SCHEMA.trim()
             );
             let answer = call(&fix)?;
             let p = read_proposal(&answer.text)?;
-            check(user, &p.config)
+            let cfg = holds(user, &p, repo_labels)
                 .context("the configurer's config doesn't hold, even after a try to fix it")?;
-            Ok(p)
+            (p, cfg)
         }
+    };
+    if let Some(repo_labels) = repo_labels {
+        let summary = labels::summary(&cfg, repo_labels, p.labels.as_deref().unwrap_or(&[]));
+        p.why = format!("{}\n\n{}", p.why.trim_end(), summary.trim_end());
     }
+    Ok(p)
 }
 
 // --------------------------------------------------------------- proposals
@@ -670,7 +707,7 @@ mod tests {
 
     #[test]
     fn the_configurer_stays_offline_and_says_what_comes_first() {
-        let p = prompt("shop", None, &[]);
+        let p = prompt("shop", None, &[], None);
         assert!(
             p.contains("Install nothing and download nothing, toolchains included"),
             "{p}"
@@ -758,7 +795,7 @@ mod tests {
 
     #[test]
     fn its_brief_reviews_the_repository_and_a_recalibration_carries_the_feedback() {
-        let fresh = prompt("shop", None, &[]);
+        let fresh = prompt("shop", None, &[], None);
         assert!(fresh.contains("for the repository shop"));
         assert!(fresh.contains("Review the repository, exhaustively"));
         assert!(fresh.contains("`git log`") && fresh.contains("`{tests}`"));
@@ -774,7 +811,7 @@ mod tests {
             lens: None,
             note: Some("house style".into()),
         };
-        let again = prompt("shop", Some("version: 1"), &[said]);
+        let again = prompt("shop", Some("version: 1"), &[said], None);
         assert!(again.contains("# Its config now\n\n```yaml\nversion: 1\n```"));
         assert!(
             again.contains("- Review R1, lens correctness: \"F1 title\" (High, blocked, src/a.rs) — the user says: a real defect, but it shouldn't have blocked. They added: house style"),
@@ -803,19 +840,95 @@ mod tests {
         );
         let good = answer(GOOD);
         let fake = Fake::new(&[&bad, &good]);
-        let p = propose(&fake, &u, (&name, &b), Path::new("/clone"), "review it").unwrap();
+        let p = propose(
+            &fake,
+            &u,
+            (&name, &b),
+            Path::new("/clone"),
+            "review it",
+            None,
+        )
+        .unwrap();
         assert_eq!(p.config.trim(), GOOD.trim());
         let asked = fake.asked.lock().unwrap();
         assert_eq!(asked.len(), 2);
         assert!(asked[1].contains("It doesn't hold") && asked[1].contains("Don't review"));
         // Twice wrong is an error, not a bad config.
         let fake = Fake::new(&[&bad, &bad]);
-        let e = propose(&fake, &u, (&name, &b), Path::new("/clone"), "review it").unwrap_err();
+        let e = propose(
+            &fake,
+            &u,
+            (&name, &b),
+            Path::new("/clone"),
+            "review it",
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{e:#}").contains("even after a try"), "{e:#}");
         // A good first answer needs no second call.
         let fake = Fake::new(&[&good]);
-        propose(&fake, &u, (&name, &b), Path::new("/clone"), "review it").unwrap();
+        propose(
+            &fake,
+            &u,
+            (&name, &b),
+            Path::new("/clone"),
+            "review it",
+            None,
+        )
+        .unwrap();
         assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_repositorys_labels_are_classified_and_their_names_kept() {
+        let repo = [
+            RepoLabel {
+                name: "wait:correctness".into(),
+                description: "ACR: the correctness lens is still open".into(),
+            },
+            RepoLabel {
+                name: "epic".into(),
+                description: String::new(),
+            },
+        ];
+        let p = prompt("shop", None, &[], Some(&repo));
+        assert!(p.contains("# The repository's labels"), "{p}");
+        assert!(p.contains("- `epic`\n"), "{p}");
+        assert!(p.contains("classify them in one ```labels block"), "{p}");
+
+        let u = user(false);
+        let (name, b) = binding(&u).unwrap();
+        // Unclassified labels get the one call to fix it, with the labels.
+        let unclassified = answer(GOOD);
+        let classified = format!(
+            "{}\n\n```labels\n- {{label: \"wait:correctness\", kind: dimension, lens: correctness, relevant: true, why: its history}}\n- {{label: epic, kind: other}}\n```\n",
+            answer(GOOD).replace("\n\n## Why", "")
+        )
+        .replace("Because.", "")
+            + "\n## Why\n\nBecause.";
+        let fake = Fake::new(&[&unclassified, &classified]);
+        let p = propose(
+            &fake,
+            &u,
+            (&name, &b),
+            Path::new("/clone"),
+            "review it",
+            Some(&repo),
+        )
+        .unwrap();
+        let asked = fake.asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[1].contains("no ```labels block"), "{}", asked[1]);
+        assert!(asked[1].contains("- `wait:correctness`"), "{}", asked[1]);
+        assert_eq!(p.labels.as_ref().map(Vec::len), Some(2));
+        // Its reasons end with what the config does with the labels.
+        assert!(p.why.starts_with("## Why"), "{}", p.why);
+        assert!(p.why.contains("## The repository's labels"), "{}", p.why);
+        assert!(
+            p.why.contains("Not review concerns: 1 label(s)"),
+            "{}",
+            p.why
+        );
     }
 
     #[test]
@@ -867,6 +980,7 @@ mod tests {
         let plain = Proposal {
             config: GOOD.into(),
             not_findings: None,
+            labels: None,
             why: String::new(),
         };
         for at in 1002..1008 {

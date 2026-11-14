@@ -13,6 +13,7 @@ mod flow;
 mod generated;
 pub mod grayboard;
 mod keep;
+mod labels;
 mod learned;
 mod plan;
 pub mod progress;
@@ -3812,6 +3813,18 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             if accept {
                 calibration::accept(&paths.state, &name, &now, crate::util::now_ms(), folded)?;
                 println!("Accepted {name}'s review config.");
+                // Accepting is the only thing that creates labels: what the
+                // config names and the repository lacks.
+                match labels::create_missing(&repo, &cfg) {
+                    Ok(made) if !made.is_empty() => {
+                        println!("Created these labels on {name}: {}.", made.join(", "))
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "{APP_NAME}: couldn't check {name}'s labels against the config: {e:#}. \
+                         A review puts on a change only labels the repository has."
+                    ),
+                }
             }
             let record = calibration::load(&paths.state, &name)?;
             let unfolded =
@@ -4603,7 +4616,24 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
     }
     check_bridges(paths, &configuring, &machine, &copies_root(paths), false)?;
     let caller = BridgeCaller::new(paths)?;
-    let brief = configure::prompt(&name, current.as_deref().filter(|_| recalibrate), &feedback);
+    // The names the repository's people already give its lenses, so this
+    // calibration keeps them rather than inventing near-duplicates.
+    let repo_labels = match labels::read(&repo) {
+        Ok(found) => Some(found),
+        Err(e) => {
+            eprintln!(
+                "{APP_NAME}: couldn't read {name}'s labels, so this calibration can't reuse \
+                 their names: {e:#}"
+            );
+            None
+        }
+    };
+    let brief = configure::prompt(
+        &name,
+        current.as_deref().filter(|_| recalibrate),
+        &feedback,
+        repo_labels.as_deref(),
+    );
     eprintln!(
         "{APP_NAME}: {binding_name} is reviewing {name} to {}. It reads the whole \
          repository, so this takes a while.",
@@ -4616,7 +4646,14 @@ fn configure_repo(paths: &Paths, repo: &Path, recalibrate: bool) -> Result<()> {
             "configure its review".to_string()
         }
     );
-    let proposal = configure::propose(&caller, &user, (&binding_name, &binding), &clone, &brief)?;
+    let proposal = configure::propose(
+        &caller,
+        &user,
+        (&binding_name, &binding),
+        &clone,
+        &brief,
+        repo_labels.as_deref(),
+    )?;
     let waiting = configure::save(&kept_at, &proposal, folds)?;
     if current.is_some() {
         let diff = std::process::Command::new("git")
