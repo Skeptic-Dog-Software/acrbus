@@ -657,6 +657,9 @@ fn extras(args: &Value) -> Result<Option<Extras>> {
                 .map_err(|e| anyhow!("options: {e}"))?,
         ),
     };
+    if let Some(o) = &options {
+        review_only(o)?;
+    }
     let files: Vec<&str> = args["attachments"]
         .as_array()
         .map(|list| list.iter().filter_map(Value::as_str).collect())
@@ -680,6 +683,32 @@ fn extras(args: &Value) -> Result<Option<Extras>> {
         attachments,
         ..Extras::default()
     }))
+}
+
+/// Refuses what only an ACR review's own caller sends: a session's bus
+/// tools can't mark a request as a review, so a bridge that takes only
+/// reviews (`accepts = "review"`) can't be reached through them.
+fn review_only(o: &RunOptions) -> Result<()> {
+    let set: Vec<&str> = [
+        ("review", o.review.is_some()),
+        ("facts", o.facts.is_some()),
+        ("cache_key", o.cache_key.is_some()),
+        ("allowed_tools", o.allowed_tools.is_some()),
+        ("allowed_paths", o.allowed_paths.is_some()),
+        ("relay_tokens", o.relay_tokens.is_some()),
+        ("relay_after_edit", o.relay_after_edit.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    if !set.is_empty() {
+        bail!(
+            "options: {} {} only for an ACR review's own calls, which the bus tools don't make",
+            set.join(", "),
+            if set.len() == 1 { "is" } else { "are" }
+        );
+    }
+    Ok(())
 }
 
 fn tools() -> Value {
@@ -902,6 +931,29 @@ fn tools() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bus_tool_cant_mark_a_request_as_a_review() {
+        // So a bridge that takes only reviews can't be reached through one.
+        for options in [
+            json!({"review": true}),
+            json!({"review": false}),
+            json!({"model": "m", "review": true}),
+            json!({"facts": "/tmp/f"}),
+            json!({"allowed_paths": "{}"}),
+            json!({"relay_tokens": 64000}),
+        ] {
+            let e = extras(&json!({ "options": options })).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("only for an ACR review's own calls"),
+                "{options}: {e:#}"
+            );
+        }
+        // What a request may ask for still goes.
+        let o: RunOptions =
+            serde_json::from_value(json!({"model": "m", "effort": "high"})).unwrap();
+        assert!(review_only(&o).is_ok());
+    }
 
     #[test]
     fn questions_must_fit_a_question_carousel() {

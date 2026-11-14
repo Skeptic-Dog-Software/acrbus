@@ -173,6 +173,10 @@ pub trait Caller: Sync {
 
     /// The review's spend cap, from now on: None for none.
     fn set_cap(&self, _cap: Option<super::config::SpendCap>) {}
+
+    /// The review's config, to price what its calls spend as its report
+    /// does, for the spend cap.
+    fn set_prices(&self, _cfg: &Config) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1878,6 +1882,69 @@ impl Caller for Watched<'_> {
     fn set_cap(&self, cap: Option<super::config::SpendCap>) {
         self.inner.set_cap(cap)
     }
+    fn set_prices(&self, cfg: &Config) {
+        self.inner.set_prices(cfg)
+    }
+}
+
+/// A caller that starts no call past the review's spend cap: for calls
+/// made one after another inside a step, such as a fix's relay sessions.
+struct CapChecked<'a> {
+    inner: &'a dyn Caller,
+}
+
+impl Caller for CapChecked<'_> {
+    fn call(&self, call: &Call) -> Result<Answer> {
+        if let Some(why) = self.inner.over_cap() {
+            return Err(anyhow::Error::new(Outage(format!("{SPEND_CAP}: {why}"))));
+        }
+        self.inner.call(call)
+    }
+    fn note(&self, what: &str) {
+        self.inner.note(what)
+    }
+    fn say(&self, what: &str) {
+        self.inner.say(what)
+    }
+    fn share(&self, shared: Option<Shared>) -> bool {
+        self.inner.share(shared)
+    }
+    fn warmed(&self, label: &str) -> Option<bool> {
+        self.inner.warmed(label)
+    }
+    fn has_room(&self, binding: &Binding) -> bool {
+        self.inner.has_room(binding)
+    }
+    fn fingerprint(&self, repo: &Path) -> Option<String> {
+        self.inner.fingerprint(repo)
+    }
+    fn snapshot(&self, repo: &Path) -> Option<String> {
+        self.inner.snapshot(repo)
+    }
+    fn delta(&self, repo: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
+        self.inner.delta(repo, from, to)
+    }
+    fn changed(&self, repo: &Path, from: &str, to: &str) -> Option<Vec<super::change::Changed>> {
+        self.inner.changed(repo, from, to)
+    }
+    fn revert(&self, repo: &Path, from: &str, path: &str, existed: bool) -> Result<()> {
+        self.inner.revert(repo, from, path, existed)
+    }
+    fn rekey(&self, label: &str) {
+        self.inner.rekey(label)
+    }
+    fn fix_scope(&self, scope: Option<&FixScope>) {
+        self.inner.fix_scope(scope)
+    }
+    fn over_cap(&self) -> Option<String> {
+        self.inner.over_cap()
+    }
+    fn set_cap(&self, cap: Option<super::config::SpendCap>) {
+        self.inner.set_cap(cap)
+    }
+    fn set_prices(&self, cfg: &Config) {
+        self.inner.set_prices(cfg)
+    }
 }
 
 /// A reviewer's work: its sessions' usage, its findings, and its stage's
@@ -2308,13 +2375,10 @@ fn fixed_of(legs: &Legs) -> Result<roles::Fixed> {
 /// and if that can't either, the review pauses, saved, as a round's
 /// outage does, rather than taking a gateway that's down for a step that
 /// failed. Anything else it returns as it came.
-fn watched<T>(
-    run: &mut Run,
-    s: &Setting,
-    caller: &dyn Caller,
-    label: &str,
-    mut f: impl FnMut(&mut Run) -> Result<T>,
-) -> Result<T> {
+/// Past the review's spend cap, a call that would start here doesn't: the
+/// review pauses, as for an outage, keeping what its calls finished, for a
+/// person to raise the cap, go on without it, or stop.
+fn cap_pause(run: &mut Run, caller: &dyn Caller) -> Result<()> {
     if let Some(why) = caller.over_cap() {
         let why = format!("{SPEND_CAP}: {why}");
         run.outage = Some(Paused {
@@ -2323,7 +2387,31 @@ fn watched<T>(
         });
         return Err(anyhow::Error::new(Outage(why)));
     }
+    Ok(())
+}
+
+fn watched<T>(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    label: &str,
+    mut f: impl FnMut(&mut Run) -> Result<T>,
+) -> Result<T> {
+    cap_pause(run, caller)?;
     match f(run) {
+        // A call within it found the cap reached, as a fix's later relay
+        // session does: paused, as above.
+        Err(e) if is_outage(&e) => {
+            if run.outage.is_none()
+                && let Some(o) = find::<Outage>(&e)
+            {
+                run.outage = Some(Paused {
+                    round: run.round,
+                    why: o.0.clone(),
+                });
+            }
+            Err(e)
+        }
         Err(e) if is_connection(&e) => {
             caller.say(&format!(
                 "{label}: its model couldn't be reached, so it waits {}s and goes once more",
@@ -4746,6 +4834,7 @@ fn gate_round(
     let dir = Copies::fresh(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
+    cap_pause(run, caller)?;
     let proposed = ask_in_form(
         run,
         s,
@@ -4807,6 +4896,7 @@ fn gate_round(
                 ..g.raw.clone()
             })
             .collect();
+        cap_pause(run, caller)?;
         let judged = roles::judge_prompt(lens, &[tagged], &s.not_findings).and_then(|prompt| {
             let prompt = prompt
                 + "\n\nKeep each finding's title as it's given, with its [G..] tag, and don't \
@@ -6210,6 +6300,17 @@ fn same_defects(run: &mut Run, s: &Setting, caller: &dyn Caller) {
             )
         })
         .collect();
+    // Past the spend cap it starts no call: nothing is grouped, which costs
+    // nothing now, and the review's next call pauses at the cap.
+    if let Some(why) = caller.over_cap() {
+        if let Some(r) = run.lenses.values_mut().find_map(|l| l.rounds.last_mut()) {
+            r.notes.push(format!(
+                "findings more than one lens made of one defect weren't grouped: {SPEND_CAP} is \
+                 reached ({why}), so no new call starts"
+            ));
+        }
+        return;
+    }
     let what = DEDUPE;
     let groups = ask(
         run,
@@ -7171,8 +7272,10 @@ fn fix_once(
         }
     };
     caller.fix_scope(Some(scope));
+    // Each of its sessions after the first checks the spend cap too.
+    let capped = CapChecked { inner: caller };
     let legs = watched(run, s, caller, &what, |_| {
-        relayed_with(caller, &call, &used, Some(&guard))
+        relayed_with(&capped, &call, &used, Some(&guard))
     });
     // Its last session, which handed nothing off.
     guard();
@@ -7714,6 +7817,15 @@ fn blast_radius(run: &mut Run, s: &Setting, caller: &dyn Caller) {
         caller.say("the blast-radius check has no Sizer binding, so every lens attacks");
         return;
     };
+    // Past the spend cap it starts no call: every lens attacks, which costs
+    // nothing now, and the round's own calls pause at the cap.
+    if let Some(why) = caller.over_cap() {
+        caller.say(&format!(
+            "the blast-radius check doesn't run, since {SPEND_CAP} is reached ({why}), so every \
+             lens attacks"
+        ));
+        return;
+    }
     let repo = run.reading().to_path_buf();
     let call = Call {
         role: Role::Sizer,
@@ -7830,7 +7942,9 @@ fn to_fix(run: &Run) -> Vec<(String, Finding)> {
 
 /// What the session that ran the review is to fix, as it reads it: less
 /// what groups of the Orchestrator's fix already did, which it's told.
-pub fn fix_brief(run: &Run) -> String {
+/// What's left for the session that ran the review to fix: the folded
+/// blockers and reported defects no Orchestrator group already fixed.
+fn session_left(run: &Run) -> (Vec<(String, Finding)>, Vec<Reported>) {
     let partial = run
         .partial_fix
         .as_ref()
@@ -7847,6 +7961,22 @@ pub fn fix_brief(run: &Run) -> String {
         .into_iter()
         .filter(|(_, f)| !done(&f.id))
         .collect();
+    (left, reported)
+}
+
+/// The files the session that ran the review may change in its fix: as an
+/// agent fixer's, from what's left for it.
+pub fn session_scope(run: &Run) -> FixScope {
+    let (left, reported) = session_left(run);
+    fix_scope(run, &left, &reported)
+}
+
+pub fn fix_brief(run: &Run) -> String {
+    let partial = run
+        .partial_fix
+        .as_ref()
+        .filter(|p| p.round == run.round && !p.groups.is_empty());
+    let (left, reported) = session_left(run);
     let mut out = fix_list(&left, &reported);
     if let Some(p) = partial {
         out.push_str("\nAlready fixed by the Orchestrator, in the working tree:\n");
@@ -7854,8 +7984,20 @@ pub fn fix_brief(run: &Run) -> String {
             out.push_str(&format!("- {}: {}\n", g.ids.join(", "), g.done.trim()));
         }
     }
+    out.push_str(&session_scope(run).told());
+    out.push_str(SESSION_FIX_SCOPE);
     out
 }
+
+/// What the session that ran the review is told of its scope, after the
+/// files: what happens to anything else, and how to note it instead.
+const SESSION_FIX_SCOPE: &str = "When you say the fixes are in, anything changed outside these \
+     files, and any binary no blocker points at, is put back before the next round reads it. \
+     Build into a temporary directory, never the working tree. Note what the fix needs changed \
+     elsewhere, and docs it left saying something no longer true, in a JSON file passed with \
+     `--notes <file>`: {\"needs\": [{\"path\": \"<file>\", \"why\": \"<why>\"}], \
+     \"stale\": [{\"file\": \"<doc>\", \"line\": <number>, \"says\": \"<what it says that's \
+     no longer true>\"}]}. Each is put to a person: fix it now, ticket it, or leave it.\n";
 
 /// The session that ran the review has fixed what was folded in, in the
 /// working tree: the next round attacks the change as it is now, with the
@@ -7865,6 +8007,7 @@ pub fn fixed_by_session(
     s: &Setting,
     caller: &dyn Caller,
     briefs: BTreeMap<String, String>,
+    notes: Option<roles::SessionNotes>,
 ) -> Result<()> {
     if run.waiting != Some(Gate::Fix) {
         bail!(
@@ -7887,6 +8030,52 @@ pub fn fixed_by_session(
             "{line}. Fold them into the working tree, then resume with --fixed again, or end \
              the review with --stop"
         );
+    }
+    // Held to its files as an agent fixer is: what it changed outside them,
+    // and any binary no blocker points at, put back before anything reads
+    // it, and locked. Set against the tree as the session was asked to fix.
+    if let Some(asked) = run.fixing.as_ref().and_then(|f| f.from.clone()) {
+        let scope = session_scope(run);
+        let label = "the session that ran the review";
+        let reverted = put_back(caller, &run.repo, &asked, &scope, label);
+        for (path, _) in &reverted {
+            if !run.locked.iter().any(|l| &l.path == path) {
+                run.locked.push(Locked {
+                    path: path.clone(),
+                    round: run.round,
+                    by: "acrbus".into(),
+                });
+            }
+        }
+        if !reverted.is_empty() {
+            run.guarded.push(Guarded {
+                round: run.round,
+                fix: "the session's fix".into(),
+                paths: scope.paths.clone(),
+                reverted: reverted.clone(),
+                usd: None,
+            });
+        }
+        // All it changed was outside its files: put back, it did no work.
+        if caller.snapshot(&run.repo).as_deref() == Some(asked.as_str()) {
+            let line = format!(
+                "{label}: did no work: everything it changed was outside the files its fix may \
+                 change, and was put back: {}",
+                reverted
+                    .iter()
+                    .map(|(p, why)| format!("{p} ({why})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            caller.say(&line);
+            bail!(
+                "{line}. Fix the blockers in their own files, noting anything else with \
+                 --notes, then resume with --fixed again, or end the review with --stop"
+            );
+        }
+    }
+    if let Some(n) = &notes {
+        keep_notes(run, s, caller, &n.as_fixed());
     }
     let folded = to_fix(run);
     let done = "fixed by the session that ran the review".to_string();
@@ -7967,6 +8156,7 @@ pub fn drive(
 ) -> Result<()> {
     run.status = Status::Running;
     run.waiting = None;
+    caller.set_prices(s.cfg);
     caller.set_cap(run.spend_cap);
     loop {
         let known = failures(run).len();
@@ -8005,6 +8195,51 @@ pub fn drive(
         }
         if !stepped {
             return Ok(());
+        }
+    }
+}
+
+/// Carries a review on with nobody in the loop, as a trial does: each
+/// escalation is taken as seen and the review goes on. Except its spend
+/// cap, which nobody here can raise: driving again would only reach it
+/// again, so the review ends there, stopped, with the cap's escalation as
+/// its note.
+pub fn drive_unattended(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    reload: &dyn Fn(bool) -> Result<Change>,
+) -> Result<()> {
+    loop {
+        for e in &mut run.escalations {
+            e.seen = true;
+        }
+        drive(run, s, caller, reload)?;
+        match run.waiting {
+            None => return Ok(()),
+            Some(Gate::Escalation) => {
+                if run
+                    .escalations
+                    .iter()
+                    .any(|e| !e.seen && e.about == Some(About::SpendCap))
+                {
+                    caller.note(&format!(
+                        "review {}: its spend cap is reached, and nobody here raises it, so it \
+                         ends there, with what its calls finished",
+                        run.id
+                    ));
+                    run.status = Status::Stopped;
+                    run.waiting = None;
+                    for e in &mut run.escalations {
+                        e.seen = true;
+                    }
+                    return Ok(());
+                }
+            }
+            Some(gate) => bail!(
+                "run {} is waiting at {gate:?}, which nobody here answers",
+                run.id
+            ),
         }
     }
 }
@@ -8538,6 +8773,19 @@ lenses:
             if self.edits_once {
                 let edited = self.edited.load(std::sync::atomic::Ordering::SeqCst);
                 return Some(if edited { "edited" } else { "base" }.into());
+            }
+            // Every file it changed put back: the tree is as it was put
+            // back to.
+            if let Some(all) = &self.changed {
+                let reverted = self.reverted.lock().unwrap();
+                if !all.is_empty()
+                    && all
+                        .iter()
+                        .all(|c| reverted.iter().any(|(p, _, _)| p == &c.path))
+                    && let Some((_, from, _)) = reverted.last()
+                {
+                    return Some(from.clone());
+                }
             }
             (self.fixes.is_some() || self.changed.is_some()).then(new_id)
         }
@@ -11513,7 +11761,7 @@ lenses:
                 .contains("acr resume r --fixed")
         );
         fixed.store(true, std::sync::atomic::Ordering::SeqCst);
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
         // Every lens attacks the fix, since a missed defect is nobody's lens's.
         assert_eq!(run.round, 2);
@@ -15108,7 +15356,7 @@ lenses:
             brief.contains("Already fixed by the Orchestrator, in the working tree:\n- alpha-r1-1, alpha-r1-2: fixed first and second"),
             "{brief}"
         );
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap();
         assert!(run.partial_fix.is_none());
         assert_eq!(run.stage, Stage::Review);
     }
@@ -15281,6 +15529,143 @@ lenses:
     }
 
     #[test]
+    fn a_call_one_after_another_within_a_step_checks_the_spend_cap_and_pauses() {
+        let cfg = plain("exception", 1, 1);
+        let mut fake = Fake::new(|_, _: &str| Ok(NOTHING.into()));
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let before = fake.calls.lock().unwrap().len();
+        // Reached once one more call is in, as by a fix's first session.
+        fake.capped_after = Some(before + 1);
+        fake.set_cap(Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        }));
+        let binding = cfg.binding(Role::Orchestrator, None).unwrap();
+        let call = Call {
+            role: Role::Orchestrator,
+            binding_name: "large",
+            binding,
+            prompt: "fix it",
+            artifact: None,
+            writes: true,
+            no_tools: false,
+            relay_tokens: None,
+            repo: Path::new("."),
+            label: "a fix".into(),
+        };
+        let capped = CapChecked { inner: &fake };
+        let Err(e) = watched(&mut run, &s, &fake, "a fix", |_| {
+            capped.call(&call)?;
+            capped.call(&call)
+        }) else {
+            panic!("its second session started past the cap");
+        };
+        assert!(is_outage(&e), "{e:#}");
+        // Its second session never started, and the review is paused at
+        // the cap, for drive to put to a person.
+        assert_eq!(fake.calls.lock().unwrap().len(), before + 1);
+        assert!(
+            run.outage
+                .as_ref()
+                .is_some_and(|o| o.why.starts_with(SPEND_CAP)),
+            "{:?}",
+            run.outage
+        );
+    }
+
+    #[test]
+    fn the_test_gate_starts_no_call_past_the_spend_cap() {
+        // Where the gate's proposer comes, without a cap.
+        let (_, calls) = gated(Some("warn"));
+        let proposer = calls
+            .iter()
+            .position(|c| c.0 == Role::Reviewer && c.3.contains("proposing small breaks"))
+            .expect("the gate proposes mutants");
+        use super::super::change::tests::repo_with;
+        let mut cfg = config(
+            "exception",
+            1,
+            1,
+            "",
+            "stages: [gate]\ntests: {command: 'true', gate: warn}",
+        );
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-gate-cap-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    r#"{"mutants": [{"file": "a.src", "find": "x = 1", "replace": "x = 2", "why": "x is one", "tests": []}]}"#
+                        .to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached once the proposer has answered: the gate's Judge never
+        // starts.
+        fake.capped_after = Some(proposer + 1);
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.about == Some(About::SpendCap)),
+            "{:?}",
+            run.escalations
+        );
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.0 == Role::Judge && c.3.contains("[G0]")),
+            "the gate's Judge started past the cap"
+        );
+    }
+
+    #[test]
+    fn with_nobody_in_the_loop_a_review_at_its_spend_cap_ends_there_rather_than_loops() {
+        let mut cfg = plain("exception", 3, 1);
+        cfg.spend_cap = Some(super::super::config::SpendCap {
+            usd: Some(1.0),
+            tokens: None,
+        });
+        let mut fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        // Reached before any call: one reviewer that came in under it would
+        // let the review end confirmed, as a race.
+        fake.capped_after = Some(0);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive_unattended(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!((run.status, run.waiting), (Status::Stopped, None));
+        let caps = run
+            .escalations
+            .iter()
+            .filter(|e| e.about == Some(About::SpendCap))
+            .count();
+        assert_eq!(caps, 1, "reached once, not again and again");
+        assert!(run.escalations.iter().all(|e| e.seen));
+        assert!(said(&fake).contains("nobody here raises it"));
+    }
+
+    #[test]
     fn at_its_spend_cap_a_review_starts_no_new_call_and_asks_whether_to_go_on() {
         let mut cfg = plain("exception", 3, 1);
         cfg.spend_cap = Some(super::super::config::SpendCap {
@@ -15337,7 +15722,7 @@ lenses:
             "alpha".to_string(),
             "Start at the new lock in a.src.".to_string(),
         )]);
-        fixed_by_session(&mut run, &s, &fake, briefs).unwrap();
+        fixed_by_session(&mut run, &s, &fake, briefs, None).unwrap();
         drive(&mut run, &s, &fake, &reload).unwrap();
         let alpha = prompts(&fake, Role::Reviewer, "alpha");
         assert!(alpha.len() >= 2, "{}", alpha.len());
@@ -15362,11 +15747,108 @@ lenses:
         run.fixer = Fixer::Session;
         drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
         assert_eq!(run.waiting, Some(Gate::Fix));
-        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap_err();
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap_err();
         assert!(format!("{e:#}").contains("did no work"), "{e:#}");
         assert!(said(&fake).contains("did no work: it said the fixes are in"));
         // Still waiting for the fixes, in the same round.
         assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
+    }
+
+    #[test]
+    fn a_session_fix_is_held_to_its_files_and_its_notes_are_kept() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        fake.changed = rebuilt();
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Fix));
+        // It's told its files, and how to note anything else.
+        let brief = fix_brief(&run);
+        assert!(brief.contains("# The files this fix may change"), "{brief}");
+        assert!(brief.contains("`a.src`"), "{brief}");
+        assert!(brief.contains("--notes <file>"), "{brief}");
+        let notes = roles::read_session_notes(
+            r#"{"needs": [{"path": "b.src", "why": "its caller"}],
+                "stale": [{"file": "README.md", "line": 3, "says": "the old flag"}]}"#,
+        )
+        .unwrap();
+        fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), Some(notes)).unwrap();
+        // What it changed outside a.src, and the binary, were put back
+        // before the next round, and are locked.
+        let reverted = fake.reverted.lock().unwrap();
+        let paths: Vec<&str> = reverted.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(paths, ["build/tool.bin", "notes.md"]);
+        drop(reverted);
+        assert!(said(&fake).contains(
+            "the session that ran the review: put back 2 file(s) it changed outside its scope"
+        ));
+        let locked: Vec<&str> = run.locked.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(locked, ["build/tool.bin", "notes.md"]);
+        assert_eq!(run.guarded[0].fix, "the session's fix");
+        assert!(run.flags.is_empty(), "{:?}", run.flags);
+        // Its notes are kept, as an agent fixer's are: tickets, under a gate
+        // that doesn't ask at rounds.
+        let notes: Vec<(&str, &str, NoteState)> = run
+            .fix_notes
+            .iter()
+            .map(|n| (n.kind.as_str(), n.path.as_str(), n.state))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("needs", "b.src", NoteState::Ticket),
+                ("stale", "README.md", NoteState::Ticket)
+            ]
+        );
+        assert_eq!(run.stage, Stage::Review);
+    }
+
+    #[test]
+    fn a_session_fix_that_changed_only_files_outside_its_scope_did_no_work() {
+        let cfg = plain("exception", 3, 1);
+        let mut fake = Fake::new(defect_in("alpha", 1));
+        let c1 = |path: &str| super::super::change::Changed {
+            path: path.into(),
+            binary: false,
+            existed: true,
+        };
+        fake.changed = Some(vec![c1("CONTRIBUTING.md"), c1("other/b.src")]);
+        let s = setting(&cfg);
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        run.fixer = Fixer::Session;
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let e = fixed_by_session(&mut run, &s, &fake, BTreeMap::new(), None).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("did no work: everything it changed was outside"),
+            "{e}"
+        );
+        assert!(
+            e.contains("CONTRIBUTING.md (a doc no blocker points at)"),
+            "{e}"
+        );
+        // Still waiting for the fix, with what was put back locked.
+        assert_eq!((run.waiting, run.round), (Some(Gate::Fix), 1));
+        assert_eq!(run.locked.len(), 2);
+    }
+
+    #[test]
+    fn a_reviewer_reports_a_real_defect_outside_its_lens_without_hunting_for_one() {
+        let cfg = plain("exception", 1, 1);
+        let fake = Fake::new(defect_in("alpha", 1));
+        go(&cfg, &["a.src"], &fake);
+        let alpha = prompts(&fake, Role::Reviewer, "alpha");
+        assert!(!alpha[0].contains("and nothing outside it"), "{}", alpha[0]);
+        assert!(
+            alpha[0].contains("don't go looking outside it")
+                && alpha[0].contains("say in its detail which lens it belongs to"),
+            "{}",
+            alpha[0]
+        );
     }
 
     /// What a fix changed: the file its blocker points at, a rebuilt
@@ -15652,21 +16134,5 @@ lenses:
         );
         // Asked again, with the escalation.
         assert_eq!(headers(&run, &cfg), ["Escalated", "Escalated", "Flagged"]);
-    }
-
-    #[test]
-    fn a_fix_by_the_session_that_ran_the_review_is_flagged_too() {
-        let cfg = plain("exception", 3, 1);
-        let mut fake = Fake::new(defect_in("alpha", 1));
-        fake.changed = rebuilt();
-        let s = setting(&cfg);
-        let c = change(&["a.src"]);
-        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
-        run.fixer = Fixer::Session;
-        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
-        assert_eq!(run.waiting, Some(Gate::Fix));
-        fixed_by_session(&mut run, &s, &fake, BTreeMap::new()).unwrap();
-        assert_eq!(run.flags.len(), 2);
-        assert!(run.flags.iter().all(|f| f.round == 1));
     }
 }

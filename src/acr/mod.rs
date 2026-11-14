@@ -414,6 +414,11 @@ pub enum AcrCmd {
         /// what the fixes changed.
         #[arg(long, value_name = "FILE", requires = "fixed")]
         brief: Option<PathBuf>,
+        /// With `--fixed`: what the fix needs changed outside its files, and
+        /// the docs it left stale, as JSON: {"needs": [{"path", "why"}],
+        /// "stale": [{"file", "line", "says"}]}. Each is put to a person.
+        #[arg(long, value_name = "FILE", requires = "fixed")]
+        notes: Option<PathBuf>,
         /// Blockers to fix, by ID, with commas.
         #[arg(long, value_delimiter = ',')]
         fold: Vec<String>,
@@ -1436,9 +1441,36 @@ fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<C
 
 /// Reaches models through bridges, as `acrbus call` does. Each call is a
 /// fresh session, limited to its binding's tools.
+/// A finished call's tokens, its dollars priced as the review's report
+/// prices them: by the config's price for its binding or model, or else
+/// what its agent said, and none for a subscription. So a spend cap trips
+/// on an agent that reports no cost, as Claude Code doesn't.
+fn priced(
+    cfg: Option<&Config>,
+    name: &str,
+    binding: &config::Binding,
+    u: &crate::proto::RunUsage,
+) -> crate::bridge::LiveTokens {
+    let mut t = crate::bridge::LiveTokens::of(u);
+    if binding.subscription {
+        t.usd = None;
+    } else if let Some(p) = cfg.and_then(|c| c.price(name, binding)) {
+        t.usd = Some(p.usd(
+            u.input_tokens,
+            u.cache_read_tokens,
+            u.cache_write_tokens,
+            u.output_tokens,
+        ));
+    }
+    t
+}
+
 struct BridgeCaller {
     /// The review's spend cap, set as it runs.
     cap: std::sync::Mutex<Option<config::SpendCap>>,
+    /// The review's config, to price each call as its report does, for the
+    /// spend cap and progress.
+    prices: std::sync::Mutex<Option<Config>>,
     socket: PathBuf,
     agent: String,
     store: Attachments,
@@ -1514,6 +1546,7 @@ impl BridgeCaller {
             rekeyed: Default::default(),
             fix_scope: Default::default(),
             cap: Default::default(),
+            prices: Default::default(),
         })
     }
 
@@ -1807,6 +1840,10 @@ impl Caller for BridgeCaller {
         *self.cap.lock().unwrap_or_else(|e| e.into_inner()) = cap;
     }
 
+    fn set_prices(&self, cfg: &Config) {
+        *self.prices.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+    }
+
     fn has_room(&self, binding: &config::Binding) -> bool {
         let bridge = binding.agent.split('@').next().unwrap_or_default();
         // One slot always left over for the review's own calls.
@@ -1824,11 +1861,16 @@ impl Caller for BridgeCaller {
             self.answered(call, a);
         }
         let failed = answer.as_ref().err().map(|e| format!("{e:#}"));
+        let prices = self
+            .prices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let used = answer
             .as_ref()
             .ok()
             .and_then(|a| a.usage.as_ref())
-            .map(crate::bridge::LiveTokens::of);
+            .map(|u| priced(prices.as_ref(), call.binding_name, call.binding, u));
         self.progress.end(token, failed.as_deref(), used);
         answer
     }
@@ -2234,7 +2276,12 @@ fn attend(
                     },
                 )?;
             } else {
-                flow::fixed_by_session(run, s, caller, Default::default())?;
+                // Refused, it may still have put files back and locked
+                // them: kept, so the next try is held to them too.
+                if let Err(e) = flow::fixed_by_session(run, s, caller, Default::default(), None) {
+                    save(paths, run, cfg)?;
+                    return Err(e);
+                }
             }
         } else {
             let ask = carousel::ask(run, cfg, &APP_NAME.to_string());
@@ -3488,6 +3535,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     answers: None,
                     fixed: false,
                     brief: None,
+                    notes: None,
                     fold: Vec::new(),
                     waive: Vec::new(),
                     defer: Vec::new(),
@@ -3505,6 +3553,7 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
             answers,
             fixed,
             brief,
+            notes,
             fold,
             waive,
             defer,
@@ -3649,7 +3698,21 @@ pub fn run(paths: &Paths, command: AcrCmd, starter: Option<String>) -> Result<Ex
                     .transpose()?
                     .map(|b| b.lenses)
                     .unwrap_or_default();
-                flow::fixed_by_session(&mut run, &s, &caller, briefs)?;
+                let notes = notes
+                    .as_deref()
+                    .map(|f| {
+                        fs::read_to_string(f)
+                            .with_context(|| format!("reading {}", f.display()))
+                            .and_then(|t| roles::read_session_notes(&t))
+                            .with_context(|| format!("{}: notes as JSON", f.display()))
+                    })
+                    .transpose()?;
+                // Refused, it may still have put files back and locked them:
+                // kept, so the next try is held to them too.
+                if let Err(e) = flow::fixed_by_session(&mut run, &s, &caller, briefs, notes) {
+                    save(paths, &run, &cfg)?;
+                    return Err(e);
+                }
             }
             // Under way again, as its record says to anyone who looks.
             run.status = flow::Status::Running;
@@ -4254,20 +4317,7 @@ fn pipeline_run(
         }
         reload(&cfg, repo, base, head.filter(|_| !fixed))
     };
-    loop {
-        for e in &mut run.escalations {
-            e.seen = true;
-        }
-        flow::drive(&mut run, &s, &caller, &reloading)?;
-        match run.waiting {
-            None => break,
-            Some(flow::Gate::Escalation) => {}
-            Some(gate) => bail!(
-                "run {} is waiting at {gate:?}, which nobody here answers",
-                run.id
-            ),
-        }
-    }
+    flow::drive_unattended(&mut run, &s, &caller, &reloading)?;
     for e in &mut run.escalations {
         e.seen = true;
     }
@@ -5069,6 +5119,48 @@ mod tests {
     }
 
     #[test]
+    fn what_a_call_spent_is_priced_as_the_report_prices_it_for_the_spend_cap() {
+        let cfg = config::resolve(
+            &config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap(),
+            config::parse_repo(
+                "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                 lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n\
+                 costs: {prices: {example/medium-model: {input_per_mtok: 2, output_per_mtok: 10, \
+                 cached_input_per_mtok: 0.2}}}\n",
+            )
+            .unwrap(),
+            &Flags::default(),
+        )
+        .unwrap();
+        // An agent that reports no cost, as Claude Code doesn't.
+        let u = crate::proto::RunUsage {
+            input_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+            output_tokens: 100_000,
+            usd: None,
+            ..Default::default()
+        };
+        let medium = cfg.binding(Role::Reviewer, None).unwrap().clone();
+        let t = priced(Some(&cfg), "medium", &medium, &u);
+        // 1M fresh at $2, 1M cached at $0.20, 100k out at $10.
+        assert!((t.usd.unwrap() - 3.2).abs() < 1e-9, "{:?}", t.usd);
+        // With no price for it, what its agent said, or nothing.
+        let large = cfg.binding(Role::Judge, None).unwrap().clone();
+        let said = crate::proto::RunUsage {
+            usd: Some(0.5),
+            ..u.clone()
+        };
+        assert_eq!(priced(Some(&cfg), "large", &large, &said).usd, Some(0.5));
+        assert_eq!(priced(Some(&cfg), "large", &large, &u).usd, None);
+        // A subscription's calls cost no dollars.
+        let mut sub = medium.clone();
+        sub.subscription = true;
+        assert_eq!(priced(Some(&cfg), "medium", &sub, &u).usd, None);
+        // Before the review's config is known, what the agent said.
+        assert_eq!(priced(None, "medium", &medium, &said).usd, Some(0.5));
+    }
+
+    #[test]
     fn a_reviews_end_says_what_it_waits_for_and_how_to_answer() {
         let cfg = config::resolve(
             &config::parse_user(include_str!("../../examples/acr/user.yaml")).unwrap(),
@@ -5399,6 +5491,7 @@ mod tests {
             answers: None,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),
@@ -5559,6 +5652,7 @@ mod tests {
             answers,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),
@@ -5613,6 +5707,7 @@ mod tests {
             answers: None,
             fixed: false,
             brief: None,
+            notes: None,
             fold: Vec::new(),
             waive: Vec::new(),
             defer: Vec::new(),

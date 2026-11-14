@@ -270,8 +270,13 @@ spend_cap: {usd: 20}   # or {tokens: 30000000}, or both
   terminal. Every review records where each gate's answers came from, and
   what its flags weakened.
 - `spend_cap`: once the review's calls have spent it, no new call starts,
-  and you're asked to raise it, go on without it, or stop.
-  `--spend-cap-usd` sets one for a run.
+  and you're asked to raise it, go on without it, or stop. Dollars are
+  counted as the report counts them: by `costs.prices`, or a binding's own
+  prices, or else what the agent says a call cost, and none for a
+  subscription. So set prices for an agent that reports no cost, such as
+  Claude Code, or cap its tokens. `--spend-cap-usd` sets the dollars for a
+  run, keeping the config's token cap. A trial's review, with nobody to
+  ask, ends at its cap.
 
 ## 5b. What acrbus does, so the config needn't
 

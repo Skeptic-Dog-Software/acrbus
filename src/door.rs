@@ -459,9 +459,13 @@ mod tests {
             "{:#}",
             r.call(serde_json::json!({ "op": "hello" })).unwrap_err()
         );
-        // Under load the close can reach the client as a reset instead.
+        // Under load the close can reach the client as a reset, or another
+        // socket error, instead.
         assert!(
-            e.contains("closed") || e.contains("Broken pipe") || e.contains("reset"),
+            e.contains("closed")
+                || e.contains("Broken pipe")
+                || e.contains("reset")
+                || e.contains("os error"),
             "{e}"
         );
         // Its own account's processes do.
