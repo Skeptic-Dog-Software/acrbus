@@ -135,7 +135,7 @@ pub fn claude(install: bool) -> Result<()> {
         &plugin.join("skills/acr/SKILL.md"),
         include_str!("../plugin/skills/acr/SKILL.md"),
     )?;
-    // A lighter review: one fresh reviewer on the whole change.
+    // A lighter review: two fresh reviewers from different model families on the whole change.
     write(
         &plugin.join("skills/review/SKILL.md"),
         include_str!("../plugin/skills/review/SKILL.md"),
