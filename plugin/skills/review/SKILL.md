@@ -1,11 +1,11 @@
 ---
 name: review
-description: Whole-change review. One fresh reviewer reads the entire change at once, against a standing list of cross-cutting checks, and your user decides each finding. Lean on tokens. Use it to review a branch, a PR or a working tree when your user asks for a review and doesn't ask for a full ACR.
+description: Whole-change review. One fresh reviewer reads the entire change at once, against a standing list of cross-cutting checks, and your user decides each finding. It reports; it doesn't fix. Lean on tokens. Use it to review a branch, a PR or a working tree when your user asks for a review and doesn't ask for a full ACR.
 ---
 
 # Whole-change review
 
-One reviewer, the whole change, a short list of checks that cut across files, and your user decides. It costs one reviewer call per pass, not a fan-out per dimension.
+One reviewer, the whole change, a short list of checks that cut across files, and your user decides. It costs one reviewer call per review, not a fan-out per dimension. It reports and doesn't fix: your user fixes by their own method, then asks for a new review.
 
 **Why one reader.** Many real defects live between files: the same kind of message handled on two paths that disagree, a widened helper whose other callers weren't checked, a rule enforced at the step methods but not at Start. A reviewer that reads one dimension, or one path, at a time can miss them. One reader holding the whole change, pointed at those seams, catches them. A separate session still reviews, because the session that wrote the change mostly ratifies its own work.
 
@@ -35,26 +35,17 @@ Use a reviewer your user has named, such as a bus agent on a cheaper model (`acr
 
 ## 3. Your user decides
 
-- Read each finding's cited lines, so you can say what it points at. Don't drop or downgrade a finding yourself: you wrote the change.
-- Ask your user about each blocker with AskUserQuestion: **fix now**, **ticket**, or **not a defect**. Group non-blockers into one question. Never answer for your user.
-
-## 4. Fix only what was chosen
-
-- Change only the files a chosen finding cites, and tests beside them that pin the fix.
-- When a fix makes a doc stale, or needs a file outside that scope, don't edit it. List it as "file:line now says X" or "needs file: why", and ask.
-- Don't write build outputs into the tree. Build to a temp path, or just run the tests.
-- Run the tests that cover what you changed.
-
-## 5. Check the fixes, once
-
-Ask one fresh reviewer, with the same brief, on the fix's diff only: did each fix hold, and did it break any of the checks? Bring what it finds to your user the same way. Stop there unless your user asks for another pass.
+- Read each finding's cited lines, so you can say what it points at. Don't drop or downgrade a finding yourself, and don't fix anything.
+- Ask your user about each blocker with AskUserQuestion: **real**, **ticket**, or **not a defect**. Group non-blockers into one question. Never answer for your user.
+- Fixing is your user's, by their own method. When they've fixed, they ask for a new review. Give that review the earlier findings and their verdicts, so it says which blockers still stand and doesn't raise again what was ruled not a defect.
 
 ## Report
 
 Give your user:
 - the change reviewed;
-- what each pass found, by check;
-- what was fixed, ticketed or ruled not a defect, and by whom;
+- what it found, by check;
+- each finding's verdict (real, ticket, not a defect), and who gave it;
+- for a review after fixes, which earlier blockers still stand;
 - the reviewer's model;
 - what wasn't checked.
 
