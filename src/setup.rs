@@ -135,6 +135,11 @@ pub fn claude(install: bool) -> Result<()> {
         &plugin.join("skills/acr/SKILL.md"),
         include_str!("../plugin/skills/acr/SKILL.md"),
     )?;
+    // A lighter review: one fresh reviewer on the whole change.
+    write(
+        &plugin.join("skills/review/SKILL.md"),
+        include_str!("../plugin/skills/review/SKILL.md"),
+    )?;
     println!("Wrote the Claude Code plugin to {}", plugin.display());
     install_pipe_skill()?;
 
