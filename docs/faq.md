@@ -1237,7 +1237,7 @@ resumes with `acr resume --fixed`. When the Orchestrator can write and the
 human gate asks about the scope, the scope gate asks you which. In a
 review to convergence, the steelman fixes.
 
-Code: src/acr/flow.rs::Fixer; src/acr/flow.rs::session_fixes; src/acr/flow.rs::fix_route; src/acr/carousel.rs::fixer; src/acr/carousel.rs::SESSION | Config: allowed_bindings, savings.fixer | CLI: acrbus acr resume --fixed | Tests: a_fix_needs_somewhere_to_go, a_fix_by_the_session_that_ran_the_review_is_flagged_too
+Code: src/acr/flow.rs::Fixer; src/acr/flow.rs::session_fixes; src/acr/flow.rs::fix_route; src/acr/carousel.rs::fixer; src/acr/carousel.rs::SESSION | Config: allowed_bindings, savings.fixer | CLI: acrbus acr resume --fixed | Tests: a_fix_needs_somewhere_to_go, a_session_fix_is_held_to_its_files_and_its_notes_are_kept
 
 ### Where do fixes go, and does acrbus commit them?
 
@@ -1633,7 +1633,13 @@ Only if `integrations` turns it on, with labels or a comment, in your
 replaces yours, and you pass `--post-pr`. With neither turning anything
 on, it posts nothing.
 
-Code: src/acr/config.rs::Integrations; src/acr/config.rs::Labels; src/acr/report.rs::comment | Config: integrations, integrations.labels, integrations.comment, defaults | CLI: acrbus acr run --post-pr | Tests: a_repository_that_turned_nothing_on_gets_no_labels_or_comment
+A review only puts on labels the repository has. Accepting a config
+creates the ones it names and the repository lacks, and the calibration
+that proposed it kept the names the repository's labels already give each
+review concern, so two people calibrating separately don't make two
+labels for one thing.
+
+Code: src/acr/config.rs::Integrations; src/acr/config.rs::Labels; src/acr/report.rs::comment; src/acr/labels.rs::create_missing; src/acr/labels.rs::check | Config: integrations, integrations.labels, integrations.comment, defaults | CLI: acrbus acr run --post-pr, acrbus acr calibration --accept | Tests: a_repository_that_turned_nothing_on_gets_no_labels_or_comment, accepting_creates_only_what_the_repository_lacks, the_repositorys_labels_are_classified_and_their_names_kept
 
 ## Models and bindings
 

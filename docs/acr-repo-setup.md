@@ -691,10 +691,24 @@ notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
    criteria, attack, blocker and triggers, and the tiers, runbook, tests and
    stages. The proposal waits beside the config, at
    `<repository>.proposed.yaml`, with its reasons in `<repository>.proposed.md`.
+
+   It reads every label on the repository first, with `gh`, because those
+   are the names everyone calibrating the repository shares. It says which
+   labels name a kind of review concern, in whatever pattern, which of those
+   concerns matter here now, and which labels are something else, such as
+   a size or a type. A concern that matters keeps the name its labels give
+   it, and a new name needs a reason. acrbus checks that every label was
+   classified and none was made up, and the reasons end with what it found:
+   the lenses whose labels the repository has, the labels accepting would
+   create, names spelt close to existing ones, and labels that give one lens
+   two names.
 2. **Read it and accept it.** Change what you disagree with, then run
    `acrbus acr calibration --repo <path> --accept`. That puts it in place,
    keeping the config it replaces as a backup, and calibrates the
-   repository. A config you wrote yourself is accepted the same way.
+   repository. A config you wrote yourself is accepted the same way. When
+   the config sets `integrations.labels`, accepting creates the labels it
+   names and the repository lacks. Nothing else creates labels: a review
+   puts only existing ones on a change.
 3. **Review, and say how each review did.** After a review,
    `acrbus acr feedback <review id>` lists its findings. Mark each one
    (`--finding <number> --verdict right|not-a-defect|not-a-blocker|should-block`,
