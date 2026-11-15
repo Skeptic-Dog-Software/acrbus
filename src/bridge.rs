@@ -1537,6 +1537,73 @@ struct Journal {
     /// The run's process group, and when its leader started.
     pgid: Option<i32>,
     leader_started: Option<String>,
+    /// What git said was changed in the working directory when the first
+    /// try began, so a try after one that was cut off can tell what that
+    /// one left there. None if it isn't a git checkout, or a bridge before
+    /// this one recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dirty: Option<Vec<String>>,
+}
+
+/// The paths git says are changed or new in `dir`, sorted, or None if it
+/// isn't a git checkout.
+fn changed_paths(dir: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| l[3..].to_string())
+        .collect();
+    paths.sort();
+    Some(paths)
+}
+
+/// Whether a run planned this way can change files: tools that write or
+/// run commands, or no narrowing at all.
+fn can_write(plan: &Plan) -> bool {
+    let tools = plan.allowed_tools.as_ref().or(plan.tools.as_ref());
+    tools.is_none_or(|tools| {
+        tools.iter().any(|t| {
+            let t = t.to_ascii_lowercase();
+            ["bash", "write", "edit", "notebookedit"].contains(&t.as_str())
+        })
+    })
+}
+
+/// Why a try after one that was cut off mustn't start: the cut-off try left
+/// changes in the working directory it would start on top of. None when it
+/// can start.
+fn left_behind(plan: &Plan, journal: &Journal) -> Option<String> {
+    if !can_write(plan) {
+        return None;
+    }
+    let now = changed_paths(&plan.workdir)?;
+    let before = journal.dirty.clone().unwrap_or_default();
+    let added: Vec<&String> = now.iter().filter(|p| !before.contains(p)).collect();
+    if added.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = added.iter().take(10).map(|p| p.as_str()).collect();
+    let more = added.len().saturating_sub(shown.len());
+    Some(format!(
+        "an earlier try at this request was cut off and left {} changed file(s) in {}: {}{}. \
+         It isn't started again on top of them: look at them, keep or reset them, then send \
+         the request again",
+        added.len(),
+        plan.workdir.display(),
+        shown.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 /// A reply, saved before it's sent.
@@ -2925,6 +2992,12 @@ impl Bridge {
                 "the bridge stopped during all {MAX_ATTEMPTS} tries at this request"
             )));
         }
+        if journal.attempts == 1 {
+            journal.dirty = changed_paths(&job.plan.workdir);
+        } else if let Some(why) = left_behind(&job.plan, &journal) {
+            self.save_journal(&msg.id, &journal);
+            return Outcome::Finished(self.failed(why));
+        }
         self.save_journal(&msg.id, &journal);
         let request = self.request_dir(&msg.id);
         let outcome = loop {
@@ -2944,6 +3017,9 @@ impl Bridge {
                     journal.pgid = None;
                     journal.leader_started = None;
                     self.save_journal(&msg.id, &journal);
+                    if let Some(why) = left_behind(&job.plan, &journal) {
+                        break Outcome::Finished(self.failed(why));
+                    }
                     self.log(format!(
                         "{}: trying it again, try {} of {MAX_ATTEMPTS}",
                         msg.id, journal.attempts
@@ -4509,6 +4585,7 @@ mod tests {
                 attempts: 1,
                 pgid: Some(pid),
                 leader_started: process_started(pid),
+                dirty: None,
             },
         );
         let first = rig.state().join("runs").join(&id).join("1");
@@ -4541,6 +4618,7 @@ mod tests {
                 attempts: 1,
                 pgid: Some(pid),
                 leader_started: Some("a long time ago".into()),
+                dirty: None,
             },
         );
         let bridge = rig.start(rig.settings("echo done", ""));
@@ -4568,6 +4646,74 @@ mod tests {
         );
         bridge.stop().unwrap();
         assert!(!rig.home("ran").exists());
+    }
+
+    #[test]
+    fn a_try_after_one_cut_off_doesnt_start_on_what_that_one_left() {
+        let rig = Rig::new();
+        let work = rig.dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        fs::write(work.join("kept.txt"), "x").unwrap();
+        // A file changed before the first try began is the user's, not the try's.
+        let id = rig.left_pending("fix it");
+        rig.journal(
+            &id,
+            &Journal {
+                attempts: 1,
+                dirty: Some(vec!["kept.txt".into()]),
+                ..Journal::default()
+            },
+        );
+        // What the cut-off try left.
+        fs::write(work.join("half.rs"), "half an edit").unwrap();
+        let bridge = rig.start(rig.settings(r#"touch "$HOME/ran"; echo hi"#, ""));
+        let reply = rig.reply_to(&id);
+        assert!(
+            reply.contains("was cut off and left 1 changed file(s)")
+                && reply.contains("half.rs")
+                && !reply.contains("kept.txt"),
+            "{reply}"
+        );
+        bridge.stop().unwrap();
+        assert!(!rig.home("ran").exists(), "it mustn't start again");
+    }
+
+    #[test]
+    fn a_read_only_try_or_a_clean_tree_starts_again_as_before() {
+        let rig = Rig::new();
+        let work = rig.dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&work)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let id = rig.left_pending("look");
+        rig.journal(
+            &id,
+            &Journal {
+                attempts: 1,
+                dirty: Some(Vec::new()),
+                ..Journal::default()
+            },
+        );
+        let bridge = rig.start(rig.settings("echo answered", ""));
+        assert_eq!(rig.reply_to(&id), "answered");
+        bridge.stop().unwrap();
     }
 
     #[test]

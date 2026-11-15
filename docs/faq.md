@@ -1387,7 +1387,12 @@ ended and tried again in a fresh run. A busy run is never taken for a quiet
 one, and the idle watch never cuts off a call that's working; only a call's
 time cap does (see below). `idle_secs = 0` turns the watch off.
 
-Code: src/bridge.rs::default_idle; src/bridge.rs::SHAKE_WAIT; src/bridge.rs::MAX_ATTEMPTS | Config: idle_secs | CLI: acrbus bridge status | Tests: a_shake_wakes_a_stopped_process_and_the_run_goes_on, a_busy_run_is_never_taken_for_a_quiet_one, a_run_abandoned_on_every_try_fails_saying_what_the_shake_found, an_abandoned_run_is_tried_again_and_can_still_answer
+A try after one that was ended, or cut off when the bridge stopped, doesn't
+start on what the earlier try left: when the run can write and its working
+directory is a git checkout with files changed since the first try began,
+the request fails, naming them, for you to look at and send again.
+
+Code: src/bridge.rs::default_idle; src/bridge.rs::SHAKE_WAIT; src/bridge.rs::MAX_ATTEMPTS; src/bridge.rs::left_behind | Config: idle_secs | CLI: acrbus bridge status | Tests: a_try_after_one_cut_off_doesnt_start_on_what_that_one_left, a_shake_wakes_a_stopped_process_and_the_run_goes_on, a_busy_run_is_never_taken_for_a_quiet_one, a_run_abandoned_on_every_try_fails_saying_what_the_shake_found, an_abandoned_run_is_tried_again_and_can_still_answer
 
 ### Is there a time budget on calls?
 
