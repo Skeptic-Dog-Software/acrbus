@@ -272,11 +272,14 @@ pub(crate) fn write_plugin(exe: &Path) -> Result<PathBuf> {
         include_str!("../plugin/skills/acr/SKILL.md"),
     )?;
     // A lighter review: two fresh reviewers from different model families on the whole change.
-    write(
-        &plugin.join("skills/review/SKILL.md"),
-        include_str!("../plugin/skills/review/SKILL.md"),
-    )?;
+    write(&plugin.join("skills/review/SKILL.md"), &review_skill(name))?;
     Ok(plugin)
+}
+
+/// The review skill, with its commands named for the binary that installs
+/// it, so `tailbus call` where only tailbus is installed.
+fn review_skill(name: &str) -> String {
+    include_str!("../plugin/skills/review/SKILL.md").replace("`acrbus ", &format!("`{name} "))
 }
 
 const PIPE: &str = include_str!("../plugin/commands/pipe.md");
@@ -1699,6 +1702,18 @@ pub fn grayboard_config(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_review_skill_names_the_binary_that_installs_it() {
+        let as_tailbus = review_skill("tailbus");
+        assert!(as_tailbus.contains("`tailbus call <agent>"), "{as_tailbus}");
+        assert!(as_tailbus.contains("`tailbus acr plan"), "{as_tailbus}");
+        assert!(!as_tailbus.contains("`acrbus "), "{as_tailbus}");
+        assert_eq!(
+            review_skill("acrbus"),
+            include_str!("../plugin/skills/review/SKILL.md")
+        );
+    }
+
     use super::*;
 
     #[test]

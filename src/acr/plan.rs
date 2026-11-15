@@ -90,6 +90,18 @@ pub struct PlannedLens {
     pub id: String,
     pub why: Why,
     pub binding: String,
+    /// What's wrong in it, what blocks and how to attack, as its reviewers
+    /// get them, built-in lenses' included, so a review that runs outside
+    /// `acr run` holds to the same lens.
+    pub criteria: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attack: Option<String>,
+    /// The stage whose runs this lens judges, such as probes or the test
+    /// gate: a review that doesn't make those runs can't cover it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -416,10 +428,19 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
     let chosen = select(cfg, tier, change)?;
     let mut lenses = Vec::new();
     for (lens, why) in &chosen {
+        let stage = cfg
+            .stages
+            .iter()
+            .find(|s| super::stages::lens_id(**s) == Some(lens.id.as_str()))
+            .map(|s| format!("{s:?}").to_lowercase());
         lenses.push(PlannedLens {
             id: lens.id.clone(),
             why: why.clone(),
             binding: cfg.binding_name(Role::Reviewer, Some(lens))?.to_string(),
+            criteria: lens.criteria.clone(),
+            blocker: lens.blocker.clone(),
+            attack: lens.attack.clone(),
+            stage,
         });
     }
     // What reviewers read: the diff without generated files, unless their
@@ -659,6 +680,34 @@ mod tests {
         // Content in a file header doesn't count as the change.
         let header = dry(&cfg, &change(&["a.txt"], "+++ b/sync.Mutex\n")).unwrap();
         assert!(!ids(&header).contains(&"goroutine-safety"));
+    }
+
+    #[test]
+    fn each_planned_lens_carries_what_its_reviewers_get() {
+        let cfg = example();
+        let plan = dry(&cfg, &change(&["pkg/a.go"], "+\tgo func() {}()\n")).unwrap();
+        let lens = |id: &str| plan.lenses.iter().find(|l| l.id == id).unwrap();
+        let correctness = lens("correctness");
+        let own = cfg.lenses.iter().find(|l| l.id == "correctness").unwrap();
+        assert_eq!(correctness.criteria, own.criteria);
+        assert_eq!(correctness.blocker, own.blocker);
+        assert_eq!(correctness.stage, None);
+        // A built-in lens, which the repository's config doesn't write out,
+        // comes with its criteria too.
+        let elegance = lens(crate::acr::config::ELEGANCE);
+        assert!(!elegance.criteria.is_empty());
+        assert!(elegance.blocker.is_some());
+        // A stage's lens says so: a review that doesn't make its runs can't
+        // cover it.
+        for l in &plan.lenses {
+            let staged = cfg
+                .stages
+                .iter()
+                .any(|s| crate::acr::stages::lens_id(*s) == Some(l.id.as_str()));
+            assert_eq!(l.stage.is_some(), staged, "{}", l.id);
+        }
+        let json = serde_json::to_value(&plan).unwrap();
+        assert!(json["lenses"][0]["criteria"].is_string(), "{json}");
     }
 
     #[test]
