@@ -50,6 +50,24 @@ struct Server {
     /// Requests the client cancelled, which get no reply.
     cancelled: Mutex<HashSet<String>>,
     started: Mutex<bool>,
+    /// When the daemon's version was last asked, and the notice it called
+    /// for: a newer daemon means this session's server is out of date.
+    updated: Mutex<(Option<std::time::Instant>, Option<String>)>,
+}
+
+/// How often a session's server asks the daemon its version.
+const VERSION_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The line a tool result carries when the daemon is newer than this
+/// session's server, which keeps running the binary it started with.
+fn update_notice(daemon: &str) -> Option<String> {
+    let mine = env!("CARGO_PKG_VERSION");
+    crate::compat::later(daemon, mine).then(|| {
+        format!(
+            "({APP_NAME} was updated to {daemon}; restart this session to load it. Its \
+             {APP_NAME} tools are still {mine}'s.)"
+        )
+    })
 }
 
 pub fn run(
@@ -75,6 +93,7 @@ pub fn run(
         waiting: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
         started: Mutex::new(false),
+        updated: Mutex::new((None, None)),
     });
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -148,6 +167,10 @@ impl Server {
                         Ok(text) => (text, false),
                         Err(e) => (format!("{e:#}"), true),
                     };
+                    let text = match server.notice() {
+                        Some(notice) => format!("{text}\n\n{notice}"),
+                        None => text,
+                    };
                     server.reply(
                         &id,
                         json!({"content": [{"type": "text", "text": text}], "isError": is_error}),
@@ -168,6 +191,23 @@ impl Server {
             })),
             (None, _) => {}
         }
+    }
+
+    /// The update notice, if the daemon is newer than this server: asked
+    /// at most once a minute.
+    fn notice(&self) -> Option<String> {
+        let mut updated = self.updated.lock().unwrap();
+        let fresh = updated.0.is_some_and(|at| at.elapsed() < VERSION_CHECK);
+        if !fresh {
+            let daemon = local::call::<Hello>(&self.socket, &Request::Hello)
+                .ok()
+                .map(|h| h.version);
+            *updated = (
+                Some(std::time::Instant::now()),
+                daemon.as_deref().and_then(update_notice),
+            );
+        }
+        updated.1.clone()
     }
 
     fn instructions(&self) -> String {
@@ -933,6 +973,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_session_whose_server_is_behind_the_daemon_is_told_to_restart() {
+        let mine = env!("CARGO_PKG_VERSION");
+        assert_eq!(update_notice(mine), None, "the same version");
+        assert_eq!(update_notice("0.0.1"), None, "an older daemon");
+        let notice = update_notice("99.0.0").unwrap();
+        assert!(
+            notice.contains("was updated to 99.0.0; restart this session"),
+            "{notice}"
+        );
+        assert!(notice.contains(&format!("still {mine}'s")), "{notice}");
+    }
+
+    #[test]
     fn a_bus_tool_cant_mark_a_request_as_a_review() {
         // So a bridge that takes only reviews can't be reached through one.
         for options in [
@@ -998,6 +1051,7 @@ mod tests {
             waiting: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(HashSet::new()),
             started: Mutex::new(false),
+            updated: Mutex::new((None, None)),
         };
         let worker = server(Some("acme")).instructions();
         assert!(worker.contains("You are acme's worker"));

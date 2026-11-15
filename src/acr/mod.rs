@@ -1093,6 +1093,7 @@ fn diagnose(paths: &Paths, repo: &Path, with_tests: bool) -> Vec<Said> {
             out.push(doctor_prompt(paths, bridge, &set));
         }
     }
+    out.extend(doctor_current(paths));
     // Calibration.
     let decided = not_findings(&cfg, &source, repo, "HEAD").unwrap_or_default();
     match (change::name(repo), fingerprint(&cfg, &text, &decided)) {
@@ -1214,6 +1215,33 @@ const TOOLCHAIN_OF: [(&str, &str, &str); 8] = [
 /// Whether reviewers who run things find the repository's toolchain, as
 /// their bridge runs them: tests that pass for you can't run for them
 /// without it.
+/// Whether what setup wrote is this version's, and whether the tools the
+/// bridges run are the versions this one was tested with.
+fn doctor_current(paths: &Paths) -> Vec<Said> {
+    let mut out = Vec::new();
+    let (due, notes) = crate::refresh::due(paths);
+    if due.is_empty() {
+        out.push(Said::Ok(format!(
+            "what setup wrote here is this version's, {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    } else {
+        out.push(Said::Fix(format!(
+            "run `{APP_NAME} setup refresh`: {}",
+            due.join("; ")
+        )));
+    }
+    out.extend(notes.into_iter().map(Said::Note));
+    for (level, line) in crate::compat::bridge_versions(paths) {
+        out.push(match level {
+            crate::compat::Level::Ok => Said::Ok(line),
+            crate::compat::Level::Note => Said::Note(line),
+            crate::compat::Level::Fix => Said::Fix(line),
+        });
+    }
+    out
+}
+
 /// What a bridge takes from acrbus's defaults for its kind, and what from
 /// its own table; or, for one written out in full whose agent acrbus knows,
 /// that naming its kind would let the table say only what's its own.
@@ -3216,6 +3244,16 @@ pub fn active_reviews(paths: &Paths) -> usize {
 }
 
 /// Checks the text of a user's ACR config, as `acrbus setup acr` writes it.
+/// Where the user's ACR config, its bindings, is.
+pub(crate) fn user_config(paths: &Paths) -> PathBuf {
+    user_config_path(paths)
+}
+
+/// `setup refresh`'s change to the bindings: see [`config::refresh_bindings`].
+pub(crate) fn refresh_bindings(text: &str) -> Result<(Option<String>, Vec<String>)> {
+    config::refresh_bindings(text)
+}
+
 pub fn check_user_config(text: &str) -> Result<()> {
     config::parse_user(text).map(|_| ())
 }

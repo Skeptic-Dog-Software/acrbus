@@ -1505,6 +1505,42 @@ for that bridge's runs.
 
 Code: src/setup.rs::service_install; src/setup.rs::wait_for_quiet; src/setup.rs::QUIET_WAIT; src/setup.rs::bridge_install | CLI: acrbus service install --now, acrbus bridge install --now | Tests: an_update_waits_for_runs_and_reviews_under_way
 
+### How do I bring a machine up to a new version?
+
+Put the new binary in place, then run `acrbus setup refresh`. Setup writes
+some files once and keeps them, so without it a newer binary doesn't reach
+them. Refresh moves bridges written out in full to `kind` form, so they take
+the new defaults, and names each setting it dropped that wasn't a default.
+It makes bindings that are exactly a built-in, or what an earlier setup
+wrote, `use` that built-in. It rewrites the plugin, the `/pipe` skill setup
+wrote, the reviewers' confinement and the system prompt. It backs up each
+file it changes, restarts only the bridges whose tables changed, and a
+second run changes nothing. The daemon rewrites the plugin, confinement and
+system prompt itself as it starts, when it runs from where it's installed,
+and logs what a refresh would change.
+
+Code: src/refresh.rs::run; src/refresh.rs::bridges; src/refresh.rs::owned; src/refresh.rs::at_start; src/acr/config.rs::refresh_bindings | CLI: acrbus setup refresh | Tests: an_old_bridge_moves_to_its_kinds_form_keeping_what_is_the_machines, a_refresh_makes_what_setup_wrote_use_the_built_ins_and_leaves_the_rest, owned_files_of_another_version_are_rewritten_and_missing_ones_left_out
+
+### What happens to Claude Code sessions open during an update?
+
+They keep the `acrbus` tools they started with until they restart. Once
+the daemon is newer, each tool result in such a session ends with a line
+saying acrbus was updated and the session should restart. The server isn't
+swapped in place: its calls run on threads of their own, and doing so
+safely mid-session would risk a message or a reply.
+
+Code: src/mcp.rs::update_notice; src/mcp.rs::VERSION_CHECK | Tests: a_session_whose_server_is_behind_the_daemon_is_told_to_restart
+
+### Which versions of Claude Code, pi and node does it work with?
+
+Each release says the versions it was tested with: this one, Claude Code
+2.1.325, pi 1.5.2, and node 22.22.1 and 24.22.0. `acr doctor` and the
+daemon, as it starts, ask each bridge's agent CLI, and node for pi, for its
+version: older than tested is a fix line, newer a note. omp isn't pinned
+yet.
+
+Code: src/compat.rs::TESTED; src/compat.rs::bridge_versions; src/acr/mod.rs::doctor_current | CLI: acrbus acr doctor | Tests: older_than_tested_is_to_fix_and_newer_is_only_said, a_version_is_read_from_what_a_tool_prints
+
 ## You, in the loop
 
 ### When does a review ask me?
@@ -1893,7 +1929,11 @@ all`: the daemon at login, the Claude Code plugin, and headless Claude Code
 as ACR's agent with its token, bindings and service. Each part is its own
 command too, and `setup acr` is safe to run again.
 
-Code: src/setup.rs::service_install; src/setup.rs::claude; src/setup.rs::acr | Config: owner | CLI: acrbus setup all, acrbus setup claude, acrbus setup acr, acrbus service install | Tests: what_setup_acr_writes_is_a_working_config, a_new_acr_bridge_has_your_toolchains_and_downloads_nothing, setup_says_what_an_older_acr_bridge_lacks_and_changes_nothing
+What setup writes runs the installed binary: run from a `.new` waiting to
+be moved in, a `.prev` or a build, it writes the path of the one in place,
+the daemon service's or `~/.local/bin`'s, or refuses.
+
+Code: src/setup.rs::service_install; src/setup.rs::claude; src/setup.rs::acr; src/setup.rs::installed_exe | Config: owner | CLI: acrbus setup all, acrbus setup claude, acrbus setup acr, acrbus service install | Tests: what_setup_acr_writes_is_a_working_config, a_new_acr_bridge_has_your_toolchains_and_downloads_nothing, setup_says_what_an_older_acr_bridge_lacks_and_changes_nothing, what_setup_writes_runs_the_installed_binary_not_a_waiting_or_built_one
 
 ### How do I review my first change?
 

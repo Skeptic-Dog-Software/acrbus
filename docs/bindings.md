@@ -33,6 +33,30 @@ defaults:
 or any other agent CLI works the same way. Without a `configurer`, the
 Judge's binding configures.
 
+A binding can take one acrbus ships with `use:`, so a newer acrbus brings
+newer models and settings to it. It still names its own `agent`, and
+anything else it sets wins:
+
+```yaml
+allowed_bindings:
+  sonnet-high:
+    use: sonnet-high
+    agent: claude-acr@laptop
+  deep-judge:
+    use: opus-judge
+    agent: claude-acr@laptop
+    effort: high
+```
+
+The built-ins are Claude models, as `setup acr` gives each role:
+`haiku-low` (the Sizer), `sonnet-high` (reviewers), `opus-medium` (the
+Orchestrator), `opus-judge` (the Judge) and `opus-configure` (the
+configurer). `setup acr` writes its bindings this way, and `setup refresh`
+rewrites a binding that's exactly a built-in, or what an earlier version's
+setup wrote under its name, to `use` it, keeping the rest of the file and
+saying what changed. Models a provider or gateway names its own way stay
+in your own bindings, written out in full.
+
 Calls have no time budget: a call runs until it answers, and its bridge
 ends one that stalls (`idle_secs`). A call asks its bridge for as long as
 the bridge allows, so a binding's `timeout`, if set, is only a cap no call

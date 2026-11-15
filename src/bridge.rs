@@ -426,7 +426,7 @@ impl Kind {
     }
 
     /// Its defaults, as a bridge table.
-    fn defaults(self) -> &'static str {
+    pub(crate) fn defaults(self) -> &'static str {
         match self {
             Kind::Claude => include_str!("bridges/claude.toml"),
             Kind::Omp => include_str!("bridges/omp.toml"),
@@ -436,7 +436,7 @@ impl Kind {
 
     /// The kind a command is, by its program's name, for a bridge whose
     /// table doesn't say.
-    fn of(command: &Path) -> Option<Kind> {
+    pub(crate) fn of(command: &Path) -> Option<Kind> {
         match command.file_name()?.to_str()? {
             "claude" => Some(Kind::Claude),
             "omp" => Some(Kind::Omp),

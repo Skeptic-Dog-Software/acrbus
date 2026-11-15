@@ -41,6 +41,31 @@ path = "/usr/local/bin:/usr/bin:/bin"
 A bridge isn't a sandbox: the agent runs as you, with what its own settings
 allow.
 
+## Keeping a bridge current
+
+A bridge with `kind` gets its args, options, environment and usage from
+acrbus's defaults for that kind, so a newer acrbus brings newer ones. Its
+table says only what's this machine's, and anything it sets wins over the
+defaults. A table written out in full, as older versions of `setup acr`
+wrote it, keeps what it had. `acrbus setup refresh` moves one whose command
+is Claude Code, omp or pi to `kind` form, after backing up the config:
+- It keeps what's this machine's: owner, command, home, path, working
+  directory, `extra_args`, secrets, `accepts`, `options.workdirs`, a model
+  that isn't the default, `options.models` for a kind with no default
+  models, and any setting the defaults don't have.
+- Flags that its `args` carried and the defaults don't, such as
+  `--settings` for the reviewers' confinement, go to `extra_args`.
+- It drops the rest, and names each key it dropped that wasn't the new
+  default, so you can put back a choice you meant.
+
+Then it restarts that bridge. `acr doctor` says when a refresh is due, and
+names keys in a `kind` table that keep a newer default from it.
+
+acrbus is tested with particular versions of the agent CLIs it drives:
+Claude Code 2.1.325, pi 1.5.2, and node 22.22.1 and 24.22.0. `acr doctor`
+and the daemon, as it starts, ask each bridge's agent for its version. One
+older than tested is something to fix; one newer is only noted.
+
 ## What a bridge runs
 
 `accepts = "review"` runs only an ACR review's calls, and refuses any

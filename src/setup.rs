@@ -32,17 +32,96 @@ fn home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-/// This binary, which the plugin and the service run.
-fn this_exe() -> Result<PathBuf> {
-    let exe = env::current_exe()?.canonicalize()?;
-    if exe.components().any(|c| c.as_os_str() == "target") {
-        eprintln!(
-            "Note: {} looks like a build directory. Install {APP_NAME} first \
-             (`cargo install --path .`) so this points at a binary that stays put.",
-            exe.display()
-        );
+/// Whether a binary at `path` is an installed copy of this program: named
+/// as the program, and outside any build directory. A `.new` waiting to be
+/// moved into place, a `.prev` kept to go back to, or a `target/` build
+/// isn't, and a path to one written into the plugin or a service would
+/// break when it's moved, replaced or cleaned.
+pub(crate) fn is_installed(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == app().name)
+        && !path.components().any(|c| c.as_os_str() == "target")
+}
+
+/// The binary the daemon's service runs, from its systemd unit or launchd
+/// plist, if one is installed.
+fn service_exe(paths: &Paths) -> Option<PathBuf> {
+    if let Ok(unit) = unit_path(&daemon_unit(paths))
+        && let Ok(text) = fs::read_to_string(unit)
+        && let Some(exe) = unit_exe(&text)
+    {
+        return Some(exe);
     }
-    Ok(exe)
+    let plist = fs::read_to_string(plist_path(&daemon_label(paths)).ok()?).ok()?;
+    plist_exe(&plist)
+}
+
+/// The program a unit's `ExecStart` runs: its first word, quoted as setup
+/// writes it or not.
+fn unit_exe(text: &str) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))?
+        .trim();
+    let first = match line.strip_prefix('"') {
+        Some(rest) => rest.split('"').next()?,
+        None => line.split_whitespace().next()?,
+    };
+    (!first.is_empty()).then(|| PathBuf::from(first.replace("\\\\", "\\")))
+}
+
+/// The program a plist's `ProgramArguments` runs: its first string.
+fn plist_exe(text: &str) -> Option<PathBuf> {
+    let after = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")?;
+    let raw = &after[start..start + end];
+    let unxml = raw
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    Some(PathBuf::from(unxml))
+}
+
+/// The installed binary: this one if it is, or else the one the daemon's
+/// service runs, or the program in `~/.local/bin` or `~/.cargo/bin`.
+/// Everything setup writes, the plugin and the services, runs this path, so
+/// a binary run from where it waits or is built writes the one in place.
+pub fn installed_exe(paths: &Paths) -> Result<PathBuf> {
+    let exe = env::current_exe()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let home = home().ok();
+    installed_from(&exe, service_exe(paths), home.as_deref())
+}
+
+fn installed_from(exe: &Path, service: Option<PathBuf>, home: Option<&Path>) -> Result<PathBuf> {
+    if is_installed(exe) {
+        return Ok(exe.to_path_buf());
+    }
+    let name = app().name;
+    let candidates = service.into_iter().chain(home.into_iter().flat_map(|h| {
+        [
+            h.join(".local/bin").join(name),
+            h.join(".cargo/bin").join(name),
+        ]
+    }));
+    for candidate in candidates {
+        if is_installed(&candidate) && candidate.is_file() {
+            eprintln!(
+                "Note: {} isn't where {APP_NAME} is installed, so what setup writes runs {}.",
+                exe.display(),
+                candidate.display()
+            );
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "{} isn't an installed {APP_NAME}, and there's none to point at instead: install it \
+         as ~/.local/bin/{name} (or with `cargo install --path .`), then run setup from there, \
+         so the plugin and services run a binary that stays put",
+        exe.display()
+    )
 }
 
 fn write(path: &Path, text: &str) -> Result<()> {
@@ -59,20 +138,77 @@ fn pretty(v: &serde_json::Value) -> String {
 /// Writes the Claude Code plugin: the MCP server, and the hooks that push
 /// messages into sessions. It lives in a local marketplace, so Claude Code
 /// loads it in place.
-pub fn claude(install: bool) -> Result<()> {
-    let exe = this_exe()?;
-    let exe = exe.to_string_lossy();
+pub fn claude(paths: &Paths, install: bool) -> Result<()> {
+    let exe = installed_exe(paths)?;
+    let plugin = write_plugin(&exe)?;
+    println!("Wrote the Claude Code plugin to {}", plugin.display());
+    install_pipe_skill()?;
+    let (root, name) = (plugin_root()?, app().name);
+
+    if !install {
+        println!(
+            "To install it:\n  claude plugin marketplace add {}\n  claude plugin install {APP_NAME}@{APP_NAME}",
+            root.display()
+        );
+        return Ok(());
+    }
+
+    let claude = find_claude()?;
+    let added = Command::new(&claude)
+        .args(["plugin", "marketplace", "add"])
+        .arg(&root)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("running {}", claude.display()))?;
+    let said = String::from_utf8_lossy(&added.stdout).to_string()
+        + &String::from_utf8_lossy(&added.stderr);
+    if !added.status.success() && !said.contains("already") {
+        bail!("`claude plugin marketplace add` failed: {}", said.trim());
+    }
+    let installed = Command::new(&claude)
+        .args(["plugin", "install"])
+        .arg(format!("{name}@{name}"))
+        .stdin(Stdio::null())
+        .output()?;
+    let said = String::from_utf8_lossy(&installed.stdout).to_string()
+        + &String::from_utf8_lossy(&installed.stderr);
+    if !installed.status.success() && !said.contains("already") {
+        bail!("`claude plugin install` failed: {}", said.trim());
+    }
+    println!(
+        "Installed the {APP_NAME} plugin. Sessions started from now on load it. Restart \
+         sessions that are already open: /reload-plugins rereads the plugin's files, but \
+         keeps a {APP_NAME} server that's already running on the old version."
+    );
+    Ok(())
+}
+
+/// The local marketplace the plugin lives in, which Claude Code loads in
+/// place: `<data>/<app>/claude`.
+pub(crate) fn plugin_root() -> Result<PathBuf> {
     let data = env::var_os("XDG_DATA_HOME")
         .filter(|d| !d.is_empty())
         .map_or_else(
             || home().map(|h| h.join(".local/share")),
             |d| Ok(PathBuf::from(d)),
         )?;
+    Ok(data.join(app().name).join("claude"))
+}
+
+/// The plugin's folder in it.
+pub(crate) fn plugin_dir() -> Result<PathBuf> {
+    Ok(plugin_root()?.join(app().name))
+}
+
+/// Writes every file of the plugin, running `exe`: its marketplace entry,
+/// manifest, MCP server, hooks, the /pipe command and the skills. Returns
+/// its folder.
+pub(crate) fn write_plugin(exe: &Path) -> Result<PathBuf> {
+    let exe = exe.to_string_lossy();
     let name = app().name;
-    let root = data.join(name).join("claude");
+    let root = plugin_root()?;
     let plugin = root.join(name);
     let description = app().about;
-
     write(
         &root.join(".claude-plugin/marketplace.json"),
         &pretty(&json!({
@@ -140,44 +276,7 @@ pub fn claude(install: bool) -> Result<()> {
         &plugin.join("skills/review/SKILL.md"),
         include_str!("../plugin/skills/review/SKILL.md"),
     )?;
-    println!("Wrote the Claude Code plugin to {}", plugin.display());
-    install_pipe_skill()?;
-
-    if !install {
-        println!(
-            "To install it:\n  claude plugin marketplace add {}\n  claude plugin install {APP_NAME}@{APP_NAME}",
-            root.display()
-        );
-        return Ok(());
-    }
-    let claude = find_claude()?;
-    let added = Command::new(&claude)
-        .args(["plugin", "marketplace", "add"])
-        .arg(&root)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("running {}", claude.display()))?;
-    let said = String::from_utf8_lossy(&added.stdout).to_string()
-        + &String::from_utf8_lossy(&added.stderr);
-    if !added.status.success() && !said.contains("already") {
-        bail!("`claude plugin marketplace add` failed: {}", said.trim());
-    }
-    let installed = Command::new(&claude)
-        .args(["plugin", "install"])
-        .arg(format!("{name}@{name}"))
-        .stdin(Stdio::null())
-        .output()?;
-    let said = String::from_utf8_lossy(&installed.stdout).to_string()
-        + &String::from_utf8_lossy(&installed.stderr);
-    if !installed.status.success() && !said.contains("already") {
-        bail!("`claude plugin install` failed: {}", said.trim());
-    }
-    println!(
-        "Installed the {APP_NAME} plugin. Sessions started from now on load it. Restart \
-         sessions that are already open: /reload-plugins rereads the plugin's files, but \
-         keeps a {APP_NAME} server that's already running on the old version."
-    );
-    Ok(())
+    Ok(plugin)
 }
 
 const PIPE: &str = include_str!("../plugin/commands/pipe.md");
@@ -212,24 +311,54 @@ fn pipe_skill() -> String {
     format!("---\nname: pipe\ndisable-model-invocation: true\n{front}\n---\n{mark}\n{body}")
 }
 
-fn install_pipe_skill() -> Result<()> {
+/// Where the personal `/pipe` skill goes.
+pub(crate) fn pipe_skill_path() -> Result<PathBuf> {
     let config = env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|d| !d.is_empty())
         .map_or_else(
             || home().map(|h| h.join(".claude")),
             |d| Ok(PathBuf::from(d)),
         )?;
-    let path = config.join("skills/pipe/SKILL.md");
-    if let Ok(existing) = fs::read_to_string(&path)
-        && !existing.contains(PIPE_MARK_END)
-    {
+    Ok(config.join("skills/pipe/SKILL.md"))
+}
+
+/// What's at the personal `/pipe` skill's place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PipeSkill {
+    Absent,
+    /// Written by setup: current, or from another version.
+    Ours {
+        current: bool,
+    },
+    /// Someone else's, which setup leaves alone.
+    Theirs,
+}
+
+pub(crate) fn pipe_skill_state(path: &Path) -> PipeSkill {
+    match fs::read_to_string(path) {
+        Err(_) => PipeSkill::Absent,
+        Ok(text) if !text.contains(PIPE_MARK_END) => PipeSkill::Theirs,
+        Ok(text) => PipeSkill::Ours {
+            current: text == pipe_skill(),
+        },
+    }
+}
+
+/// Writes the personal `/pipe` skill, the version this binary has.
+pub(crate) fn write_pipe_skill(path: &Path) -> Result<()> {
+    write(path, &pipe_skill())
+}
+
+fn install_pipe_skill() -> Result<()> {
+    let path = pipe_skill_path()?;
+    if pipe_skill_state(&path) == PipeSkill::Theirs {
         println!(
             "Left {} alone, since {APP_NAME} didn't write it. /{APP_NAME}:pipe works either way.",
             path.display()
         );
         return Ok(());
     }
-    write(&path, &pipe_skill())?;
+    write_pipe_skill(&path)?;
     println!("Wrote {}, so /pipe works in every session.", path.display());
     Ok(())
 }
@@ -357,9 +486,10 @@ impl UserUnit<'_> {
         )
     }
 
-    /// Writes the unit and starts it, replacing a running one.
-    fn start(&self) -> Result<String> {
-        write(&unit_path(self.name)?, &self.text(&this_exe()?))?;
+    /// Writes the unit, running `exe`, and starts it, replacing a running
+    /// one.
+    fn start(&self, exe: &Path) -> Result<String> {
+        write(&unit_path(self.name)?, &self.text(exe))?;
         let unit = format!("{}.service", self.name);
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", &unit])?;
@@ -493,9 +623,9 @@ impl LaunchAgent<'_> {
 
     /// Writes the plist and starts the job, replacing a running one.
     /// Returns the launchd domain it's in.
-    fn start(&self) -> Result<String> {
+    fn start(&self, exe: &Path) -> Result<String> {
         let path = plist_path(self.label)?;
-        write(&path, &self.plist(&this_exe()?))?;
+        write(&path, &self.plist(exe))?;
         let path_str = path.to_string_lossy().to_string();
         // A GUI session's domain when there is one; over ssh with nobody
         // logged in at the screen, the user domain.
@@ -599,6 +729,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
     let bridges: Vec<String> = crate::config::Config::load(&paths.config)
         .map(|c| c.bridges.keys().cloned().collect())
         .unwrap_or_default();
+    let exe = installed_exe(paths)?;
     wait_for_quiet(paths, &bridges, true, now)?;
     let (label, unit) = (daemon_label(paths), daemon_unit(paths));
     let job = match manager {
@@ -610,7 +741,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
                 throttle: 10,
                 exit_timeout: None,
             }
-            .start()?;
+            .start(&exe)?;
             format!("launchd {domain}/{label}")
         }
         Manager::Systemd => UserUnit {
@@ -619,7 +750,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
             args: &["daemon"],
             after: None,
         }
-        .start()?,
+        .start(&exe)?,
     };
     let log = match manager {
         Manager::Launchd => paths.log().display().to_string(),
@@ -674,6 +805,7 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
     )?;
     paths.make_state_dir()?;
     let settings = bridge::load(paths, agent)?;
+    let exe = installed_exe(paths)?;
     wait_for_quiet(paths, &[agent.to_string()], false, now)?;
     let dir = bridge::state_dir(paths, agent);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -690,7 +822,7 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
                 // Long enough for its runs' grace period and to stop what's left.
                 exit_timeout: Some(settings.shutdown_grace_secs + 10),
             }
-            .start()?;
+            .start(&exe)?;
             (
                 format!("launchd {domain}/{label}"),
                 log.display().to_string(),
@@ -706,7 +838,7 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
                 args: &["bridge", "run", agent],
                 after: Some(&daemon),
             }
-            .start()?;
+            .start(&exe)?;
             (job, format!("journalctl --user -u {name}"))
         }
     };
@@ -815,7 +947,7 @@ pub fn gives_system_prompt(args: &[String], file: &Path) -> bool {
 /// Its commands aren't confined. Claude Code's sandbox would do that, but
 /// with the read block it stops a session that signs in with a token, as
 /// every reviewer here does, before its first request.
-fn confine_settings() -> String {
+pub(crate) fn confine_settings() -> String {
     let settings = serde_json::json!({
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
@@ -1036,6 +1168,47 @@ fn confine_bridge(doc: &mut toml_edit::DocumentMut, confine: &Path) -> Result<bo
     Ok(true)
 }
 
+/// Bindings this version ships, by name: Claude models sized to each role,
+/// as `setup acr` gives them. A binding in `allowed_bindings` that says
+/// `use: <name>` takes one, with its own `agent` and anything it changes, so
+/// a newer binary brings newer models and settings to it. Models a provider
+/// names its own way, through a gateway say, stay in your own bindings.
+pub(crate) const BUILTIN_BINDINGS: &[(&str, &str)] = &[
+    (
+        "haiku-low",
+        "{model: claude-haiku-5-5, effort: low, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "sonnet-high",
+        "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob, Bash, Write, Edit], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-medium",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "opus-judge",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-configure",
+        "{model: claude-opus-5-5, effort: max, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+];
+
+/// What an earlier version's `setup acr` wrote under a built-in's name,
+/// which `setup refresh` takes as that built-in.
+pub(crate) const EARLIER_BUILTINS: &[(&str, &str)] = &[(
+    "sonnet-high",
+    "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob], timeout: 14400, \
+     subscription: true}",
+)];
+
 /// The ACR config `acrbus setup acr` writes, if there's none: Anthropic
 /// models sized to each role, all on this machine's agent.
 fn acr_bindings(machine: &str) -> String {
@@ -1045,44 +1218,26 @@ fn acr_bindings(machine: &str) -> String {
 # {agent}, headless Claude Code on your subscription, so they count in
 # tokens. ACR runs on one machine. Reviewers each work in a copy of the
 # repository of their own, where they run and break things, and nothing they
-# do reaches it. Each timeout is 4 hours, a cap no review should ever reach.
+# do reaches it. Each binding `use`s one {APP_NAME} ships, so a newer {APP_NAME}
+# brings newer models and settings to it; anything you set beside `use`
+# wins. Each timeout is 4 hours, a cap no review should ever reach.
 version: 1
 allowed_bindings:
   haiku-low:       # the Sizer: one quick call to pick the tier
+    use: haiku-low
     agent: {agent}
-    model: claude-haiku-5-5
-    effort: low
-    tools: [Read, Grep, Glob]
-    timeout: 14400
-    subscription: true
   sonnet-high:     # reviewers: most of the calls; they attack, and run probes
+    use: sonnet-high
     agent: {agent}
-    model: claude-sonnet-5-5
-    effort: high
-    tools: [Read, Grep, Glob, Bash, Write, Edit]
-    timeout: 14400
-    subscription: true
   opus-medium:     # the Orchestrator: few calls; without writes, fixes escalate
+    use: opus-medium
     agent: {agent}
-    model: claude-opus-5-5
-    effort: medium
-    tools: [Read, Grep, Glob]
-    timeout: 14400
-    subscription: true
   opus-judge:      # the Judge: checks claims, and may run scripts in its scratch space
+    use: opus-judge
     agent: {agent}
-    model: claude-opus-5-5
-    effort: medium
-    tools: [Read, Grep, Glob, Bash, Write]
-    timeout: 14400
-    subscription: true
   opus-configure:  # the configurer: reviews a whole repository to configure its review
+    use: opus-configure
     agent: {agent}
-    model: claude-opus-5-5
-    effort: max
-    tools: [Read, Grep, Glob, Bash, Write]
-    timeout: 14400
-    subscription: true
 defaults:
   bindings:
     sizer: haiku-low
@@ -1217,7 +1372,7 @@ fn make_token(claude: &Path, token: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
+pub(crate) fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
     let text = match fs::read_to_string(&paths.config) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1227,7 +1382,7 @@ fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
         .with_context(|| format!("in {}", paths.config.display()))
 }
 
-fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
+pub(crate) fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
     // Checked before it's written, so a mistake never lands.
     let text = doc.to_string();
     toml::from_str::<crate::config::Config>(&text).context("the config it would write")?;
@@ -1545,6 +1700,77 @@ pub fn grayboard_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_setup_writes_runs_the_installed_binary_not_a_waiting_or_built_one() {
+        let name = app().name;
+        let dir = std::env::temp_dir().join(format!("tb-installed-{}", crate::util::new_id()));
+        let bin = dir.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let installed = bin.join(name);
+        fs::write(&installed, "").unwrap();
+        // The installed one itself.
+        assert_eq!(
+            installed_from(&installed, None, Some(&dir)).unwrap(),
+            installed
+        );
+        // One waiting to be moved in, one kept to go back to, and a build all
+        // write the installed one.
+        for waiting in [
+            bin.join(format!("{name}.new")),
+            bin.join(format!("{name}.prev")),
+            dir.join(format!("src/target/release/{name}")),
+        ] {
+            assert_eq!(
+                installed_from(&waiting, None, Some(&dir)).unwrap(),
+                installed
+            );
+        }
+        // The service's binary wins over ~/.local/bin.
+        let service = dir.join(format!("opt/{name}"));
+        fs::create_dir_all(service.parent().unwrap()).unwrap();
+        fs::write(&service, "").unwrap();
+        let waiting = bin.join(format!("{name}.new"));
+        assert_eq!(
+            installed_from(&waiting, Some(service.clone()), Some(&dir)).unwrap(),
+            service
+        );
+        // With none installed, it says so rather than write a path that moves.
+        let e = installed_from(&waiting, None, Some(&dir.join("elsewhere"))).unwrap_err();
+        assert!(format!("{e:#}").contains("isn't an installed"), "{e:#}");
+    }
+
+    #[test]
+    fn the_services_binary_is_read_from_its_unit_or_plist() {
+        let unit = UserUnit {
+            name: "x",
+            description: "x",
+            args: &["daemon"],
+            after: None,
+        }
+        .text(Path::new("/home/me/.local/bin/my app"));
+        assert_eq!(
+            unit_exe(&unit),
+            Some(PathBuf::from("/home/me/.local/bin/my app"))
+        );
+        assert_eq!(
+            unit_exe("ExecStart=/usr/bin/x daemon\n"),
+            Some(PathBuf::from("/usr/bin/x"))
+        );
+        let log = PathBuf::from("/tmp/log");
+        let plist = LaunchAgent {
+            label: "l",
+            args: &["daemon"],
+            log: &log,
+            throttle: 10,
+            exit_timeout: None,
+        }
+        .plist(Path::new("/Users/me/.local/bin/a&b"));
+        assert_eq!(
+            plist_exe(&plist),
+            Some(PathBuf::from("/Users/me/.local/bin/a&b"))
+        );
+    }
 
     #[test]
     fn signing_in_to_grayboard_pins_this_machines_name() {
