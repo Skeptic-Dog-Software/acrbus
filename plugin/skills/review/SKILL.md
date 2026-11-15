@@ -23,8 +23,8 @@ Gather all of this with commands, not with a model.
 - **The repository's own checks:** `.review/checks.md`, or a "Review checks" section in CONTRIBUTING.md. Add them to the standing checks, and pass on any non-issues the file lists.
 - **The repository's lenses,** when it has an acrbus review config: `<repository>.yaml` in the `acr` folder beside acrbus's `config.toml`, or `.acr/config.yaml` in the repository at the base.
   - `acrbus acr plan --base <base> --head <head> --json` lists the lenses whose triggers the change matches, with no model calls. If it can't run, match each lens's `triggers` against the diff yourself.
-  - From the config, take each listed lens's `id`, `criteria` and `blocker`.
-  - Leave out lenses with no criteria there, such as the stage lenses `tests`, `claims` and `probes`: they need runs this review doesn't make.
+  - Each listed lens carries its `id`, `criteria`, `blocker` and `attack`, built-in lenses such as `elegance` included. Take them from there.
+  - Leave out a lens that names a `stage`, such as `tests` or `probes`: it judges runs this review doesn't make. Say which you left out.
 - **A context pack:** what reviewers would otherwise spend tool calls finding. At the head:
   - for each function, type or constant the change adds or changes, its callers and references (`git grep -n -w <name>`);
   - where the change adds a case to a message kind, enum or switch, every other place that handles the same type;
@@ -42,12 +42,12 @@ Call both through bridge agents, so each starts fresh, holds only what you send 
 
 Give each only its read-only tools with `--tools`, and add `--verbose` so each call prints what it used, for the report. Use the bindings your user names instead, when they name them. If either can't be reached, ask your user whether to go on with one, and say so in the report. Don't give either reviewer your reasoning or this conversation.
 
-Give both the same brief, with the parts they share first, in this order: the role, the checks and lenses, the context pack, the diff, then the PR's claims.
+Give both the same brief, with the parts they share first, in this order: the role, the checks and lenses, the context pack, the diff, then the PR's claims. A brief over 64 KB goes to the bridge as an attachment by itself, so pass it in one file.
 
 - **Role:** "You are the reviewer for this change. Find what is wrong."
 - **The checks below,** plus the repository's own.
 - **The lenses:** each one's id, what's wrong in it (`criteria`) and what blocks (`blocker`).
-- **A budget for reading:** at most 8 read-only tool calls, only to confirm or rule out a specific suspicion. The pack and the diff are the review's main input.
+- **Reading:** a few read-only tool calls, only to confirm or rule out a specific suspicion. The pack and the diff are the review's main input. Nothing enforces a number, so the report gives the calls each made.
 - **Answer every lens and every check,** with findings, or with what you checked and found sound.
 - **A defect that depends on state counts** when you give the sequence of events that triggers it.
 - **The answer:** a list of findings. Each has the lens and the check it falls under, or "other"; blocker or non-blocker; `file:line`; the evidence; and whether it's a fact or a judgment call. No findings is a valid answer.
@@ -55,7 +55,7 @@ Give both the same brief, with the parts they share first, in this order: the ro
 ### Deep lenses
 
 A lens your user names as deep for this review also gets a reviewer of its own: one more fresh `acrbus call` on the whole change.
-- It gets the same brief, with that lens's `attack` added at the end, so the cache serves everything before it, and the same 8-call budget.
+- It gets the same brief, with that lens's `attack` added at the end, so the cache serves everything before it, and the same guidance on reading.
 - It runs on the model your user names, or else GLM on high. The other family checks its findings.
 - At most two deep lenses per review, unless your user agrees to more after seeing the extra calls.
 
@@ -87,8 +87,8 @@ A lens your user names as deep for this review also gets a reviewer of its own: 
 ## 5. Labels on the PR
 
 When the change is a PR and the repository's config sets `integrations.labels`, label each lens this review covered:
-- **waiting** (such as `wait:{lens}`): a finding in it that your user ruled real still blocks.
-- **confirmed** (such as `confirmed:{lens}`): none does. A ticket or a ruling of not a defect doesn't block.
+- **waiting** (such as `wait:{lens}`): your user ruled a finding in it real, blocker or not. It stays waiting until a review after their fix finds it fixed.
+- **confirmed** (such as `confirmed:{lens}`): no finding in it is ruled real. A ticket or a ruling of not a defect leaves it confirmed.
 - **Neither:** a lens left out, or one neither reviewer answered. Never confirm a lens nobody checked.
 - **ready** or **not-ready:** not-ready while any lens is waiting. When every lens covered is confirmed, it's ready if none was left out. If some were, ask your user whether to mark it ready, naming them.
 
@@ -100,7 +100,7 @@ Show your user the labels. Once they agree, add them and take off this config's 
 
 Give your user:
 - the change reviewed;
-- what was found, by check, with who found each finding and the checker's verdict;
+- what was found, by lens and by check, with who found each finding and the checker's verdict, and where the reviewer and the checker disagree on whether it blocks;
 - each finding's verdict (real, ticket, not a defect), and who gave it;
 - each lens's outcome (waiting, confirmed, or not checked, and why), and the labels set;
 - for a review after fixes, which earlier blockers still stand;
