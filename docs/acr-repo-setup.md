@@ -763,7 +763,7 @@ commits.
 
 - **Export to stable text.** Two exports of the same version must match,
   or every diff is noise. Use a fixed order, such as frames and then what's
-  in them, and leave out positions, colours and ids that change from one
+  in them, and leave out positions, colors and ids that change from one
   export to the next.
 - **Configure the carrier like any repository.** Its config is
   `~/.config/acrbus/acr/<name>.yaml`, and one carrier serves every piece of

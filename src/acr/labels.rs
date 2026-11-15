@@ -400,7 +400,7 @@ pub fn create_missing(repo: &Path, cfg: &Config) -> Result<Vec<String>> {
     Ok(made)
 }
 
-/// The labels to create, each with its description and colour, the way
+/// The labels to create, each with its description and color, the way
 /// acrbus has always described them.
 fn to_create(
     names: &Labels,
@@ -440,7 +440,7 @@ fn to_create(
             add(
                 p.replace("{lens}", lens),
                 format!("ACR: the {lens} lens's latest round found no blocker"),
-                "0e8a16",
+                "1d76db",
             );
         }
     }
