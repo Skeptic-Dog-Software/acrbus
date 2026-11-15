@@ -17,7 +17,7 @@ Two reviewers from different model families each read the whole change against a
 
 Gather all of this with commands, not with a model.
 
-- **Base and head:** the PR's base branch, or what your user names. With no head, review the working tree against the base.
+- **Base and head:** the PR's base branch, or what your user names. Fetch first (`git fetch origin`) and use the remote's branch, `origin/<base>`, since a local branch can be far behind and turn a small change into a large one. With no head, review the working tree against the base.
 - **The whole diff:** `git diff <base>...<head>`, or `git diff <base>` for a working tree.
 - **The change's claims:** the PR's title and description, if there is one (`gh pr view <n>`). They're claims to check, not to trust.
 - **The repository's own checks:** `.review/checks.md`, or a "Review checks" section in CONTRIBUTING.md. Add them to the standing checks, and pass on any non-issues the file lists.
