@@ -273,6 +273,11 @@ pub(crate) fn write_plugin(exe: &Path) -> Result<PathBuf> {
     )?;
     // A lighter review: two fresh reviewers from different model families on the whole change.
     write(&plugin.join("skills/review/SKILL.md"), &review_skill(name))?;
+    // Scores a finished review against defects known some other way.
+    write(
+        &plugin.join("skills/review-score/SKILL.md"),
+        include_str!("../plugin/skills/review-score/SKILL.md"),
+    )?;
     Ok(plugin)
 }
 
