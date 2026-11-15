@@ -28,9 +28,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// installed binary the plugin runs; without one, the plugin isn't touched.
 pub fn owned(paths: &Paths, exe: Option<&Path>, apply: bool) -> Result<Vec<String>> {
     let mut out = Vec::new();
+    // The plugin and the /pipe skill are the user's, not an instance's: a
+    // second home, a test's say, leaves them to the default one.
+    let per_user = Paths::default_state().ok().as_deref() == Some(paths.state.as_path());
     let plugin = setup::plugin_dir()?;
     let manifest = plugin.join(".claude-plugin/plugin.json");
-    if let Ok(text) = fs::read_to_string(&manifest) {
+    if let Some(text) = per_user
+        .then(|| fs::read_to_string(&manifest).ok())
+        .flatten()
+    {
         let was = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| v["version"].as_str().map(str::to_string))
@@ -71,7 +77,7 @@ pub fn owned(paths: &Paths, exe: Option<&Path>, apply: bool) -> Result<Vec<Strin
         }
     }
     let pipe = setup::pipe_skill_path()?;
-    if setup::pipe_skill_state(&pipe) == (setup::PipeSkill::Ours { current: false }) {
+    if per_user && setup::pipe_skill_state(&pipe) == (setup::PipeSkill::Ours { current: false }) {
         if apply {
             setup::write_pipe_skill(&pipe)?;
             out.push(format!("rewrote the /pipe skill, {}", pipe.display()));
@@ -377,9 +383,226 @@ fn order_of(key: &str) -> usize {
     .unwrap_or(100)
 }
 
+// ---------------------------------------------------------------- refresh
+
+/// A file's backup beside it, `<name>.<ms>.bak`, made before it's changed.
+fn backup(file: &Path) -> Result<PathBuf> {
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let to = file.with_file_name(format!("{name}.{}.bak", crate::util::now_ms()));
+    fs::copy(file, &to).with_context(|| format!("backing up {}", file.display()))?;
+    Ok(to)
+}
+
+/// What's out of date here: the bridges and bindings `setup refresh` would
+/// change, and the owned files the daemon would rewrite. Then notes: keys in
+/// bridges that keep newer defaults from them.
+pub fn due(paths: &Paths) -> (Vec<String>, Vec<String>) {
+    let mut due = Vec::new();
+    let mut notes = Vec::new();
+    if let Ok(mut doc) = setup::read_config(paths)
+        && let Ok((moved, shadowing)) = bridges(&mut doc)
+    {
+        for m in moved {
+            due.push(format!(
+                "[bridges.{}] is written out in full, so newer defaults for {} don't reach it",
+                m.agent, m.kind
+            ));
+        }
+        notes.extend(shadowing);
+    }
+    if let Ok(text) = fs::read_to_string(crate::acr::user_config(paths))
+        && let Ok((Some(_), lines)) = crate::acr::refresh_bindings(&text)
+    {
+        let n = lines.iter().filter(|l| l.contains(" now uses ")).count();
+        due.push(format!(
+            "{n} binding(s) in your acr.yaml can use a built-in binding"
+        ));
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .filter(|e| setup::is_installed(e));
+    if let Ok(lines) = owned(paths, exe.as_deref(), false) {
+        due.extend(lines);
+    }
+    (due, notes)
+}
+
+/// What the daemon does as it starts: rewrites the owned files that are
+/// another version's, and says what `setup refresh` would change and which
+/// bridges' tools are older than tested. Nothing, for a daemon run from a
+/// build rather than where it's installed.
+pub fn at_start(paths: &Paths) -> Vec<String> {
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .filter(|e| setup::is_installed(e))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match owned(paths, Some(&exe), true) {
+        Ok(lines) => out.extend(lines),
+        Err(e) => out.push(format!("couldn't refresh what setup wrote: {e:#}")),
+    }
+    let (due, _) = due(paths);
+    if !due.is_empty() {
+        out.push(format!(
+            "run `{APP_NAME} setup refresh`: {}",
+            due.join("; ")
+        ));
+    }
+    for (level, line) in crate::compat::bridge_versions(paths) {
+        if level != crate::compat::Level::Ok {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// `setup refresh`: brings what setup wrote here up to this version, backing
+/// up each file it changes, and restarts the bridges whose tables changed.
+/// Running it again changes nothing.
+pub fn run(paths: &Paths) -> Result<()> {
+    let mut said: Vec<String> = Vec::new();
+    let mut changed = Vec::new();
+    let mut doc = setup::read_config(paths)?;
+    let (moved, shadowing) = bridges(&mut doc)?;
+    if !moved.is_empty() {
+        let kept = backup(&paths.config)?;
+        setup::write_config(paths, &doc)?;
+        for m in &moved {
+            let mut line = format!(
+                "moved [bridges.{}] to kind = \"{}\": it now takes {APP_NAME}'s defaults",
+                m.agent, m.kind
+            );
+            if !m.carried.is_empty() {
+                line.push_str(&format!(
+                    "; its args' {} went to extra_args",
+                    m.carried.join(", ")
+                ));
+            }
+            if !m.dropped.is_empty() {
+                line.push_str(&format!(
+                    "; it dropped {}, which differed from the defaults: put back any you meant",
+                    m.dropped.join(", ")
+                ));
+            }
+            said.push(line);
+            changed.push(m.agent.clone());
+        }
+        said.push(format!("the config before is kept as {}", kept.display()));
+    }
+    let user = crate::acr::user_config(paths);
+    if let Ok(text) = fs::read_to_string(&user) {
+        let (new, lines) = crate::acr::refresh_bindings(&text)?;
+        if let Some(new) = new {
+            let kept = backup(&user)?;
+            fs::write(&user, new).with_context(|| format!("writing {}", user.display()))?;
+            said.extend(lines);
+            said.push(format!(
+                "the bindings before are kept as {}",
+                kept.display()
+            ));
+        } else {
+            said.extend(lines);
+        }
+    }
+    let exe = match setup::installed_exe(paths) {
+        Ok(exe) => Some(exe),
+        Err(e) => {
+            said.push(format!("left the plugin as it is: {e:#}"));
+            None
+        }
+    };
+    said.extend(owned(paths, exe.as_deref(), true)?);
+    let nothing = said.is_empty();
+    for line in &said {
+        println!("{line}.");
+    }
+    for agent in &changed {
+        if setup::bridge_job(paths, agent).is_some() {
+            setup::bridge_install(paths, agent, false)?;
+        } else {
+            println!("The {agent} bridge isn't a service here: restart it to load its table.");
+        }
+    }
+    for line in &shadowing {
+        println!("Note: {line}.");
+    }
+    for (level, line) in crate::compat::bridge_versions(paths) {
+        match level {
+            crate::compat::Level::Ok => {}
+            crate::compat::Level::Note => println!("Note: {line}."),
+            crate::compat::Level::Fix => println!("Fix: {line}."),
+        }
+    }
+    if nothing {
+        println!("Everything setup wrote here is this version's: nothing to refresh.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths() -> Paths {
+        let dir = std::env::temp_dir().join(format!("tb-refresh-{}", crate::util::new_id()));
+        fs::create_dir_all(dir.join("acr")).unwrap();
+        Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        }
+    }
+
+    #[test]
+    fn owned_files_of_another_version_are_rewritten_and_missing_ones_left_out() {
+        let p = paths();
+        // Nothing setup made yet: nothing to rewrite, nothing made.
+        assert!(owned(&p, None, true).unwrap().is_empty());
+        let acr = p.config.parent().unwrap().join("acr");
+        fs::write(acr.join(setup::CONFINE_FILE), "{}\n").unwrap();
+        fs::write(setup::system_prompt_path(&p), "an older prompt\n").unwrap();
+        let due = owned(&p, None, false).unwrap();
+        assert_eq!(due.len(), 2, "{due:?}");
+        assert!(due[0].contains("reviewers' confinement") && due[0].contains("another version's"));
+        // Saying what's due changes nothing.
+        assert_eq!(
+            fs::read_to_string(acr.join(setup::CONFINE_FILE)).unwrap(),
+            "{}\n"
+        );
+        let done = owned(&p, None, true).unwrap();
+        assert!(
+            done[0].starts_with("rewrote the reviewers' confinement"),
+            "{done:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(acr.join(setup::CONFINE_FILE)).unwrap(),
+            setup::confine_settings()
+        );
+        assert_eq!(
+            fs::read_to_string(setup::system_prompt_path(&p)).unwrap(),
+            setup::SYSTEM_PROMPT
+        );
+        assert!(
+            owned(&p, None, true).unwrap().is_empty(),
+            "a second time, nothing"
+        );
+    }
+
+    #[test]
+    fn whats_due_names_a_bridge_written_out_in_full() {
+        let p = paths();
+        fs::write(&p.config, OLD_CLAUDE).unwrap();
+        let (due, _) = due(&p);
+        assert!(
+            due.iter()
+                .any(|d| d.contains("[bridges.claude-acr] is written out in full")),
+            "{due:?}"
+        );
+    }
 
     /// A Claude Code bridge as `setup acr` wrote one out in full, before
     /// bridges named their kind: its args carry the confinement.

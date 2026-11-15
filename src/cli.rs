@@ -256,6 +256,12 @@ enum SetupApp {
         #[arg(long = "repo", value_name = "PATH")]
         repos: Vec<PathBuf>,
     },
+    /// After a new binary is in place: bring what setup wrote up to it.
+    /// Bridges written out in full take its defaults, bindings that are
+    /// built-ins use them, and the plugin, confinement and system prompt are
+    /// this version's. Each file it changes is backed up first, and it
+    /// restarts only the bridges whose tables changed. Safe to run again.
+    Refresh,
 }
 
 #[derive(Subcommand)]
@@ -459,6 +465,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 setup::claude(&paths, true)?;
                 setup::acr(&paths, &repos)?;
             }
+            SetupApp::Refresh => crate::refresh::run(&paths)?,
         },
         Cmd::Service { command } => match command {
             ServiceCmd::Install { now } => setup::service_install(&paths, now)?,

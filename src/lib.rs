@@ -13,6 +13,7 @@ mod bus;
 mod call;
 mod cleanup;
 pub mod cli;
+mod compat;
 pub mod config;
 mod daemon;
 mod door;

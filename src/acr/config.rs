@@ -1309,46 +1309,7 @@ pub fn parse_repo(text: &str) -> Result<Policy> {
     serde_yaml_ng::from_str(text).context("in the repository's ACR config")
 }
 
-/// Bindings this version ships, by name: Claude models sized to each role,
-/// as `setup acr` gives them. A binding in `allowed_bindings` that says
-/// `use: <name>` takes one, with its own `agent` and anything it changes, so
-/// a newer binary brings newer models and settings to it. Models a provider
-/// names its own way, through a gateway say, stay in your own bindings.
-pub const BUILTIN_BINDINGS: &[(&str, &str)] = &[
-    (
-        "haiku-low",
-        "{model: claude-haiku-5-5, effort: low, tools: [Read, Grep, Glob], timeout: 14400, \
-         subscription: true}",
-    ),
-    (
-        "sonnet-high",
-        "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob, Bash, Write, Edit], \
-         timeout: 14400, subscription: true}",
-    ),
-    (
-        "opus-medium",
-        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob], timeout: 14400, \
-         subscription: true}",
-    ),
-    (
-        "opus-judge",
-        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob, Bash, Write], \
-         timeout: 14400, subscription: true}",
-    ),
-    (
-        "opus-configure",
-        "{model: claude-opus-5-5, effort: max, tools: [Read, Grep, Glob, Bash, Write], \
-         timeout: 14400, subscription: true}",
-    ),
-];
-
-/// What an earlier version's `setup acr` wrote under a built-in's name,
-/// which `setup refresh` takes as that built-in.
-pub const EARLIER_BUILTINS: &[(&str, &str)] = &[(
-    "sonnet-high",
-    "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob], timeout: 14400, \
-     subscription: true}",
-)];
+use crate::setup::{BUILTIN_BINDINGS, EARLIER_BUILTINS};
 
 /// A built-in binding's settings, without an agent.
 pub fn builtin_binding(name: &str) -> Option<serde_yaml_ng::Mapping> {
@@ -1359,6 +1320,15 @@ pub fn builtin_binding(name: &str) -> Option<serde_yaml_ng::Mapping> {
 /// The names of the built-in bindings.
 pub fn builtin_names() -> Vec<&'static str> {
     BUILTIN_BINDINGS.iter().map(|(n, _)| *n).collect()
+}
+
+/// The models the built-in bindings use.
+fn builtin_models() -> Vec<String> {
+    BUILTIN_BINDINGS
+        .iter()
+        .filter_map(|(n, _)| builtin_binding(n))
+        .filter_map(|m| m.get("model")?.as_str().map(str::to_string))
+        .collect()
 }
 
 pub fn parse_user(text: &str) -> Result<UserConfig> {
@@ -1450,10 +1420,9 @@ pub fn refresh_bindings(text: &str) -> Result<(Option<String>, Vec<String>)> {
                 };
                 plan.push((name.to_string(), builtin, agent.to_string(), gained));
             }
-            None if have
-                .model
-                .as_deref()
-                .is_some_and(|m| m.starts_with("claude-")) =>
+            None if builtin_models()
+                .iter()
+                .any(|m| have.model.as_deref() == Some(m)) =>
             {
                 lines.push(format!(
                     "binding {name} differs from every built-in binding, so it was left as it is"

@@ -84,6 +84,16 @@ pub fn run(paths: &Paths) -> Result<()> {
         });
     }
     {
+        // What setup wrote, kept to this version: the owned files rewritten,
+        // and what `setup refresh` or an update would change said.
+        let (bus, paths) = (bus.clone(), paths.clone());
+        thread::spawn(move || {
+            for line in crate::refresh::at_start(&paths) {
+                bus.event(line);
+            }
+        });
+    }
+    {
         // What bridges and reviews leave, which they keep to be looked at,
         // goes here once it's old, and nowhere else.
         let (bus, paths) = (bus.clone(), paths.clone());

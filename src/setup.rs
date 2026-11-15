@@ -37,7 +37,7 @@ fn home() -> Result<PathBuf> {
 /// moved into place, a `.prev` kept to go back to, or a `target/` build
 /// isn't, and a path to one written into the plugin or a service would
 /// break when it's moved, replaced or cleaned.
-fn is_installed(path: &Path) -> bool {
+pub(crate) fn is_installed(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == app().name)
         && !path.components().any(|c| c.as_os_str() == "target")
 }
@@ -1168,6 +1168,47 @@ fn confine_bridge(doc: &mut toml_edit::DocumentMut, confine: &Path) -> Result<bo
     Ok(true)
 }
 
+/// Bindings this version ships, by name: Claude models sized to each role,
+/// as `setup acr` gives them. A binding in `allowed_bindings` that says
+/// `use: <name>` takes one, with its own `agent` and anything it changes, so
+/// a newer binary brings newer models and settings to it. Models a provider
+/// names its own way, through a gateway say, stay in your own bindings.
+pub(crate) const BUILTIN_BINDINGS: &[(&str, &str)] = &[
+    (
+        "haiku-low",
+        "{model: claude-haiku-5-5, effort: low, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "sonnet-high",
+        "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob, Bash, Write, Edit], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-medium",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "opus-judge",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-configure",
+        "{model: claude-opus-5-5, effort: max, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+];
+
+/// What an earlier version's `setup acr` wrote under a built-in's name,
+/// which `setup refresh` takes as that built-in.
+pub(crate) const EARLIER_BUILTINS: &[(&str, &str)] = &[(
+    "sonnet-high",
+    "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob], timeout: 14400, \
+     subscription: true}",
+)];
+
 /// The ACR config `acrbus setup acr` writes, if there's none: Anthropic
 /// models sized to each role, all on this machine's agent.
 fn acr_bindings(machine: &str) -> String {
@@ -1331,7 +1372,7 @@ fn make_token(claude: &Path, token: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
+pub(crate) fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
     let text = match fs::read_to_string(&paths.config) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1341,7 +1382,7 @@ fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
         .with_context(|| format!("in {}", paths.config.display()))
 }
 
-fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
+pub(crate) fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
     // Checked before it's written, so a mistake never lands.
     let text = doc.to_string();
     toml::from_str::<crate::config::Config>(&text).context("the config it would write")?;
@@ -1659,6 +1700,77 @@ pub fn grayboard_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_setup_writes_runs_the_installed_binary_not_a_waiting_or_built_one() {
+        let name = app().name;
+        let dir = std::env::temp_dir().join(format!("tb-installed-{}", crate::util::new_id()));
+        let bin = dir.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let installed = bin.join(name);
+        fs::write(&installed, "").unwrap();
+        // The installed one itself.
+        assert_eq!(
+            installed_from(&installed, None, Some(&dir)).unwrap(),
+            installed
+        );
+        // One waiting to be moved in, one kept to go back to, and a build all
+        // write the installed one.
+        for waiting in [
+            bin.join(format!("{name}.new")),
+            bin.join(format!("{name}.prev")),
+            dir.join(format!("src/target/release/{name}")),
+        ] {
+            assert_eq!(
+                installed_from(&waiting, None, Some(&dir)).unwrap(),
+                installed
+            );
+        }
+        // The service's binary wins over ~/.local/bin.
+        let service = dir.join(format!("opt/{name}"));
+        fs::create_dir_all(service.parent().unwrap()).unwrap();
+        fs::write(&service, "").unwrap();
+        let waiting = bin.join(format!("{name}.new"));
+        assert_eq!(
+            installed_from(&waiting, Some(service.clone()), Some(&dir)).unwrap(),
+            service
+        );
+        // With none installed, it says so rather than write a path that moves.
+        let e = installed_from(&waiting, None, Some(&dir.join("elsewhere"))).unwrap_err();
+        assert!(format!("{e:#}").contains("isn't an installed"), "{e:#}");
+    }
+
+    #[test]
+    fn the_services_binary_is_read_from_its_unit_or_plist() {
+        let unit = UserUnit {
+            name: "x",
+            description: "x",
+            args: &["daemon"],
+            after: None,
+        }
+        .text(Path::new("/home/me/.local/bin/my app"));
+        assert_eq!(
+            unit_exe(&unit),
+            Some(PathBuf::from("/home/me/.local/bin/my app"))
+        );
+        assert_eq!(
+            unit_exe("ExecStart=/usr/bin/x daemon\n"),
+            Some(PathBuf::from("/usr/bin/x"))
+        );
+        let log = PathBuf::from("/tmp/log");
+        let plist = LaunchAgent {
+            label: "l",
+            args: &["daemon"],
+            log: &log,
+            throttle: 10,
+            exit_timeout: None,
+        }
+        .plist(Path::new("/Users/me/.local/bin/a&b"));
+        assert_eq!(
+            plist_exe(&plist),
+            Some(PathBuf::from("/Users/me/.local/bin/a&b"))
+        );
+    }
 
     #[test]
     fn signing_in_to_grayboard_pins_this_machines_name() {
