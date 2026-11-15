@@ -494,19 +494,21 @@ pub fn run(paths: &Paths) -> Result<()> {
         }
         said.push(format!("the config before is kept as {}", kept.display()));
     }
+    let mut notes = Vec::new();
     let user = crate::acr::user_config(paths);
     if let Ok(text) = fs::read_to_string(&user) {
         let (new, lines) = crate::acr::refresh_bindings(&text)?;
+        let (uses, left): (Vec<String>, Vec<String>) =
+            lines.into_iter().partition(|l| l.contains(" now uses "));
+        notes.extend(left);
         if let Some(new) = new {
             let kept = backup(&user)?;
             fs::write(&user, new).with_context(|| format!("writing {}", user.display()))?;
-            said.extend(lines);
+            said.extend(uses);
             said.push(format!(
                 "the bindings before are kept as {}",
                 kept.display()
             ));
-        } else {
-            said.extend(lines);
         }
     }
     let exe = match setup::installed_exe(paths) {
@@ -528,7 +530,7 @@ pub fn run(paths: &Paths) -> Result<()> {
             println!("The {agent} bridge isn't a service here: restart it to load its table.");
         }
     }
-    for line in &shadowing {
+    for line in notes.iter().chain(&shadowing) {
         println!("Note: {line}.");
     }
     for (level, line) in crate::compat::bridge_versions(paths) {

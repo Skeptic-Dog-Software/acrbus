@@ -98,6 +98,13 @@ its service. Each part is also its own command: `acrbus service install`,
 `acrbus setup claude` and `acrbus setup acr`. To review with pi, omp or
 another harness, see [Another agent](docs/quickstart.md#another-agent).
 
+To update, put the new binary in place, then run `acrbus setup refresh`. It
+brings what setup wrote up to the new version, backing up each file it
+changes: bridges written out in full take the new defaults, bindings that
+are built-ins use them, and the plugin, the reviewers' confinement and the
+system prompt are rewritten. The daemon rewrites those last three itself
+as it starts, and says when a refresh is due.
+
 ## Review a change
 
 [The quickstart](docs/quickstart.md) goes through it step by step, for you
@@ -123,7 +130,8 @@ the config, for reading a proposal or writing one yourself.
 
 | Command | Does |
 | --- | --- |
-| `acrbus acr doctor` | Checks this machine and a repository are ready for review, and says what to fix. |
+| `acrbus setup refresh` | After an update: brings bridges, bindings, the plugin, confinement and the system prompt up to this version, backing each file up first, and restarts the bridges whose tables changed. |
+| `acrbus acr doctor` | Checks this machine and a repository are ready for review, and says what to fix: also a refresh that's due, and tools a bridge runs that are older than this version was tested with. |
 | `acrbus acr validate`, `acrbus acr schema` | Checks a repository's config, or prints its schema. |
 | `acrbus acr plan` | Shows the tier, lenses, bindings and estimated cost, with no model calls. |
 | `acrbus acr configure` | Has the configurer review the whole repository and propose its config. |

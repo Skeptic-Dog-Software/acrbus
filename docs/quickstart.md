@@ -35,6 +35,14 @@ cargo install --locked --git https://github.com/Skeptic-Dog-Software/acrbus --ro
 
 Check: `acrbus --version` prints its version.
 
+**To update later:** install the new binary the same way, or move it into
+place over the old one (`mv -f`, never `cp` over a running binary), then
+run `acrbus setup refresh`. That brings bridges, bindings, the plugin, the
+reviewers' confinement and the system prompt up to the new version, backs
+up each file it changes, and restarts the bridges whose tables changed.
+Open Claude Code sessions keep their old `acrbus` tools until they restart,
+and say so.
+
 ## 2. Say who the bus belongs to
 
 Make the folder if it isn't there, and put this in
@@ -415,6 +423,10 @@ Things that matter for an agent other than Claude Code:
 | What you see | What to do |
 | --- | --- |
 | `cargo: command not found` | Put cargo's folder on PATH (step 1). |
+| the doctor: "run `acrbus setup refresh`" | What setup wrote is an earlier version's: run it, and read what it says it changed. |
+| the doctor: a bridge's `claude` (or `pi`, `node`) is older than tested | Update that tool; acrbus was tested with the version it names. |
+| a tool result says acrbus was updated | That session's `acrbus` tools are the old version's: restart the session. |
+| setup: "isn't an installed acrbus" | Setup was run from a binary that isn't where acrbus is installed, such as a `.new` or a build. Install it as `~/.local/bin/acrbus`, then run setup from there. |
 | setup: the token doesn't sign in | `claude setup-token` for a new one, then `acrbus setup acr`. |
 | `run`: "has no review config yet" | Steps 5 and 6. |
 | `run`: "isn't calibrated" or "config has changed since" | Read the config, then step 6. |
