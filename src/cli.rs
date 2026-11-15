@@ -452,11 +452,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
         }
         Cmd::Setup { app } => match app {
-            SetupApp::Claude { no_install } => setup::claude(!no_install)?,
+            SetupApp::Claude { no_install } => setup::claude(&paths, !no_install)?,
             SetupApp::Acr { repos } => setup::acr(&paths, &repos)?,
             SetupApp::All { repos } => {
                 setup::service_install(&paths, false)?;
-                setup::claude(true)?;
+                setup::claude(&paths, true)?;
                 setup::acr(&paths, &repos)?;
             }
         },

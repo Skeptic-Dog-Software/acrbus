@@ -1309,8 +1309,105 @@ pub fn parse_repo(text: &str) -> Result<Policy> {
     serde_yaml_ng::from_str(text).context("in the repository's ACR config")
 }
 
+/// Bindings this version ships, by name: Claude models sized to each role,
+/// as `setup acr` gives them. A binding in `allowed_bindings` that says
+/// `use: <name>` takes one, with its own `agent` and anything it changes, so
+/// a newer binary brings newer models and settings to it. Models a provider
+/// names its own way, through a gateway say, stay in your own bindings.
+pub const BUILTIN_BINDINGS: &[(&str, &str)] = &[
+    (
+        "haiku-low",
+        "{model: claude-haiku-5-5, effort: low, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "sonnet-high",
+        "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob, Bash, Write, Edit], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-medium",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob], timeout: 14400, \
+         subscription: true}",
+    ),
+    (
+        "opus-judge",
+        "{model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+    (
+        "opus-configure",
+        "{model: claude-opus-5-5, effort: max, tools: [Read, Grep, Glob, Bash, Write], \
+         timeout: 14400, subscription: true}",
+    ),
+];
+
+/// What an earlier version's `setup acr` wrote under a built-in's name,
+/// which `setup refresh` takes as that built-in.
+pub const EARLIER_BUILTINS: &[(&str, &str)] = &[(
+    "sonnet-high",
+    "{model: claude-sonnet-5-5, effort: high, tools: [Read, Grep, Glob], timeout: 14400, \
+     subscription: true}",
+)];
+
+/// A built-in binding's settings, without an agent.
+pub fn builtin_binding(name: &str) -> Option<serde_yaml_ng::Mapping> {
+    let (_, text) = BUILTIN_BINDINGS.iter().find(|(n, _)| *n == name)?;
+    serde_yaml_ng::from_str(text).ok()
+}
+
+/// The names of the built-in bindings.
+pub fn builtin_names() -> Vec<&'static str> {
+    BUILTIN_BINDINGS.iter().map(|(n, _)| *n).collect()
+}
+
 pub fn parse_user(text: &str) -> Result<UserConfig> {
-    serde_yaml_ng::from_str(text).context("in your ACR config")
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(text).context("in your ACR config")?;
+    let uses = value
+        .get("allowed_bindings")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .is_some_and(|m| m.values().any(|b| b.get("use").is_some()));
+    if !uses {
+        // Read as it's written, so an error says where.
+        return serde_yaml_ng::from_str(text).context("in your ACR config");
+    }
+    let mut value = value;
+    expand_builtins(&mut value).context("in your ACR config")?;
+    serde_yaml_ng::from_value(value).context("in your ACR config")
+}
+
+/// Puts each `use:` binding's built-in under what it sets itself.
+fn expand_builtins(value: &mut serde_yaml_ng::Value) -> Result<()> {
+    let Some(bindings) = value
+        .get_mut("allowed_bindings")
+        .and_then(serde_yaml_ng::Value::as_mapping_mut)
+    else {
+        return Ok(());
+    };
+    for (name, entry) in bindings.iter_mut() {
+        let name = name.as_str().unwrap_or("?").to_string();
+        let Some(map) = entry.as_mapping_mut() else {
+            continue;
+        };
+        let Some(used) = map.remove("use") else {
+            continue;
+        };
+        let used = used
+            .as_str()
+            .with_context(|| format!("binding {name}: `use` names a built-in binding"))?;
+        let mut merged = builtin_binding(used).with_context(|| {
+            format!(
+                "binding {name}: there's no built-in binding {used}; this version has {}",
+                builtin_names().join(", ")
+            )
+        })?;
+        for (k, v) in map.iter() {
+            merged.insert(k.clone(), v.clone());
+        }
+        *map = merged;
+    }
+    Ok(())
 }
 
 /// The user's config, if they have one.
