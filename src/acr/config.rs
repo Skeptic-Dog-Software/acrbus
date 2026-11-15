@@ -1377,6 +1377,179 @@ pub fn parse_user(text: &str) -> Result<UserConfig> {
     serde_yaml_ng::from_value(value).context("in your ACR config")
 }
 
+/// A binding written as a YAML scalar: plain when it can be, else quoted.
+fn yaml_scalar(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._-/".contains(c))
+    {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_default()
+    }
+}
+
+/// `setup refresh`'s change to the bindings in `acr.yaml`: each one written
+/// out in full that's exactly a built-in, or what an earlier version's setup
+/// wrote under a built-in's name, becomes `use:` that built-in, so newer
+/// models and settings reach it. Returns the new text, if anything changed,
+/// and a line for each binding changed or left as it is.
+pub fn refresh_bindings(text: &str) -> Result<(Option<String>, Vec<String>)> {
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(text).context("in your ACR config")?;
+    let Some(map) = value
+        .get("allowed_bindings")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+    else {
+        return Ok((None, Vec::new()));
+    };
+    let built = |text: &str, agent: &str| -> Option<Binding> {
+        let mut m: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(text).ok()?;
+        m.insert("agent".into(), agent.into());
+        serde_yaml_ng::from_value(serde_yaml_ng::Value::Mapping(m)).ok()
+    };
+    let mut plan: Vec<(String, &str, String, Vec<String>)> = Vec::new();
+    let mut lines = Vec::new();
+    for (name, entry) in map {
+        let (Some(name), Some(e)) = (name.as_str(), entry.as_mapping()) else {
+            continue;
+        };
+        if e.contains_key("use") {
+            continue;
+        }
+        let Some(agent) = e.get("agent").and_then(serde_yaml_ng::Value::as_str) else {
+            continue;
+        };
+        let Ok(have) = serde_yaml_ng::from_value::<Binding>(entry.clone()) else {
+            continue;
+        };
+        // Its own name's built-in first, then the others.
+        let mut candidates: Vec<(&str, &str, bool)> = BUILTIN_BINDINGS
+            .iter()
+            .map(|(n, t)| (*n, *t, false))
+            .chain(EARLIER_BUILTINS.iter().map(|(n, t)| (*n, *t, true)))
+            .collect();
+        candidates.sort_by_key(|(n, _, _)| *n != name);
+        let found = candidates
+            .into_iter()
+            .find(|(_, t, _)| built(t, agent).as_ref() == Some(&have));
+        match found {
+            Some((builtin, earlier, was_earlier)) => {
+                let gained = if was_earlier {
+                    let now = builtin_binding(builtin)
+                        .and_then(|m| {
+                            serde_yaml_ng::from_value::<Vec<String>>(m.get("tools")?.clone()).ok()
+                        })
+                        .unwrap_or_default();
+                    let then = built(earlier, agent)
+                        .and_then(|b| b.tools)
+                        .unwrap_or_default();
+                    now.into_iter().filter(|t| !then.contains(t)).collect()
+                } else {
+                    Vec::new()
+                };
+                plan.push((name.to_string(), builtin, agent.to_string(), gained));
+            }
+            None if have
+                .model
+                .as_deref()
+                .is_some_and(|m| m.starts_with("claude-")) =>
+            {
+                lines.push(format!(
+                    "binding {name} differs from every built-in binding, so it was left as it is"
+                ));
+            }
+            None => {}
+        }
+    }
+    if plan.is_empty() {
+        return Ok((None, lines));
+    }
+    let new = rewrite_bindings(text, &plan)?;
+    let after = parse_user(&new).context("the bindings refresh would write")?;
+    for (name, builtin, agent, gained) in &plan {
+        let want = builtin_binding(builtin)
+            .and_then(|_| {
+                let (_, t) = BUILTIN_BINDINGS.iter().find(|(n, _)| n == builtin)?;
+                built(t, agent)
+            })
+            .context("a built-in binding that doesn't read")?;
+        if after.allowed_bindings.get(name) != Some(&want) {
+            bail!("rewriting binding {name} would change it; nothing was written");
+        }
+        let mut line = format!("binding {name} now uses the built-in {builtin}");
+        if !gained.is_empty() {
+            line.push_str(&format!(
+                ", and gets {}, as setup gives it today",
+                gained.join(", ")
+            ));
+        }
+        lines.push(line);
+    }
+    Ok((Some(new), lines))
+}
+
+/// The text with each planned binding's lines replaced by `use:` and
+/// `agent:`, the rest of the file as it was, comments too.
+fn rewrite_bindings(text: &str, plan: &[(String, &str, String, Vec<String>)]) -> Result<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim_end() == "allowed_bindings:")
+        .context("allowed_bindings isn't a block of its own, so it can't be rewritten in place")?;
+    let mut out: Vec<String> = lines[..=start].iter().map(|l| l.to_string()).collect();
+    let mut i = start + 1;
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    while i < lines.len() {
+        let line = lines[i];
+        let blank = line.trim().is_empty() || line.trim_start().starts_with('#');
+        if !blank && indent(line) == 0 {
+            break;
+        }
+        let header = (!blank && indent(line) == 2)
+            .then(|| line.trim().split_once(':'))
+            .flatten();
+        let Some((name, rest)) = header else {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        };
+        let Some((_, builtin, agent, _)) = plan.iter().find(|(n, ..)| n == name) else {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        };
+        let agent = yaml_scalar(agent);
+        let (value, comment) = match rest.find(" #") {
+            Some(at) => (rest[..at].trim(), rest[at..].trim_end()),
+            None => (rest.trim(), ""),
+        };
+        if value.starts_with('{') {
+            out.push(format!(
+                "  {name}: {{use: {builtin}, agent: {agent}}}{}{comment}\n",
+                if comment.is_empty() { "" } else { " " }
+            ));
+            i += 1;
+            continue;
+        }
+        out.push(line.to_string());
+        out.push(format!("    use: {builtin}\n    agent: {agent}\n"));
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            if !l.trim().is_empty() && indent(l) < 4 {
+                break;
+            }
+            if l.trim().is_empty() {
+                out.push(l.to_string());
+            }
+            i += 1;
+        }
+    }
+    out.extend(lines[i..].iter().map(|l| l.to_string()));
+    Ok(out.concat())
+}
+
 /// Puts each `use:` binding's built-in under what it sets itself.
 fn expand_builtins(value: &mut serde_yaml_ng::Value) -> Result<()> {
     let Some(bindings) = value
@@ -2735,5 +2908,113 @@ mod tests {
         let stored: SessionsConfig =
             serde_json::from_str(r#"{"relay_tokens": {}, "scout": []}"#).unwrap();
         assert_eq!(stored.stall_warn_secs, STALL_WARN_SECS);
+    }
+    /// What `setup acr` wrote before bindings could `use` a built-in, with a
+    /// reviewer from before it could run things, and two of the user's own.
+    const OLD_BINDINGS: &str = r#"# my bindings
+version: 1
+allowed_bindings:
+  haiku-low:       # the Sizer
+    agent: claude-acr@box
+    model: claude-haiku-5-5
+    effort: low
+    tools: [Read, Grep, Glob]
+    timeout: 14400
+    subscription: true
+  sonnet-high:     # reviewers
+    agent: claude-acr@box
+    model: claude-sonnet-5-5
+    effort: high
+    tools: [Read, Grep, Glob]
+    timeout: 14400
+    subscription: true
+
+  opus-writes:
+    agent: claude-acr@box
+    model: claude-opus-5-5
+    effort: medium
+    tools: [Read, Grep, Glob]
+    writes: true
+  glm: {agent: pi@box, model: provider/glm-5.3, effort: high}
+  opus-judge: {agent: claude-acr@box, model: claude-opus-5-5, effort: medium, tools: [Read, Grep, Glob, Bash, Write], timeout: 14400, subscription: true}
+defaults:
+  bindings:
+    sizer: haiku-low
+    reviewer: sonnet-high
+"#;
+
+    #[test]
+    fn a_binding_can_use_a_built_in_and_change_what_it_needs() {
+        let user = parse_user(
+            "version: 1\nallowed_bindings:\n  r: {use: sonnet-high, agent: \"a@here\", effort: max}\n",
+        )
+        .unwrap();
+        let r = &user.allowed_bindings["r"];
+        assert_eq!(r.agent, "a@here");
+        assert_eq!(r.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(r.effort.as_deref(), Some("max"), "what it sets wins");
+        assert!(r.subscription && r.timeout == Some(14400));
+        let e = parse_user("version: 1\nallowed_bindings:\n  r: {use: gpt-9, agent: \"a@here\"}\n")
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("there's no built-in binding gpt-9"),
+            "{e:#}"
+        );
+        // Every built-in reads as a binding.
+        for name in builtin_names() {
+            let text =
+                format!("version: 1\nallowed_bindings:\n  x: {{use: {name}, agent: \"a@b\"}}\n");
+            parse_user(&text).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_refresh_makes_what_setup_wrote_use_the_built_ins_and_leaves_the_rest() {
+        let (new, lines) = refresh_bindings(OLD_BINDINGS).unwrap();
+        let new = new.expect("it changes something");
+        assert!(new.starts_with("# my bindings\n"), "{new}");
+        assert!(
+            new.contains(
+                "  haiku-low:       # the Sizer\n    use: haiku-low\n    agent: claude-acr@box\n"
+            ),
+            "{new}"
+        );
+        assert!(
+            new.contains("  opus-judge: {use: opus-judge, agent: claude-acr@box}\n"),
+            "{new}"
+        );
+        // The user's own stay as they were.
+        assert!(
+            new.contains("    writes: true\n") && new.contains("  glm: {agent: pi@box"),
+            "{new}"
+        );
+        assert!(
+            new.contains("defaults:\n  bindings:\n    sizer: haiku-low\n"),
+            "{new}"
+        );
+        assert!(
+            lines.contains(&"binding sonnet-high now uses the built-in sonnet-high, and gets Bash, Write, Edit, as setup gives it today".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"binding opus-writes differs from every built-in binding, so it was left as it is"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        let user = parse_user(&new).unwrap();
+        assert_eq!(
+            user.allowed_bindings["sonnet-high"]
+                .tools
+                .as_ref()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert!(user.allowed_bindings["opus-writes"].writes);
+        // A second refresh finds nothing to do.
+        let (again, _) = refresh_bindings(&new).unwrap();
+        assert!(again.is_none());
     }
 }
