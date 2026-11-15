@@ -440,7 +440,7 @@ fn to_create(
             add(
                 p.replace("{lens}", lens),
                 format!("ACR: the {lens} lens's latest round found no blocker"),
-                "0e8a16",
+                "1d76db",
             );
         }
     }
