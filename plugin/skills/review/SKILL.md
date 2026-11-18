@@ -1,11 +1,11 @@
 ---
 name: review
-description: Whole-change review. Two fresh reviewers from different model families, GLM on high and Opus on medium, each read the entire change at once against a standing list of cross-cutting checks and the repository's review lenses. Each family then confirms or refutes the other's findings with a test, your user decides each one and which tests to keep, and each lens gets its wait or confirmed label on the PR. It reports; it doesn't fix. Lean on tokens. Use it to review a branch, a PR or a working tree when your user asks for a review and doesn't ask for a full ACR.
+description: Whole-change review. Two fresh reviewers from different model families, GLM on high and Opus on medium, each read the entire change at once against a standing list of cross-cutting checks and the repository's review lenses. Each family then proves or refutes the other's findings with tests, run at the head, after the smallest fix and at the base, and the finding's author checks each test; evidence decides what's a defect, and your user decides only what to do about each and which tests to keep, and each lens gets its wait or confirmed label on the PR. It reports; it doesn't fix. Lean on tokens. Use it to review a branch, a PR or a working tree when your user asks for a review and doesn't ask for a full ACR.
 ---
 
 # Whole-change review
 
-Two reviewers from different model families each read the whole change against a short list of checks that cut across files. Each family then writes a test that confirms or refutes each finding the other raised, and your user decides each one and which tests to keep. That's four model calls in two steps, however many lenses the repository has, plus one for each lens your user names as deep. It reports and doesn't fix: your user fixes by their own method, then asks for a new review.
+Two reviewers from different model families each read the whole change against a short list of checks that cut across files. Each family then writes tests that prove or refute each finding the other raised, and each finding's author checks the test written for it. Evidence decides what's a defect, and your user decides what to do about each and which tests to keep. That's six model calls in three steps, however many lenses the repository has, plus one for each lens your user names as deep, and one more per family when an author objects to a test. It reports and doesn't fix: your user fixes by their own method, then asks for a new review.
 
 **Why whole-change.** Many real defects live between files: the same kind of message handled on two paths that disagree, a widened helper whose other callers weren't checked, a rule enforced at the step methods but not at Start. A reviewer that reads one dimension, or one path, at a time can miss them. A reader holding the whole change, pointed at those seams, can catch them.
 
@@ -69,33 +69,46 @@ A lens your user names as deep for this review also gets a reviewer of its own: 
 
 ## 3. Each family tests the other's findings
 
-Every finding is confirmed or refuted by a test, not by reading alone.
+Evidence settles whether a finding is a defect, not a reading of it, and not your user's ruling. Nobody can reliably rule a confident write-up real or not, and a confident write-up reads the same either way.
 
 - **Merge** the two lists. Two findings at the same place about the same defect are one, found by both.
 - **Make a copy for the tests,** so nothing touches your user's checkout: `git worktree add --detach <copies>/<review id> <head>`. `<copies>` is a folder the bridges may work in, such as the `acr-copies` folder in acrbus's state directory. Remove the copy when the review ends.
-- **Send each finding to a fresh checker** from the family that didn't raise it: GLM's findings to Opus, Opus's to GLM. A finding both raised goes to Opus. That's one call per family, through the same bridges, fresh and in parallel, each with `--workdir <copy>` and tools to read, write and run. Give it the context pack, the diff and its findings. With no findings, skip this step.
-- **For each finding, the checker writes the smallest test that fails at the head if the finding is real:** a unit or integration test in the repository's own framework, a probe script, or a benchmark for a hot-path cost. It runs only that test, not the whole suite, and gives the command and its output. Each finding's test goes in a file of its own, named for the finding, so it can be kept or dropped alone.
-  - **confirmed:** the test fails the way the finding says;
-  - **refuted:** the test passes, showing the behavior is right;
-  - **untestable:** no test can show it, such as wording, naming or structure. The checker says why and judges it by reading, and the report marks it untestable.
+- **Sort each finding:**
+  - **behavior:** a claim about what the code does, which a test can show;
+  - **advice:** a claim about wording, naming, structure, scope or design that no test can show. Advice is never a defect: it never blocks and never sets a lens waiting. It goes to your user as advice, to take or leave.
+- **Send each behavior finding to a fresh checker** from the family that didn't raise it: GLM's findings to Opus, Opus's to GLM. A finding both raised goes to Opus. That's one call per family, through the same bridges, fresh and in parallel, each with `--workdir <copy>` and tools to read, write and run. Give it the context pack, the diff and its findings. With no behavior findings, skip this step.
+- **For each finding, the checker writes the smallest test that fails at the head if the finding is right:** a unit or integration test in the repository's own framework, a probe script, or a benchmark for a hot-path cost. It runs only that test, not the whole suite, and gives each command and its output. Each finding's test goes in a file of its own, named for the finding, so it can be kept or dropped alone. Then:
+  - **at the head:** does it fail the way the finding says?
+  - **after the smallest fix:** the checker makes the smallest change that should fix it, runs the test again, and reverts the change. A test that still fails isn't testing this defect.
+  - **at the base** (`git -C <copy> checkout <base>`, then back to the head): a test that fails there too shows a defect the change didn't introduce.
 
-  A test that fails for another reason, such as a build error, missing setup or a wrong assumption about the code, is no evidence: the checker fixes the test or marks the finding untestable.
-- **The checker also says,** with evidence: whether the defect was there before the change (one that was never blocks), and whether it's a blocker, by its lens's `blocker` when it has one.
-- **Not defects:** what a compiler, linter or type checker would catch; style a senior engineer wouldn't raise; a change of behavior the PR says it intends; anything the change neither caused nor exposed.
-- **Nothing is dropped.** Every finding goes to your user with its test's result and the checker's verdict.
+  A test that fails for another reason, such as a build error, missing setup or a wrong assumption about the code, is no evidence: the checker fixes the test or says it couldn't write one.
+- **The family that raised each finding reads the test written for it,** with one fresh call per family again. It says whether the test checks the claim it made, and if not, what the test misses. A checker can write a test that passes for the wrong reason, and only the finding's author is sure to object. On an objection, the checker gets one more try with it.
+- **Each behavior finding's verdict comes from that evidence:**
+  - **proven:** the test fails at the head the way the finding says and passes after the smallest fix, and the finding's author agrees it checks the claim. It's **introduced** if the test passes at the base, and **pre-existing** if it fails there too.
+  - **refuted:** the test passes at the head, and the finding's author agrees it checks the claim.
+  - **unproven:** no valid test, or the author still objects after the second try. Unproven isn't a defect and isn't refuted: say what's missing to settle it.
+- **Blocking:** only a proven, introduced defect can block, by its lens's `blocker` when it has one. The checker says which with evidence. A pre-existing defect never blocks.
+- **Not defects:** what a compiler, linter or type checker would catch; a change of behavior the PR says it intends; anything the change neither caused nor exposed.
+- **Nothing is dropped.** Every finding goes to your user with its sort, its test's results and its verdict.
 
-## 4. Your user decides
+## 4. Your user decides what to do, not what's true
 
-- Read each finding's cited lines, so you can say what it points at. Don't drop or downgrade a finding yourself, and don't fix anything.
-- Ask your user about each blocker with AskUserQuestion: **real**, **ticket**, or **not a defect**. Give the finding, who found it, its test's result and the checker's verdict. Group non-blockers into one question, and the refuted findings into another. Never answer for your user.
-- **Ask which tests to keep,** in one multi-select question listing each finding's test with its result. A kept test is saved as a patch, `.review/tests/<short head>.patch` in your user's checkout, and on their word applied to their working tree with `git apply`. The review never commits it. A confirmed finding's test is the regression test for its fix.
-- Fixing is your user's, by their own method. When they've fixed, they ask for a new review. Give that review the earlier findings, their verdicts and the kept tests. It runs each kept test first: a confirmed finding whose test now passes is fixed, one whose test still fails still stands, and what was ruled not a defect isn't raised again.
+- Read each finding's cited lines, so you can say what it points at. Don't drop or downgrade a finding yourself, don't change a verdict, and don't fix anything.
+- Never ask your user whether a finding is real. Their calls are about policy and priority, with AskUserQuestion:
+  - **each proven, introduced defect:** **fix now** or **ticket**. Give the finding, who found it, its tests' results and whether it blocks.
+  - **pre-existing defects,** in one question: ticket each, or leave it.
+  - **unproven findings,** in one question: another try at a test, with what's missing, or leave it unsettled.
+  - **advice,** in one question: take it, ticket it, or leave it.
+  - Group them, so it's a few questions, not one per finding. Never answer for your user.
+- **Ask which tests to keep,** in one multi-select question listing each finding's test with its results. A kept test is saved as a patch, `.review/tests/<short head>.patch` in your user's checkout, and on their word applied to their working tree with `git apply`. The review never commits it. A proven defect's test is the regression test for its fix.
+- Fixing is your user's, by their own method. When they've fixed, they ask for a new review. Give that review the earlier findings, their verdicts and the kept tests. It runs each kept test first: a proven defect whose test now passes is fixed, one whose test still fails still stands, and a refuted finding isn't raised again.
 
 ## 5. Labels on the PR
 
 When the change is a PR and the repository's config sets `integrations.labels`, label each lens this review covered:
-- **waiting** (such as `wait:{lens}`): your user ruled a finding in it real, blocker or not. It stays waiting until a review after their fix finds it fixed.
-- **confirmed** (such as `confirmed:{lens}`): no finding in it is ruled real. A ticket or a ruling of not a defect leaves it confirmed.
+- **waiting** (such as `wait:{lens}`): a proven, introduced defect in it that your user chose to fix now. It stays waiting until a review after their fix finds that defect's test passing.
+- **confirmed** (such as `confirmed:{lens}`): no such defect in it. A ticket, a pre-existing defect, an unproven finding or advice leaves it confirmed.
 - **Neither:** a lens left out, or one neither reviewer answered. Never confirm a lens nobody checked.
 - **ready** or **not-ready:** not-ready while any lens is waiting. When every lens covered is confirmed, it's ready if none was left out. If some were, ask your user whether to mark it ready, naming them.
 
@@ -108,10 +121,10 @@ Show your user the labels. Once they agree, add them and take off this config's 
 Give your user:
 - the change reviewed;
 - what was found, by lens and by check, with who found each finding and the checker's verdict, and where the reviewer and the checker disagree on whether it blocks;
-- each finding's verdict (real, ticket, not a defect), and who gave it;
+- each finding's sort (behavior or advice) and verdict (proven, introduced or pre-existing; refuted; unproven, and what's missing), with its tests' commands and results at the head, after the smallest fix and at the base, and whether its author agreed the test checks the claim;
+- what your user chose for each (fix now, ticket, leave, another try), and which tests were kept;
 - each lens's outcome (waiting, confirmed, or not checked, and why), and the labels set;
-- for a review after fixes, which earlier blockers still stand;
-- each finding's test: confirmed, refuted or untestable, with the command, and whether it was kept;
+- for a review after fixes, which earlier defects still stand;
 - the model and effort each reviewer and checker actually ran on, and the tokens, tool calls and test runs each used;
 - what wasn't checked.
 

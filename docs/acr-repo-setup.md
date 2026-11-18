@@ -735,7 +735,11 @@ change acrbus, a lens or a model:
    nothing can leak.
 3. Review the change by your most careful method to convergence, and write
    its findings into the key, each marked as a blocker or not, and found in
-   round 1 or later.
+   round 1 or later. Keep only findings that evidence settles, not a ruling:
+   a test that fails at the head and passes after the smallest fix, or a
+   later commit that fixed it. Nobody can reliably rule a write-up real by
+   reading it. The review-score skill builds keys this way, from planted,
+   historical and proven defects.
 4. Run `acrbus acr rescore <key> --results <file>`. A key finding counts as
    caught if the pipeline reported it at any severity. Blocker agreement is
    reported apart from that.
